@@ -45,7 +45,11 @@ impl Planes {
 /// Unpacks a `v210` frame into 10-bit codes. `None` if the stride does not
 /// hold the width's groups or `bytes` is shorter than `height` rows.
 pub fn unpack(bytes: &[u8], width: usize, height: usize, row_bytes: usize) -> Option<Planes> {
-    if row_bytes < min_row_bytes(width) || bytes.len() < row_bytes.checked_mul(height)? {
+    // A zero stride passes the width check for width 0, and chunks(0) panics.
+    if row_bytes == 0
+        || row_bytes < min_row_bytes(width)
+        || bytes.len() < row_bytes.checked_mul(height)?
+    {
         return None;
     }
     let cw = width.div_ceil(2);
@@ -80,7 +84,8 @@ pub fn unpack(bytes: &[u8], width: usize, height: usize, row_bytes: usize) -> Op
 /// do not match their size.
 pub fn pack(p: &Planes, row_bytes: usize) -> Option<Vec<u8>> {
     let cw = p.chroma_width();
-    if row_bytes < min_row_bytes(p.width)
+    if row_bytes == 0
+        || row_bytes < min_row_bytes(p.width)
         || !row_bytes.is_multiple_of(4)
         || p.luma.len() != p.width * p.height
         || p.chroma.len() != cw * 2 * p.height
@@ -182,5 +187,11 @@ mod tests {
         assert!(unpack(&[0; 64], 7, 2, 16).is_none());
         assert!(unpack(&[0; 63], 7, 2, 32).is_none());
         assert!(pack(&numbered(7, 1), 16).is_none());
+    }
+
+    #[test]
+    fn rejects_a_zero_stride_rather_than_panicking() {
+        assert!(unpack(&[], 0, 1, 0).is_none());
+        assert!(pack(&numbered(0, 1), 0).is_none());
     }
 }
