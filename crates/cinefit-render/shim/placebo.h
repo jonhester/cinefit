@@ -59,4 +59,48 @@ void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *tex);
  * reason logged. */
 int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst, float shift_x);
 
+/* Captured YCbCr 4:2:2 on the GPU: a luma plane (r16, w x h) and a chroma
+ * plane (rg16, Cb and Cr interleaved, ceil(w/2) x h), each sample stored as
+ * its 10-bit code shifted left by 6, plus the texture the packed frame is
+ * uploaded into. Destroy with cf_pl_planes_destroy before cf_pl_destroy. */
+typedef struct cf_pl_planes cf_pl_planes;
+
+/* Null on failure, logged. */
+cf_pl_planes *cf_pl_planes_create(cf_pl *pl, int w, int h);
+void cf_pl_planes_destroy(cf_pl *pl, cf_pl_planes *planes);
+
+/* Uploads a v210 frame of the planes' size and unpacks it into them on the
+ * GPU. row_bytes is the capture card's stride, a multiple of 16 that covers
+ * every 16-byte group of six pixels; data holds row_bytes * h bytes. Returns
+ * 0, or -1 with the reason logged. */
+int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size_t row_bytes);
+
+/* Reads the planes back as stored, rows packed: w * h luma samples and
+ * ceil(w/2) * h Cb, Cr pairs. For checks. Returns 0, or -1, logged. */
+int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint16_t *chroma);
+
+/* Colour descriptions, as plain ints so nothing but this header is shared. */
+#define CF_PL_MATRIX_BT709 0
+#define CF_PL_MATRIX_BT2020_NC 1
+#define CF_PL_PRIM_BT709 0
+#define CF_PL_PRIM_BT2020 1
+#define CF_PL_TRC_BT1886 0
+#define CF_PL_TRC_PQ 1
+#define CF_PL_TRC_HLG 2
+
+/* Renders the planes over the whole of dst: limited-range YCbCr with the
+ * given matrix, primaries and transfer, chroma co-sited as HDMI 4:2:2 is,
+ * into full-range RGB with dst_primaries and dst_trc. No dithering; waits for
+ * the GPU. Returns 0, or -1 with the reason logged. */
+int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int primaries, int trc,
+                       cf_pl_tex *dst, int dst_primaries, int dst_trc);
+
+/* A w x h RGBA 16-bit texture to render into and read back, for checks. Null
+ * on failure, logged. */
+cf_pl_tex *cf_pl_target_rgba16(cf_pl *pl, int w, int h);
+
+/* Reads a cf_pl_target_rgba16 texture back: w * h * 4 values, rows packed.
+ * Returns 0, or -1, logged. */
+int cf_pl_download_rgba16(cf_pl *pl, cf_pl_tex *tex, uint16_t *out);
+
 #endif

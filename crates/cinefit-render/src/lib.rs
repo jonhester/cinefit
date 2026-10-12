@@ -4,9 +4,13 @@
 //! or the shim fails to build), and rendering is Linux only; elsewhere
 //! [`Placebo::new`] reports that.
 
+pub mod color;
 mod ffi;
 #[cfg(target_os = "linux")]
 pub mod power;
+pub mod v210;
+
+pub use color::{Matrix, Primaries, RgbColor, Transfer, YcbcrColor};
 
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
@@ -271,6 +275,236 @@ impl Placebo {
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+}
+
+/// Captured 4:2:2 YCbCr on the GPU, as planes libplacebo renders from: see
+/// [`v210::Planes`] for the layout. Each sample is stored as its 10-bit code
+/// shifted left by 6. Destroyed on drop; the borrow keeps it from outliving
+/// its device.
+#[cfg(target_os = "linux")]
+pub struct GpuPlanes<'p> {
+    pl: &'p Placebo,
+    raw: std::ptr::NonNull<ffi::Planes>,
+    width: usize,
+    height: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GpuPlanes<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the planes belong to this live device and are freed once.
+        unsafe { ffi::cf_pl_planes_destroy(self.pl.handle.as_ptr(), self.raw.as_ptr()) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl GpuPlanes<'_> {
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Reads the planes back as stored (`code << 6`), for checks.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo fails.
+    pub fn download(&self) -> Result<v210::Planes, Error> {
+        let mut p = v210::Planes {
+            width: self.width,
+            height: self.height,
+            luma: vec![0; self.width * self.height],
+            chroma: Vec::new(),
+        };
+        p.chroma = vec![0; p.chroma_width() * 2 * self.height];
+        // SAFETY: the buffers hold the w * h luma and ceil(w/2) * h pairs the
+        // shim writes; the planes belong to this live device.
+        let rc = unsafe {
+            ffi::cf_pl_planes_download(
+                self.pl.handle.as_ptr(),
+                self.raw.as_ptr(),
+                p.luma.as_mut_ptr(),
+                p.chroma.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(p) } else { Err(Error::Render) }
+    }
+}
+
+/// An RGBA 16-bit texture to render into and read back, for checks.
+#[cfg(target_os = "linux")]
+pub struct Rgba16Target<'p> {
+    tex: Texture<'p>,
+    width: usize,
+    height: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl<'p> Rgba16Target<'p> {
+    pub fn texture(&self) -> &Texture<'p> {
+        &self.tex
+    }
+
+    /// Reads it back: `width * height` RGBA values, rows packed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo fails.
+    pub fn download(&self) -> Result<Vec<u16>, Error> {
+        let mut out = vec![0u16; self.width * self.height * 4];
+        // SAFETY: `out` holds the w * h * 4 values the shim writes; the
+        // texture belongs to this live device.
+        let rc = unsafe {
+            ffi::cf_pl_download_rgba16(
+                self.tex.pl.handle.as_ptr(),
+                self.tex.tex.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(out) } else { Err(Error::Render) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn primaries_raw(p: Primaries) -> c_int {
+    match p {
+        Primaries::Bt709 => ffi::PRIM_BT709,
+        Primaries::Bt2020 => ffi::PRIM_BT2020,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn transfer_raw(t: Transfer) -> c_int {
+    match t {
+        Transfer::Bt1886 => ffi::TRC_BT1886,
+        Transfer::Pq => ffi::TRC_PQ,
+        Transfer::Hlg => ffi::TRC_HLG,
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Placebo {
+    /// Planes for `width` x `height` captured YCbCr.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] for an empty or oversized picture, [`Error::Render`]
+    /// if libplacebo cannot create them (see its log).
+    pub fn planes(&self, width: usize, height: usize) -> Result<GpuPlanes<'_>, Error> {
+        let dim = |v: usize| {
+            c_int::try_from(v)
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or(Error::BadInput)
+        };
+        // SAFETY: the handle is live.
+        let raw =
+            unsafe { ffi::cf_pl_planes_create(self.handle.as_ptr(), dim(width)?, dim(height)?) };
+        std::ptr::NonNull::new(raw)
+            .map(|raw| GpuPlanes {
+                pl: self,
+                raw,
+                width,
+                height,
+            })
+            .ok_or(Error::Render)
+    }
+
+    /// Uploads a `v210` frame the size of `planes` and unpacks it into them on
+    /// the GPU. `row_bytes` is the card's stride.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] if the stride is not whole 16-byte groups covering
+    /// the width or `data` is short, [`Error::Render`] if libplacebo fails.
+    pub fn unpack_v210(
+        &self,
+        planes: &mut GpuPlanes<'_>,
+        data: &[u8],
+        row_bytes: usize,
+    ) -> Result<(), Error> {
+        if !row_bytes.is_multiple_of(16)
+            || row_bytes < v210::min_row_bytes(planes.width)
+            || data.len() < row_bytes.saturating_mul(planes.height)
+        {
+            return Err(Error::BadInput);
+        }
+        // SAFETY: `data` holds row_bytes * height bytes, which the shim
+        // uploads; the planes belong to this live device, and `&mut` keeps
+        // anything else from using them meanwhile.
+        let rc = unsafe {
+            ffi::cf_pl_unpack_v210(
+                self.handle.as_ptr(),
+                planes.raw.as_ptr(),
+                data.as_ptr(),
+                row_bytes,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// Renders the planes over the whole of `dst` with their colour, into an
+    /// RGB target with its own, and waits for the GPU. Chroma is co-sited, as
+    /// HDMI 4:2:2 is. Between identical primaries and transfers this changes
+    /// only the representation: no tone or gamut mapping.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo fails (see its log).
+    pub fn render_ycbcr(
+        &self,
+        src: &GpuPlanes<'_>,
+        color: YcbcrColor,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+    ) -> Result<(), Error> {
+        let matrix = match color.matrix {
+            Matrix::Bt709 => ffi::MATRIX_BT709,
+            Matrix::Bt2020Nc => ffi::MATRIX_BT2020_NC,
+        };
+        // SAFETY: the planes and the texture belong to this live device.
+        let rc = unsafe {
+            ffi::cf_pl_render_ycbcr(
+                self.handle.as_ptr(),
+                src.raw.as_ptr(),
+                matrix,
+                primaries_raw(color.primaries),
+                transfer_raw(color.transfer),
+                dst.tex.as_ptr(),
+                primaries_raw(dst_color.primaries),
+                transfer_raw(dst_color.transfer),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// A `width` x `height` RGBA 16-bit target that can be read back.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] for an empty or oversized size, [`Error::Render`]
+    /// if libplacebo fails.
+    pub fn target_rgba16(&self, width: usize, height: usize) -> Result<Rgba16Target<'_>, Error> {
+        let dim = |v: usize| {
+            c_int::try_from(v)
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or(Error::BadInput)
+        };
+        // SAFETY: the handle is live.
+        let tex =
+            unsafe { ffi::cf_pl_target_rgba16(self.handle.as_ptr(), dim(width)?, dim(height)?) };
+        std::ptr::NonNull::new(tex)
+            .map(|tex| Rgba16Target {
+                tex: Texture { pl: self, tex },
+                width,
+                height,
+            })
+            .ok_or(Error::Render)
     }
 }
 
