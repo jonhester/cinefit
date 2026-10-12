@@ -1,0 +1,16 @@
+[package]
+name = "cinefit-kms"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# KMS is Linux only; elsewhere the crate is just its timing and pattern code.
+[target.'cfg(target_os = "linux")'.dependencies]
+# 0.14, not 0.15: gbm 0.18 (needed later for scanout buffers) depends on 0.14.
+# 0.14.2 was yanked.
+drm = "0.14.1"
+
+[lints]
+workspace = true
