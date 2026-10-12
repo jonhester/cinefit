@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 
 #include <dlfcn.h>
 
@@ -93,7 +92,8 @@ extern "C" void cf_dl_iterator_release(cf_dl_iterator *it) noexcept {
 
 extern "C" void cf_dl_device_get_info(cf_dl_device *handle, cf_dl_device_info *out) noexcept {
     IDeckLink *dev = unwrap(handle);
-    memset(out, 0, sizeof *out);
+    // No memset: the caller pre-fills *out as "unreported", so a field this
+    // function does not set reads as unreported rather than as zero ("no").
 
     const char *s = nullptr;
     if (dev->GetDisplayName(&s) == S_OK)
