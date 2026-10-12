@@ -8,7 +8,7 @@ mod capture;
 mod ffi;
 mod metadata;
 
-pub use capture::{Capture, Frame, FrameInfo, Handler, InputFormat, PixelFormat, Sampling};
+pub use capture::{Capture, Frame, FrameInfo, Handler, InputFormat, PixelFormat, Pixels, Sampling};
 pub use metadata::{Chromaticity, ColorInfo, Colorspace, Eotf, HdrMetadata};
 
 use std::ffi::CStr;

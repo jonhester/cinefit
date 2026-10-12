@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -33,7 +35,18 @@ pub struct Stats {
     pub hdr: Vec<(Duration, Option<HdrMetadata>, u64)>,
     /// Frames the card flagged as carrying Dolby Vision metadata.
     pub dolby_vision_flagged: u64,
+    /// Frames whose pixels could not be read.
+    pub pixel_read_failures: u64,
+    /// Liveness: consecutive frame pairs whose middle row changed, and the
+    /// pairs compared. A valid signal is not a picture; this is.
+    pub middle_row_changed: u64,
+    pub middle_row_compared: u64,
+    /// `r210` frames checked for 8-bit content padded to 10 bits, and how
+    /// many had any of the low two bits set in the rows checked.
+    pub r210_checked: u64,
+    pub r210_low_bits_set: u64,
     last_stream_time: Option<i64>,
+    last_middle_row: Vec<u8>,
 }
 
 impl Stats {
@@ -85,6 +98,28 @@ impl Stats {
             }
         }
         self.last_stream_time = Some(t);
+    }
+
+    /// Checks one frame's pixels: the middle row for liveness, and for
+    /// `r210` the first and middle rows for padded 8-bit content.
+    pub fn on_pixels(&mut self, info: &FrameInfo, first_row: &[u8], middle_row: &[u8]) {
+        // Rows of a new size belong to a new format: nothing to compare yet.
+        if self.last_middle_row.len() == middle_row.len() {
+            self.middle_row_compared += 1;
+            if self.last_middle_row != middle_row {
+                self.middle_row_changed += 1;
+            }
+        }
+        self.last_middle_row.clear();
+        self.last_middle_row.extend_from_slice(middle_row);
+
+        if info.pixel_format == PixelFormat::Rgb10 {
+            let width = info.width as usize;
+            self.r210_checked += 1;
+            if r210_low_bits_set(first_row, width) || r210_low_bits_set(middle_row, width) {
+                self.r210_low_bits_set += 1;
+            }
+        }
     }
 
     pub fn total_frames(&self) -> u64 {
@@ -152,24 +187,117 @@ impl Stats {
         if self.untimed > 0 {
             let _ = writeln!(s, "frames without stream time: {}", self.untimed);
         }
+        let _ = writeln!(
+            s,
+            "pixels: middle row changed in {} of {} frame pairs",
+            self.middle_row_changed, self.middle_row_compared
+        );
+        if self.pixel_read_failures > 0 {
+            let _ = writeln!(s, "pixel reads failed: {}", self.pixel_read_failures);
+        }
+        if self.r210_checked > 0 {
+            let _ = writeln!(
+                s,
+                "r210 low two bits: set in {} of {} frames (first and middle rows)",
+                self.r210_low_bits_set, self.r210_checked
+            );
+        }
         let _ = writeln!(s, "failed restarts: {failed_restarts}");
         s
     }
+}
+
+/// Whether any of the first `width` pixels of an `r210` row has a low bit set
+/// in any component. Each pixel is a big-endian word: 2 unused bits, then
+/// red, green and blue at 10 bits each. 8-bit content padded to 10 bits has
+/// the bottom two bits of every component clear.
+pub fn r210_low_bits_set(row: &[u8], width: usize) -> bool {
+    const LOW_BITS: u32 = 0b11 << 20 | 0b11 << 10 | 0b11;
+    row.as_chunks::<4>()
+        .0
+        .iter()
+        .take(width)
+        .any(|w| u32::from_be_bytes(*w) & LOW_BITS != 0)
 }
 
 /// Counts what the input delivers. Runs on the SDK's thread.
 pub struct Recorder {
     started: Instant,
     stats: Arc<Mutex<Stats>>,
+    dump: Option<Dumper>,
 }
 
 impl Recorder {
-    pub fn new(stats: Arc<Mutex<Stats>>) -> Self {
+    pub fn new(stats: Arc<Mutex<Stats>>, dump: Option<Dumper>) -> Self {
         Self {
             started: Instant::now(),
             stats,
+            dump,
         }
     }
+}
+
+/// One frame saved for offline analysis: its bytes exactly as captured.
+pub struct Dump {
+    pub index: usize,
+    pub at: Duration,
+    pub info: FrameInfo,
+    pub bytes: Vec<u8>,
+}
+
+/// Hands a copy of one frame every `every` to a writer thread. The SDK thread
+/// only copies; the disk write happens elsewhere, so it cannot stall capture.
+pub struct Dumper {
+    every: Duration,
+    state: Mutex<(Sender<Dump>, Duration, usize)>,
+}
+
+impl Dumper {
+    pub fn new(every: Duration, tx: Sender<Dump>) -> Self {
+        Self {
+            every,
+            state: Mutex::new((tx, Duration::ZERO, 0)),
+        }
+    }
+
+    fn offer(&self, at: Duration, info: &FrameInfo, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (tx, next, index) = &mut *state;
+        if at < *next {
+            return;
+        }
+        *next = at + self.every;
+        // A closed channel means the writer stopped; nothing to do about it here.
+        let _ = tx.send(Dump {
+            index: *index,
+            at,
+            info: *info,
+            bytes: bytes.to_vec(),
+        });
+        *index += 1;
+    }
+}
+
+/// Writes `frame-NNN.bin` (the raw bytes) and `frame-NNN.json` (what they are).
+pub fn write_dump(dir: &Path, d: &Dump) -> std::io::Result<()> {
+    let i = &d.info;
+    let opt = |v: Option<String>| v.map_or_else(|| "null".to_string(), |v| format!("{v:?}"));
+    let json = format!(
+        "{{\n  \"at_seconds\": {:.3},\n  \"width\": {},\n  \"height\": {},\n  \"row_bytes\": {},\n  \"pixel_format\": \"{}\",\n  \"stream_time\": {},\n  \"eotf\": {},\n  \"colorspace\": {},\n  \"hdr\": {}\n}}\n",
+        d.at.as_secs_f64(),
+        i.width,
+        i.height,
+        i.row_bytes,
+        i.pixel_format,
+        i.stream_time
+            .map_or_else(|| "null".to_string(), |t| t.to_string()),
+        opt(i.color.eotf.map(|e| e.to_string())),
+        opt(i.color.colorspace.map(|c| c.to_string())),
+        opt(i.color.hdr.map(|h| h.to_string())),
+    );
+    let base = dir.join(format!("frame-{:03}", d.index));
+    std::fs::write(base.with_extension("bin"), &d.bytes)?;
+    std::fs::write(base.with_extension("json"), json)
 }
 
 impl Handler for Recorder {
@@ -180,7 +308,24 @@ impl Handler for Recorder {
 
     fn frame(&self, frame: Frame) {
         let at = self.started.elapsed();
-        lock(&self.stats).on_frame(at, frame.info());
+        let info = *frame.info();
+        let mut stats = lock(&self.stats);
+        stats.on_frame(at, &info);
+        if !info.has_input {
+            return;
+        }
+        let rows = frame.pixels().and_then(|p| {
+            if let Some(dump) = &self.dump {
+                dump.offer(at, &info, p.bytes());
+            }
+            let first = p.row(0)?.to_vec();
+            let middle = p.row(info.height as usize / 2)?.to_vec();
+            Some((first, middle))
+        });
+        match rows {
+            Some((first, middle)) => stats.on_pixels(&info, &first, &middle),
+            None => stats.pixel_read_failures += 1,
+        }
         // `frame` drops here, handing its buffer straight back to the card.
     }
 }
@@ -347,5 +492,40 @@ mod tests {
             s.signal.get(&(Some(Eotf::Sdr), Some(Colorspace::Rec2020))),
             Some(&2)
         );
+    }
+
+    fn r210(r: u32, g: u32, b: u32) -> [u8; 4] {
+        (r << 20 | g << 10 | b).to_be_bytes()
+    }
+
+    #[test]
+    fn padded_8_bit_r210_has_clear_low_bits() {
+        let row: Vec<u8> = [r210(200 << 2, 17 << 2, 255 << 2), r210(0, 0, 0)].concat();
+        assert!(!r210_low_bits_set(&row, 2));
+    }
+
+    #[test]
+    fn any_low_bit_in_any_component_is_found() {
+        for px in [r210(801, 0, 0), r210(0, 2, 0), r210(0, 0, 3)] {
+            assert!(r210_low_bits_set(&px, 1));
+        }
+    }
+
+    #[test]
+    fn only_the_first_width_pixels_are_checked() {
+        // Row padding past the picture is not picture.
+        let row: Vec<u8> = [r210(4, 4, 4), r210(1, 1, 1)].concat();
+        assert!(!r210_low_bits_set(&row, 1));
+    }
+
+    #[test]
+    fn middle_row_liveness_counts_changes_between_frames() {
+        let mut s = Stats::default();
+        let info = frame(0);
+        s.on_pixels(&info, &[], &[1, 2, 3]);
+        s.on_pixels(&info, &[], &[1, 2, 3]);
+        s.on_pixels(&info, &[], &[9, 2, 3]);
+        s.on_pixels(&info, &[], &[1, 2]); // new size: not compared
+        assert_eq!((s.middle_row_changed, s.middle_row_compared), (1, 2));
     }
 }

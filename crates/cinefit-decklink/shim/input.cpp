@@ -319,3 +319,31 @@ extern "C" void cf_dl_input_release(cf_dl_input *in) noexcept {
 extern "C" void cf_dl_frame_release(cf_dl_frame *frame) noexcept {
     reinterpret_cast<IDeckLinkVideoInputFrame *>(frame)->Release();
 }
+
+extern "C" cf_dl_buffer *cf_dl_frame_read(cf_dl_frame *frame, const uint8_t **data,
+                                          uint64_t *size) noexcept {
+    IDeckLinkVideoBuffer *buf = nullptr;
+    if (reinterpret_cast<IDeckLinkVideoInputFrame *>(frame)->QueryInterface(
+            IID_IDeckLinkVideoBuffer, (void **)&buf) != S_OK || !buf)
+        return nullptr;
+    if (buf->StartAccess(bmdBufferAccessRead) != S_OK) {
+        buf->Release();
+        return nullptr;
+    }
+    void *p = nullptr;
+    uint64_t n = 0;
+    if (buf->GetBytes(&p) != S_OK || !p || buf->GetSize(&n) != S_OK) {
+        buf->EndAccess(bmdBufferAccessRead);
+        buf->Release();
+        return nullptr;
+    }
+    *data = static_cast<const uint8_t *>(p);
+    *size = n;
+    return reinterpret_cast<cf_dl_buffer *>(buf);
+}
+
+extern "C" void cf_dl_buffer_end(cf_dl_buffer *b) noexcept {
+    IDeckLinkVideoBuffer *buf = reinterpret_cast<IDeckLinkVideoBuffer *>(b);
+    buf->EndAccess(bmdBufferAccessRead);
+    buf->Release();
+}

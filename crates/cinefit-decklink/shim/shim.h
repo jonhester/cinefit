@@ -134,6 +134,15 @@ void cf_dl_input_release(cf_dl_input *in) CF_DL_NOEXCEPT;
 
 void cf_dl_frame_release(cf_dl_frame *frame) CF_DL_NOEXCEPT;
 
+/* Read access to a frame's pixels. SDK 16 only allows it between StartAccess
+ * and EndAccess, so access is a handle: *data and *size stay valid until
+ * cf_dl_buffer_end, which the caller must reach before releasing the frame.
+ * Null if the frame's buffer cannot be read. */
+typedef struct cf_dl_buffer cf_dl_buffer;
+cf_dl_buffer *cf_dl_frame_read(cf_dl_frame *frame, const uint8_t **data,
+                               uint64_t *size) CF_DL_NOEXCEPT;
+void cf_dl_buffer_end(cf_dl_buffer *buf) CF_DL_NOEXCEPT;
+
 #ifdef __cplusplus
 }
 #endif

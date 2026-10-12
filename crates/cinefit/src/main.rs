@@ -3,7 +3,9 @@
 
 mod capture;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,13 +31,25 @@ enum Command {
         /// Which device, by its index in `cinefit probe`.
         #[arg(short, long, default_value_t = 0)]
         device: usize,
+        /// Save raw frames, with a JSON description of each, into this
+        /// directory.
+        #[arg(long)]
+        dump: Option<PathBuf>,
+        /// Seconds between saved frames.
+        #[arg(long, default_value_t = 1.0, requires = "dump")]
+        dump_every: f64,
     },
 }
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Probe => probe(),
-        Command::Capture { seconds, device } => capture(seconds, device),
+        Command::Capture {
+            seconds,
+            device,
+            dump,
+            dump_every,
+        } => capture(seconds, device, dump, dump_every),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -73,7 +87,12 @@ fn probe() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn capture(seconds: f64, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn capture(
+    seconds: f64,
+    index: usize,
+    dump_dir: Option<PathBuf>,
+    dump_every: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let run_for = Duration::try_from_secs_f64(seconds)
         .ok()
         .filter(|d| !d.is_zero())
@@ -85,9 +104,36 @@ fn capture(seconds: f64, index: usize) -> Result<(), Box<dyn std::error::Error>>
         .ok_or_else(|| format!("no device {index}: {} found", devices.len()))?;
     println!("device {index}: {}", device.info().display_name);
 
+    // Frames to dump go to a writer thread, so disk writes never stall the
+    // SDK's thread.
+    let mut writer = None;
+    let dumper = match &dump_dir {
+        Some(dir) => {
+            let every = Duration::try_from_secs_f64(dump_every)
+                .ok()
+                .filter(|d| !d.is_zero())
+                .ok_or("--dump-every must be a positive number")?;
+            std::fs::create_dir_all(dir)?;
+            let (tx, rx) = mpsc::channel::<capture::Dump>();
+            let dir = dir.clone();
+            writer = Some(std::thread::spawn(move || {
+                let mut written = 0usize;
+                for d in rx {
+                    match capture::write_dump(&dir, &d) {
+                        Ok(()) => written += 1,
+                        Err(e) => eprintln!("dump frame {}: {e}", d.index),
+                    }
+                }
+                written
+            }));
+            Some(capture::Dumper::new(every, tx))
+        }
+        None => None,
+    };
+
     let stats = Arc::new(Mutex::new(capture::Stats::default()));
     let started = Instant::now();
-    let running = device.start_capture(capture::Recorder::new(Arc::clone(&stats)))?;
+    let running = device.start_capture(capture::Recorder::new(Arc::clone(&stats), dumper))?;
     std::thread::sleep(run_for);
     // Measured before stopping: frames stop counting here, not after the stop
     // has finished.
@@ -97,5 +143,11 @@ fn capture(seconds: f64, index: usize) -> Result<(), Box<dyn std::error::Error>>
     drop(running);
 
     print!("{}", capture::lock(&stats).summary(ran, failed_restarts));
+    // Dropping the capture dropped the handler and its sender, so the writer
+    // finishes once the queue is written.
+    if let (Some(writer), Some(dir)) = (writer, &dump_dir) {
+        let written = writer.join().map_err(|_| "dump writer panicked")?;
+        println!("dumped {written} frames to {}", dir.display());
+    }
     Ok(())
 }

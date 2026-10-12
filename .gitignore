@@ -2,3 +2,6 @@
 
 # Dumped into the working directory when rustc crashes.
 rustc-ice-*.txt
+
+# Frames saved by `cinefit capture --dump`.
+/dumps/

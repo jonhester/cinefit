@@ -142,6 +142,12 @@ pub struct FrameHandle {
     _opaque: [u8; 0],
 }
 
+/// Opaque `cf_dl_buffer`.
+#[repr(C)]
+pub struct BufferHandle {
+    _opaque: [u8; 0],
+}
+
 /// `cf_dl_format_cb`.
 pub type FormatCallback = unsafe extern "C" fn(ctx: *mut c_void, format: *const Format) -> u32;
 /// `cf_dl_frame_cb`.
@@ -167,4 +173,10 @@ unsafe extern "C" {
     pub fn cf_dl_input_failed_restarts(input: *mut InputHandle) -> u64;
     pub fn cf_dl_input_release(input: *mut InputHandle);
     pub fn cf_dl_frame_release(frame: *mut FrameHandle);
+    pub fn cf_dl_frame_read(
+        frame: *mut FrameHandle,
+        data: *mut *const u8,
+        size: *mut u64,
+    ) -> *mut BufferHandle;
+    pub fn cf_dl_buffer_end(buf: *mut BufferHandle);
 }

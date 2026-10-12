@@ -239,6 +239,59 @@ impl Frame {
     pub fn info(&self) -> &FrameInfo {
         &self.info
     }
+
+    /// Read access to the frame's pixels, exactly as captured, or `None` if
+    /// the card's buffer cannot be read. Access ends when the returned value
+    /// drops, which the borrow makes happen before the frame is released.
+    pub fn pixels(&self) -> Option<Pixels<'_>> {
+        let mut data: *const u8 = ptr::null();
+        let mut size: u64 = 0;
+        // SAFETY: the frame holds a live reference; the shim writes both out
+        // parameters before returning a non-null handle.
+        let buf = NonNull::new(unsafe {
+            ffi::cf_dl_frame_read(self.handle.as_ptr(), &mut data, &mut size)
+        })?;
+        let len = usize::try_from(size).ok();
+        let bytes = match (data.is_null(), len) {
+            // SAFETY: the SDK guarantees `size` readable bytes at `data` until
+            // EndAccess, which `Pixels::drop` calls; the borrow of `self`
+            // keeps the frame, and so the buffer, alive that long.
+            (false, Some(len)) => unsafe { std::slice::from_raw_parts(data, len) },
+            _ => &[],
+        };
+        Some(Pixels {
+            buf,
+            bytes,
+            row_bytes: self.info.row_bytes,
+        })
+    }
+}
+
+/// A frame's pixel bytes, readable until this drops.
+pub struct Pixels<'a> {
+    buf: NonNull<ffi::BufferHandle>,
+    bytes: &'a [u8],
+    row_bytes: usize,
+}
+
+impl Pixels<'_> {
+    /// Every byte of the buffer, including row padding.
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes
+    }
+
+    /// One row, `row_bytes` long, or `None` past the end of the buffer.
+    pub fn row(&self, y: usize) -> Option<&[u8]> {
+        let start = y.checked_mul(self.row_bytes)?;
+        self.bytes.get(start..start.checked_add(self.row_bytes)?)
+    }
+}
+
+impl Drop for Pixels<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this ends the access `Frame::pixels` started, exactly once.
+        unsafe { ffi::cf_dl_buffer_end(self.buf.as_ptr()) }
+    }
 }
 
 impl Drop for Frame {
