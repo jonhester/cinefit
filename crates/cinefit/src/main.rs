@@ -24,7 +24,14 @@ struct Cli {
 enum Command {
     /// List DeckLink devices and what they report. Opens no input, so it is
     /// safe while another program is capturing.
-    Probe,
+    Probe {
+        /// Also read what the card's input EDID advertises. Taking and
+        /// releasing the card's EDID interface may be a hotplug upstream,
+        /// which the Denon in this chain does not reliably recover from
+        /// (black picture until its input is cycled), so it is opt-in.
+        #[arg(long)]
+        edid: bool,
+    },
     /// Capture from a device's input for a while and summarise what arrived.
     Capture {
         /// How long to capture, in seconds.
@@ -85,7 +92,7 @@ enum Command {
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        Command::Probe => probe(),
+        Command::Probe { edid } => probe(edid),
         Command::Gpu => gpu(),
         Command::Capture {
             seconds,
@@ -123,7 +130,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn probe() -> Result<(), Box<dyn std::error::Error>> {
+fn probe(edid: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("DeckLink API {}", cinefit_decklink::api_version()?);
 
     let devices = cinefit_decklink::devices()?;
@@ -142,9 +149,11 @@ fn probe() -> Result<(), Box<dyn std::error::Error>> {
         println!("  HDMI input:       {}", yn(d.hdmi_input));
         println!("  format detection: {}", yn(d.input_format_detection));
         println!("  HDR metadata:     {}", yn(d.hdr_metadata));
-        match d.input_edid {
-            Some(e) => println!("  input EDID:       {e}"),
-            None => println!("  input EDID:       unreported"),
+        if edid {
+            match dev.read_input_edid() {
+                Some(e) => println!("  input EDID:       {e}"),
+                None => println!("  input EDID:       unreported"),
+            }
         }
         match d.persistent_id {
             Some(id) => println!("  persistent ID:    {id:#x}"),

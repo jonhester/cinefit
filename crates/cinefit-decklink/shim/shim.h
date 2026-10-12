@@ -39,10 +39,6 @@ typedef struct {
     int64_t input_connections;       /* BMDVideoConnection bits, or CF_DL_UNKNOWN */
     int32_t input_format_detection;  /* 1, 0, or CF_DL_UNKNOWN */
     int32_t hdr_metadata;            /* 1, 0, or CF_DL_UNKNOWN */
-    int64_t edid_dynamic_range;      /* BMDDynamicRange bits the input EDID
-                                        advertises, or CF_DL_UNKNOWN. Read
-                                        only: writing it is an upstream
-                                        hotplug. */
 } cf_dl_device_info;
 
 /* Writes the driver's API version into *version, encoded like the SDK's
@@ -64,6 +60,14 @@ void cf_dl_iterator_release(cf_dl_iterator *it) CF_DL_NOEXCEPT;
  * keep that value. */
 void cf_dl_device_get_info(cf_dl_device *dev, cf_dl_device_info *out) CF_DL_NOEXCEPT;
 void cf_dl_device_release(cf_dl_device *dev) CF_DL_NOEXCEPT;
+
+/* Reads the BMDDynamicRange bits the input EDID advertises into *bits.
+ * Returns 0, or -1 if the device has no EDID interface or does not say.
+ * Not part of cf_dl_device_get_info on purpose: taking and releasing the EDID
+ * interface may itself be a hotplug upstream (the card restores its default
+ * EDID when the interface is released), and the Denon in this chain does not
+ * reliably recover from one. Call it only when asked to. */
+int32_t cf_dl_device_read_input_edid(cf_dl_device *dev, int64_t *bits) CF_DL_NOEXCEPT;
 
 /* ---- Capture (input.cpp) ---- */
 

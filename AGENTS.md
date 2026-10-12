@@ -41,7 +41,8 @@ machine with everything installed will not notice it missing.
 
 On the machine with the hardware:
 
-    cinefit probe                      # devices; opens nothing
+    cinefit probe                      # devices; opens nothing, reads no EDID
+    cinefit probe --edid               # also the input EDID: may be an upstream hotplug
     cinefit gpu                        # Vulkan, libplacebo, v210 unpack and renders read back
     cinefit capture -t 20 [--dump DIR] # what arrives on the input
     cinefit pattern -t 30 [--gpu] [--hdr]   # puts a picture on the display
@@ -65,8 +66,10 @@ unset.
   checkout; `/dumps/` is ignored as a backstop).
 - **The vendored SDK headers stay unmodified,** and nothing else from the SDK
   is added. Upgrading means replacing the folder; see its README.
-- **Read the card's input EDID, never write it.** A write renegotiates with
-  everything upstream.
+- **Never write the card's input EDID, and read it only when asked.** A write
+  renegotiates with everything upstream, and taking and releasing the EDID
+  interface at all may be a hotplug: the Denon in this chain then sends its
+  signal with a black picture until its input is cycled (2026-10-12).
 - **No root.** GPU clocks are held per process (amdgpu stable pstate), never
   through sysfs writes; do not write anything that assumes sudo.
 - **libplacebo's version is pinned in `scripts/build-libplacebo.sh`.** Moving
