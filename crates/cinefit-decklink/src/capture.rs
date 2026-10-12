@@ -335,6 +335,18 @@ impl Capture {
         // SAFETY: the input is live for as long as `self`.
         unsafe { ffi::cf_dl_input_failed_restarts(self.input.as_ptr()) }
     }
+
+    /// Whether the card's saved input was already HDMI when this capture
+    /// opened it, or `None` if it could not be read. `Some(false)` means HDMI
+    /// was selected for this session only, and the card reverts to the saved
+    /// input when the capture ends: a hotplug on the HDMI port, which the
+    /// Denon upstream does not reliably recover from.
+    pub fn saved_input_was_hdmi(&self) -> Option<bool> {
+        // SAFETY: the input is live for as long as `self`.
+        let raw = unsafe { ffi::cf_dl_input_opened_connection(self.input.as_ptr()) };
+        // bmdVideoConnectionHDMI.
+        (raw != 0).then_some(raw == 1 << 1)
+    }
 }
 
 impl Drop for Capture {

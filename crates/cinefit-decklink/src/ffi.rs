@@ -172,6 +172,7 @@ unsafe extern "C" {
         failed_call: *mut *const c_char,
     ) -> i32;
     pub fn cf_dl_input_failed_restarts(input: *mut InputHandle) -> u64;
+    pub fn cf_dl_input_opened_connection(input: *mut InputHandle) -> i64;
     pub fn cf_dl_input_release(input: *mut InputHandle);
     pub fn cf_dl_frame_release(frame: *mut FrameHandle);
     pub fn cf_dl_frame_read(

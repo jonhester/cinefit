@@ -140,6 +140,9 @@ void cf_dl_input_stop(cf_dl_input *in) CF_DL_NOEXCEPT;
 
 /* How many format-change restarts failed to enable the new mode. */
 uint64_t cf_dl_input_failed_restarts(cf_dl_input *in) CF_DL_NOEXCEPT;
+/* The BMDVideoConnection selected when the input was opened, before HDMI was
+ * selected for the session: the card's saved preference. 0 if unreadable. */
+int64_t cf_dl_input_opened_connection(cf_dl_input *in) CF_DL_NOEXCEPT;
 
 /* Stops the input if it is running, then frees it. */
 void cf_dl_input_release(cf_dl_input *in) CF_DL_NOEXCEPT;

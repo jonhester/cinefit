@@ -249,6 +249,7 @@ struct cf_dl_input {
     IDeckLinkStatus *status;    /* null if the device has none */
     Callback *cb;
     bool started;
+    int64_t opened_connection;  /* the input selected before open, or 0 */
 };
 
 namespace {
@@ -339,16 +340,17 @@ extern "C" cf_dl_input *cf_dl_input_open(cf_dl_device *dev) noexcept {
     // black picture until its input is cycled). Not written to the card's
     // preferences: whether to persist it is a separate decision.
     IDeckLinkConfiguration *cfg = nullptr;
+    int64_t connection = 0;
     if (device->QueryInterface(IID_IDeckLinkConfiguration, (void **)&cfg) == S_OK && cfg) {
-        int64_t connection = 0;
-        if (cfg->GetInt(bmdDeckLinkConfigVideoInputConnection, &connection) == S_OK &&
-            connection != bmdVideoConnectionHDMI)
+        if (cfg->GetInt(bmdDeckLinkConfigVideoInputConnection, &connection) != S_OK)
+            connection = 0;
+        else if (connection != bmdVideoConnectionHDMI)
             cfg->SetInt(bmdDeckLinkConfigVideoInputConnection, bmdVideoConnectionHDMI);
         cfg->Release();
     }
     IDeckLinkStatus *status = nullptr;
     if (device->QueryInterface(IID_IDeckLinkStatus, (void **)&status) != S_OK) status = nullptr;
-    return new cf_dl_input{input, status, new Callback(input), false};
+    return new cf_dl_input{input, status, new Callback(input), false, connection};
 }
 
 extern "C" int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
@@ -407,6 +409,10 @@ extern "C" void cf_dl_input_stop(cf_dl_input *in) noexcept {
     in->input->SetCallback(nullptr);
     in->started = false;
     untrack(in);
+}
+
+extern "C" int64_t cf_dl_input_opened_connection(cf_dl_input *in) noexcept {
+    return in->opened_connection;
 }
 
 extern "C" uint64_t cf_dl_input_failed_restarts(cf_dl_input *in) noexcept {
