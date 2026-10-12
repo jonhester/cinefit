@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/cinefit-light-accent.svg">
+    <img alt="cinefit" src="docs/logo/cinefit-dark-accent.svg" width="235">
+  </picture>
+</p>
+
 # cinefit
 
 Runs on Linux with Blackmagic's Desktop Video driver. It builds and its tests
