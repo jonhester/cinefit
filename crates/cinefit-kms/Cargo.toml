@@ -11,6 +11,8 @@ repository.workspace = true
 # 0.14, not 0.15: gbm 0.18 (needed later for scanout buffers) depends on 0.14.
 # 0.14.2 was yanked.
 drm = "0.14.1"
+# Scanout buffers the GPU renders into, shared as dma-bufs.
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 
 [lints]
 workspace = true

@@ -37,4 +37,24 @@ void cf_pl_get_info(cf_pl *pl, cf_pl_info *out);
  * logged. */
 int cf_pl_render_rgba8(cf_pl *pl, int w, int h, const uint8_t *in, uint8_t *out);
 
+/* A libplacebo texture. Destroy with cf_pl_tex_destroy before cf_pl_destroy. */
+typedef struct cf_pl_tex cf_pl_tex;
+
+/* Imports a dma-buf as a render target: one plane of DRM format `fourcc`
+ * (e.g. XRGB8888) with the given modifier, stride and offset. libplacebo
+ * duplicates fd, so the caller keeps and closes its own. Null on failure,
+ * logged. */
+cf_pl_tex *cf_pl_import_dmabuf(cf_pl *pl, int fd, int w, int h, uint32_t fourcc,
+                               uint64_t modifier, uint32_t stride, uint32_t offset);
+
+/* Uploads a w x h RGBA8 image (rows packed) as a texture to render from.
+ * Null on failure, logged. */
+cf_pl_tex *cf_pl_upload_rgba8(cf_pl *pl, int w, int h, const uint8_t *rgba);
+
+void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *tex);
+
+/* Renders src over the whole of dst, both sRGB, without dithering, and waits
+ * for the GPU to finish. Returns 0, or -1 with the reason logged. */
+int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst);
+
 #endif

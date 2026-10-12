@@ -171,6 +171,100 @@ impl Placebo {
     }
 }
 
+/// A dma-buf to render into, as a scanout buffer describes it.
+#[derive(Debug, Clone, Copy)]
+pub struct DmaBufTarget<'a> {
+    pub fd: std::os::fd::BorrowedFd<'a>,
+    pub width: u32,
+    pub height: u32,
+    /// DRM fourcc, e.g. XRGB8888.
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub stride: u32,
+    pub offset: u32,
+}
+
+/// A texture owned by a [`Placebo`], destroyed on drop. The borrow keeps it
+/// from outliving the device it belongs to.
+#[cfg(target_os = "linux")]
+pub struct Texture<'p> {
+    pl: &'p Placebo,
+    tex: std::ptr::NonNull<ffi::Tex>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Texture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the texture belongs to this live device and is freed once.
+        unsafe { ffi::cf_pl_tex_destroy(self.pl.handle.as_ptr(), self.tex.as_ptr()) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Placebo {
+    /// Imports a dma-buf as a texture to render into. libplacebo duplicates
+    /// the fd, so the caller keeps its own.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo cannot import it (see its log).
+    pub fn import_dmabuf(&self, t: &DmaBufTarget<'_>) -> Result<Texture<'_>, Error> {
+        use std::os::fd::AsRawFd;
+        let dim = |v: u32| c_int::try_from(v).map_err(|_| Error::BadInput);
+        // SAFETY: the fd is valid for the call, and libplacebo duplicates it
+        // rather than taking ownership; the handle is live.
+        let tex = unsafe {
+            ffi::cf_pl_import_dmabuf(
+                self.handle.as_ptr(),
+                t.fd.as_raw_fd(),
+                dim(t.width)?,
+                dim(t.height)?,
+                t.fourcc,
+                t.modifier,
+                t.stride,
+                t.offset,
+            )
+        };
+        std::ptr::NonNull::new(tex)
+            .map(|tex| Texture { pl: self, tex })
+            .ok_or(Error::Render)
+    }
+
+    /// Uploads a `w` x `h` RGBA8 image, rows packed, as a texture to render
+    /// from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] if the size is wrong, [`Error::Render`] if
+    /// libplacebo fails.
+    pub fn upload_rgba8(&self, w: u32, h: u32, rgba: &[u8]) -> Result<Texture<'_>, Error> {
+        if rgba.len() != (w as usize) * (h as usize) * 4 || w == 0 || h == 0 {
+            return Err(Error::BadInput);
+        }
+        let dim = |v: u32| c_int::try_from(v).map_err(|_| Error::BadInput);
+        // SAFETY: `rgba` holds w * h * 4 bytes, which libplacebo copies.
+        let tex = unsafe {
+            ffi::cf_pl_upload_rgba8(self.handle.as_ptr(), dim(w)?, dim(h)?, rgba.as_ptr())
+        };
+        std::ptr::NonNull::new(tex)
+            .map(|tex| Texture { pl: self, tex })
+            .ok_or(Error::Render)
+    }
+
+    /// Renders `src` over the whole of `dst` and waits for the GPU to finish,
+    /// so `dst` can go to the display.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo fails (see its log).
+    pub fn render(&self, src: &Texture<'_>, dst: &Texture<'_>) -> Result<(), Error> {
+        // SAFETY: both textures belong to this live device.
+        let rc =
+            unsafe { ffi::cf_pl_render(self.handle.as_ptr(), src.tex.as_ptr(), dst.tex.as_ptr()) };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl Drop for Placebo {
     fn drop(&mut self) {

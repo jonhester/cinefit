@@ -389,5 +389,107 @@ fn gpu() -> Result<(), Box<dyn std::error::Error>> {
     if max_diff > 1 {
         return Err("identity render changed the image".into());
     }
+    scanout_check(&pl, w, h, &rgba)
+}
+
+/// Renders the pattern into a real GBM scanout buffer through a dma-buf
+/// import, reads the buffer back through the CPU and compares. Allocates on
+/// the display device but shows nothing.
+#[cfg(target_os = "linux")]
+fn scanout_check(
+    pl: &cinefit_render::Placebo,
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsFd;
+
+    let mut out = cinefit_kms::Output::open(None)?;
+    let modes = out.modes();
+    let index = modes
+        .iter()
+        .position(|m| usize::from(m.width) == w && usize::from(m.height) == h)
+        .ok_or_else(|| format!("the display offers no {w}x{h} mode"))?;
+    let frame = out.create_scanout(index)?;
+    let buf = out.export(frame)?;
+    let target = pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+        fd: buf.fd.as_fd(),
+        width: buf.width,
+        height: buf.height,
+        fourcc: buf.fourcc,
+        modifier: buf.modifier,
+        stride: buf.stride,
+        offset: buf.offset,
+    })?;
+    let src = pl.upload_rgba8(w as u32, h as u32, rgba)?;
+    let started = Instant::now();
+    pl.render(&src, &target)?;
+    let took = started.elapsed();
+
+    // XRGB8888 is B, G, R, X in memory.
+    let (max_diff, first_bad, samples) = out.read_scanout(frame, |px, stride| {
+        let mut worst = 0u8;
+        let mut first_bad = None;
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * stride + x * 4;
+                let i = (y * w + x) * 4;
+                let d = [
+                    (px[o + 2], rgba[i]),
+                    (px[o + 1], rgba[i + 1]),
+                    (px[o], rgba[i + 2]),
+                ]
+                .iter()
+                .map(|(got, want)| got.abs_diff(*want))
+                .max()
+                .unwrap_or(0);
+                if d > 1 && first_bad.is_none() {
+                    first_bad = Some((x, y, px[o..o + 4].to_vec(), rgba[i..i + 4].to_vec()));
+                }
+                worst = worst.max(d);
+            }
+        }
+        // Raw bytes at a few known points: a corner (border), bars, the ramp.
+        let samples: Vec<_> = [
+            (0, 0),
+            (w / 16, h / 3),
+            (w * 3 / 16, h / 3),
+            (w / 2, h * 5 / 6),
+        ]
+        .iter()
+        .map(|&(x, y)| {
+            let o = y * stride + x * 4;
+            let i = (y * w + x) * 4;
+            (x, y, px[o..o + 4].to_vec(), rgba[i..i + 4].to_vec())
+        })
+        .collect::<Vec<_>>();
+        (worst, first_bad, samples)
+    })?;
+    // Raw bytes only when something is wrong: they tell a channel swap, a
+    // stride mix-up and missing writes apart at a glance.
+    if max_diff > 1 {
+        for (x, y, got, want) in samples.iter().chain(first_bad.iter()) {
+            println!("  ({x}, {y}): buffer bytes {got:02x?}, expected RGBA {want:02x?}");
+        }
+    }
+    println!(
+        "scanout render {w}x{h} (GBM, modifier {:#x}, stride {}): largest difference {max_diff} (of 255), {:.1} ms",
+        buf.modifier,
+        buf.stride,
+        took.as_secs_f64() * 1000.0
+    );
+    if max_diff > 1 {
+        return Err("render into the scanout buffer changed the image".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scanout_check(
+    _pl: &cinefit_render::Placebo,
+    _w: usize,
+    _h: usize,
+    _rgba: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }

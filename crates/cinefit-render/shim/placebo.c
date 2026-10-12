@@ -127,3 +127,79 @@ done:
     pl_tex_destroy(gpu, &dst);
     return rc;
 }
+
+static void log_err(struct cf_pl *pl, const char *msg) {
+    if (pl->log_cb) pl->log_cb(pl->log_ctx, PL_LOG_ERR, msg);
+}
+
+static pl_tex unwrap_tex(cf_pl_tex *t) { return (pl_tex)(const void *)t; }
+static cf_pl_tex *wrap_tex(pl_tex t) { return (cf_pl_tex *)(void *)t; }
+
+cf_pl_tex *cf_pl_import_dmabuf(cf_pl *pl, int fd, int w, int h, uint32_t fourcc,
+                               uint64_t modifier, uint32_t stride, uint32_t offset) {
+    pl_gpu gpu = pl->vk->gpu;
+    pl_fmt fmt = pl_find_fourcc(gpu, fourcc);
+    // libplacebo registers the A variant of formats with a padding byte
+    // (ARGB8888, not XRGB8888). The memory layout is the same and a render
+    // target's fourth byte goes unused, so fall back to it. DRM's X and A
+    // codes differ only in their first character: 'XR24' and 'AR24'.
+    if (!fmt && (fourcc & 0xFF) == 'X')
+        fmt = pl_find_fourcc(gpu, (fourcc & ~0xFFu) | 'A');
+    if (!fmt) {
+        log_err(pl, "no libplacebo format for the scanout buffer's DRM fourcc");
+        return NULL;
+    }
+    // libplacebo dup()s the fd for the import and closes only its own copy.
+    pl_tex tex = pl_tex_create(gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .renderable = true,
+        .import_handle = PL_HANDLE_DMA_BUF,
+        .shared_mem = {
+            .handle.fd = fd,
+            .size = (size_t)stride * (size_t)h,
+            .offset = offset,
+            .drm_format_mod = modifier,
+            // In bytes, despite the name: libplacebo hands it to Vulkan as
+            // the plane's rowPitch (gpu_tex.c, v7.360.0). Passing pixels
+            // packs several GPU rows into each real one.
+            .stride_w = stride,
+        },
+    ));
+    return wrap_tex(tex);
+}
+
+cf_pl_tex *cf_pl_upload_rgba8(cf_pl *pl, int w, int h, const uint8_t *rgba) {
+    pl_gpu gpu = pl->vk->gpu;
+    pl_fmt fmt = pl_find_named_fmt(gpu, "rgba8");
+    if (!fmt) {
+        log_err(pl, "no rgba8 texture format");
+        return NULL;
+    }
+    pl_tex tex = pl_tex_create(gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .sampleable = true, .initial_data = rgba));
+    return wrap_tex(tex);
+}
+
+void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *t) {
+    pl_tex tex = unwrap_tex(t);
+    pl_tex_destroy(pl->vk->gpu, &tex);
+}
+
+int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst) {
+    struct pl_frame image = {
+        .num_planes = 1,
+        .planes = {{ .texture = unwrap_tex(src), .components = 3, .component_mapping = {0, 1, 2} }},
+        .repr = pl_color_repr_rgb,
+        .color = pl_color_space_srgb,
+    };
+    struct pl_frame target = image;
+    target.planes[0].texture = unwrap_tex(dst);
+
+    struct pl_render_params params = pl_render_default_params;
+    params.dither_params = NULL;
+    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    // Before the display reads the buffer, the GPU must be done writing it.
+    // Waiting here is the simple way; a fence handed to the flip can replace
+    // it later.
+    pl_gpu_finish(pl->vk->gpu);
+    return 0;
+}

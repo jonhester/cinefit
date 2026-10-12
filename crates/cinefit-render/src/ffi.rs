@@ -24,6 +24,13 @@ pub struct Handle {
     _opaque: [u8; 0],
 }
 
+/// Opaque `cf_pl_tex`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct Tex {
+    _opaque: [u8; 0],
+}
+
 #[cfg(target_os = "linux")]
 pub type LogCallback = unsafe extern "C" fn(ctx: *mut c_void, level: c_int, msg: *const c_char);
 
@@ -45,4 +52,17 @@ unsafe extern "C" {
         input: *const u8,
         out: *mut u8,
     ) -> c_int;
+    pub fn cf_pl_import_dmabuf(
+        pl: *mut Handle,
+        fd: c_int,
+        w: c_int,
+        h: c_int,
+        fourcc: u32,
+        modifier: u64,
+        stride: u32,
+        offset: u32,
+    ) -> *mut Tex;
+    pub fn cf_pl_upload_rgba8(pl: *mut Handle, w: c_int, h: c_int, rgba: *const u8) -> *mut Tex;
+    pub fn cf_pl_tex_destroy(pl: *mut Handle, tex: *mut Tex);
+    pub fn cf_pl_render(pl: *mut Handle, src: *mut Tex, dst: *mut Tex) -> c_int;
 }
