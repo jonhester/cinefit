@@ -1,8 +1,6 @@
 //! Declarations for `shim/shim.h`. Hand-written; keep the two in step.
-//!
-//! The types compile on every platform so the conversions built on them can be
-//! tested anywhere; only the functions need the shim, and so Linux.
 
+use std::ffi::{c_char, c_int};
 use std::mem::{offset_of, size_of};
 
 pub const UNKNOWN: i64 = -1;
@@ -34,46 +32,37 @@ const _: () = assert!(offset_of!(DeviceInfo, input_connections) == 272);
 const _: () = assert!(offset_of!(DeviceInfo, input_format_detection) == 280);
 const _: () = assert!(offset_of!(DeviceInfo, hdr_metadata) == 284);
 
-#[cfg(target_os = "linux")]
-pub use self::linux::*;
+impl DeviceInfo {
+    /// Nothing reported: a safe starting value for the shim to fill. If the
+    /// shim ever skips a field, it reads as unreported, not as "no".
+    pub const UNREPORTED: Self = Self {
+        display_name: [0; 128],
+        model_name: [0; 128],
+        persistent_id: UNKNOWN,
+        video_io_support: UNKNOWN,
+        input_connections: UNKNOWN,
+        input_format_detection: UNKNOWN as i32,
+        hdr_metadata: UNKNOWN as i32,
+    };
+}
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use super::{DeviceInfo, UNKNOWN};
-    use std::ffi::c_int;
+/// Opaque `cf_dl_iterator`.
+#[repr(C)]
+pub struct IteratorHandle {
+    _opaque: [u8; 0],
+}
 
-    impl DeviceInfo {
-        /// Nothing reported: a safe starting value for the shim to fill. If the
-        /// shim ever skips a field, it reads as unreported, not as "no".
-        pub const UNREPORTED: Self = Self {
-            display_name: [0; 128],
-            model_name: [0; 128],
-            persistent_id: UNKNOWN,
-            video_io_support: UNKNOWN,
-            input_connections: UNKNOWN,
-            input_format_detection: UNKNOWN as i32,
-            hdr_metadata: UNKNOWN as i32,
-        };
-    }
+/// Opaque `cf_dl_device`.
+#[repr(C)]
+pub struct DeviceHandle {
+    _opaque: [u8; 0],
+}
 
-    /// Opaque `cf_dl_iterator`.
-    #[repr(C)]
-    pub struct IteratorHandle {
-        _opaque: [u8; 0],
-    }
-
-    /// Opaque `cf_dl_device`.
-    #[repr(C)]
-    pub struct DeviceHandle {
-        _opaque: [u8; 0],
-    }
-
-    unsafe extern "C" {
-        pub fn cf_dl_api_version(version: *mut i64) -> c_int;
-        pub fn cf_dl_iterator_create() -> *mut IteratorHandle;
-        pub fn cf_dl_iterator_next(it: *mut IteratorHandle) -> *mut DeviceHandle;
-        pub fn cf_dl_iterator_release(it: *mut IteratorHandle);
-        pub fn cf_dl_device_get_info(dev: *mut DeviceHandle, out: *mut DeviceInfo);
-        pub fn cf_dl_device_release(dev: *mut DeviceHandle);
-    }
+unsafe extern "C" {
+    pub fn cf_dl_api_version(version: *mut i64, err: *mut c_char, err_len: usize) -> c_int;
+    pub fn cf_dl_iterator_create() -> *mut IteratorHandle;
+    pub fn cf_dl_iterator_next(it: *mut IteratorHandle) -> *mut DeviceHandle;
+    pub fn cf_dl_iterator_release(it: *mut IteratorHandle);
+    pub fn cf_dl_device_get_info(dev: *mut DeviceHandle, out: *mut DeviceInfo);
+    pub fn cf_dl_device_release(dev: *mut DeviceHandle);
 }

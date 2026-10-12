@@ -16,7 +16,6 @@ fn main() -> ExitCode {
 
 /// Lists DeckLink devices and what they report. Discovery only: it opens no
 /// input, so it is safe while another program is capturing.
-#[cfg(target_os = "linux")]
 fn probe() -> ExitCode {
     let version = match cinefit_decklink::api_version() {
         Ok(v) => v,
@@ -55,10 +54,4 @@ fn probe() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
-}
-
-#[cfg(not(target_os = "linux"))]
-fn probe() -> ExitCode {
-    eprintln!("DeckLink capture is only supported on Linux");
-    ExitCode::FAILURE
 }

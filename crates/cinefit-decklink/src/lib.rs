@@ -1,13 +1,14 @@
 //! DeckLink capture, through a small C++ shim over Blackmagic's SDK.
 //!
-//! Talking to the card is Linux only: the SDK loads `libDeckLinkAPI.so`, which
-//! ships with the Desktop Video driver, at run time. The types and conversions
-//! here build everywhere so they can be tested on any machine.
+//! The SDK loads `libDeckLinkAPI.so`, which ships with the Desktop Video driver,
+//! at run time, so everything builds and tests on any machine; without the
+//! driver, calls fail with [`Error::DriverNotLoaded`].
 
 mod ffi;
 
 use std::ffi::CStr;
 use std::fmt;
+use std::ptr::NonNull;
 
 // Bits from the SDK's BMDVideoIOSupport and BMDVideoConnection.
 const DEVICE_SUPPORTS_CAPTURE: i64 = 1 << 0;
@@ -15,8 +16,9 @@ const VIDEO_CONNECTION_HDMI: i64 = 1 << 1;
 
 #[derive(Debug)]
 pub enum Error {
-    /// `libDeckLinkAPI.so` could not be loaded: the driver is not installed.
-    DriverNotLoaded,
+    /// `libDeckLinkAPI.so` could not be loaded, usually because the Desktop
+    /// Video driver is not installed. `reason` is the loader's own message.
+    DriverNotLoaded { reason: String },
     /// The driver loaded but did not report its version, so it cannot be
     /// checked against [`ApiVersion::REQUIRED`].
     VersionUnreported,
@@ -28,8 +30,8 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::DriverNotLoaded => {
-                f.write_str("DeckLink driver not loaded (is Desktop Video installed?)")
+            Error::DriverNotLoaded { reason } => {
+                write!(f, "DeckLink driver not loaded: {reason}")
             }
             Error::VersionUnreported => f.write_str("DeckLink driver did not report its version"),
             Error::DriverTooOld { found } => write!(
@@ -113,95 +115,95 @@ fn c_string(buf: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(target_os = "linux")]
-pub use self::linux::*;
+/// The installed driver's API version.
+///
+/// # Errors
+///
+/// [`Error::DriverNotLoaded`] if the Desktop Video driver is not installed,
+/// or [`Error::VersionUnreported`] if it does not say which version it is.
+pub fn api_version() -> Result<ApiVersion, Error> {
+    let mut raw = ffi::UNKNOWN;
+    // Room for the loader's message, which on macOS lists every path tried.
+    let mut err = [0u8; 2048];
+    // SAFETY: both pointers are live; the shim writes one `i64` through the
+    // first and at most `err.len()` bytes, NUL-terminated, through the second.
+    let rc = unsafe { ffi::cf_dl_api_version(&mut raw, err.as_mut_ptr().cast(), err.len()) };
+    if rc != 0 {
+        return Err(Error::DriverNotLoaded {
+            reason: c_string(&err),
+        });
+    }
+    if raw == ffi::UNKNOWN {
+        return Err(Error::VersionUnreported);
+    }
+    Ok(ApiVersion::from_raw(raw))
+}
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use super::{ApiVersion, DeviceInfo, Error, ffi};
-    use std::ptr::NonNull;
-
-    /// The installed driver's API version.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::DriverNotLoaded`] if the Desktop Video driver is not installed,
-    /// or [`Error::VersionUnreported`] if it does not say which version it is.
-    pub fn api_version() -> Result<ApiVersion, Error> {
-        let mut raw = ffi::UNKNOWN;
-        // SAFETY: the shim writes one `i64` through the pointer, which is live.
-        let rc = unsafe { ffi::cf_dl_api_version(&mut raw) };
-        if rc != 0 {
-            return Err(Error::DriverNotLoaded);
-        }
-        if raw == ffi::UNKNOWN {
-            return Err(Error::VersionUnreported);
-        }
-        Ok(ApiVersion::from_raw(raw))
+/// Every DeckLink device the driver can see, in the driver's order.
+///
+/// # Errors
+///
+/// Any error from [`api_version`], or [`Error::DriverTooOld`] if the driver
+/// predates [`ApiVersion::REQUIRED`]. No devices is not an error: the
+/// result is empty.
+pub fn devices() -> Result<Vec<Device>, Error> {
+    // An old driver lacks the iterator entry point, and the SDK reports
+    // that the same way as a missing driver, so check first.
+    let found = api_version()?;
+    if found < ApiVersion::REQUIRED {
+        return Err(Error::DriverTooOld { found });
     }
 
-    /// Every DeckLink device the driver can see, in the driver's order.
-    ///
-    /// # Errors
-    ///
-    /// Any error from [`api_version`], or [`Error::DriverTooOld`] if the driver
-    /// predates [`ApiVersion::REQUIRED`]. No devices is not an error: the
-    /// result is empty.
-    pub fn devices() -> Result<Vec<Device>, Error> {
-        // An old driver lacks the iterator entry point, and the SDK reports
-        // that the same way as a missing driver, so check first.
-        let found = api_version()?;
-        if found < ApiVersion::REQUIRED {
-            return Err(Error::DriverTooOld { found });
+    // SAFETY: no preconditions. The driver loaded and is new enough, so null
+    // means it lacks the entry point despite its version.
+    let it = NonNull::new(unsafe { ffi::cf_dl_iterator_create() }).ok_or_else(|| {
+        Error::DriverNotLoaded {
+            reason: "libDeckLinkAPI.so has no device iterator entry point".into(),
         }
+    })?;
+    let it = Iter(it);
 
-        // SAFETY: no preconditions; null means the driver is not loaded.
-        let it =
-            NonNull::new(unsafe { ffi::cf_dl_iterator_create() }).ok_or(Error::DriverNotLoaded)?;
-        let it = Iter(it);
-
-        let mut out = Vec::new();
-        // SAFETY: `it` is a live iterator; each non-null result carries a
-        // reference that `Device` takes ownership of.
-        while let Some(dev) = NonNull::new(unsafe { ffi::cf_dl_iterator_next(it.0.as_ptr()) }) {
-            out.push(Device(dev));
-        }
-        Ok(out)
+    let mut out = Vec::new();
+    // SAFETY: `it` is a live iterator; each non-null result carries a
+    // reference that `Device` takes ownership of.
+    while let Some(dev) = NonNull::new(unsafe { ffi::cf_dl_iterator_next(it.0.as_ptr()) }) {
+        out.push(Device(dev));
     }
+    Ok(out)
+}
 
-    struct Iter(NonNull<ffi::IteratorHandle>);
+struct Iter(NonNull<ffi::IteratorHandle>);
 
-    impl Drop for Iter {
-        fn drop(&mut self) {
-            // SAFETY: we hold the only reference this wrapper took.
-            unsafe { ffi::cf_dl_iterator_release(self.0.as_ptr()) }
-        }
+impl Drop for Iter {
+    fn drop(&mut self) {
+        // SAFETY: we hold the only reference this wrapper took.
+        unsafe { ffi::cf_dl_iterator_release(self.0.as_ptr()) }
     }
+}
 
-    /// One DeckLink device, from [`devices`]. Holds an SDK reference, released
-    /// on drop.
-    ///
-    /// Not `Send` or `Sync` for now: nothing needs a device on another thread
-    /// yet, and the SDK's threading rules for it are not established here.
-    #[derive(Debug)]
-    pub struct Device(NonNull<ffi::DeviceHandle>);
+/// One DeckLink device, from [`devices`]. Holds an SDK reference, released
+/// on drop.
+///
+/// Not `Send` or `Sync` for now: nothing needs a device on another thread
+/// yet, and the SDK's threading rules for it are not established here.
+#[derive(Debug)]
+pub struct Device(NonNull<ffi::DeviceHandle>);
 
-    impl Device {
-        /// What the device reports about itself; see [`DeviceInfo`].
-        pub fn info(&self) -> DeviceInfo {
-            let mut raw = ffi::DeviceInfo::UNREPORTED;
-            // SAFETY: the device is live, and `raw` is a valid, writable struct
-            // whose layout the shim shares.
-            unsafe { ffi::cf_dl_device_get_info(self.0.as_ptr(), &mut raw) };
-            DeviceInfo::from(&raw)
-        }
+impl Device {
+    /// What the device reports about itself; see [`DeviceInfo`].
+    pub fn info(&self) -> DeviceInfo {
+        let mut raw = ffi::DeviceInfo::UNREPORTED;
+        // SAFETY: the device is live, and `raw` is a valid, writable struct
+        // whose layout the shim shares.
+        unsafe { ffi::cf_dl_device_get_info(self.0.as_ptr(), &mut raw) };
+        DeviceInfo::from(&raw)
     }
+}
 
-    impl Drop for Device {
-        fn drop(&mut self) {
-            // SAFETY: we hold the only reference this wrapper took.
-            unsafe { ffi::cf_dl_device_release(self.0.as_ptr()) }
-        }
+impl Drop for Device {
+    fn drop(&mut self) {
+        // SAFETY: we hold the only reference this wrapper took.
+        unsafe { ffi::cf_dl_device_release(self.0.as_ptr()) }
     }
 }
 
@@ -214,12 +216,7 @@ mod tests {
         display_name[..name.len()].copy_from_slice(name.as_bytes());
         ffi::DeviceInfo {
             display_name,
-            model_name: [0; 128],
-            persistent_id: ffi::UNKNOWN,
-            video_io_support: ffi::UNKNOWN,
-            input_connections: ffi::UNKNOWN,
-            input_format_detection: ffi::UNKNOWN as i32,
-            hdr_metadata: ffi::UNKNOWN as i32,
+            ..ffi::DeviceInfo::UNREPORTED
         }
     }
 

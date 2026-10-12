@@ -7,6 +7,7 @@
 #ifndef CINEFIT_DECKLINK_SHIM_H
 #define CINEFIT_DECKLINK_SHIM_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -43,8 +44,9 @@ typedef struct {
 /* Writes the driver's API version into *version, encoded like the SDK's
  * BLACKMAGIC_DECKLINK_API_VERSION (0xMMmmpp00), or CF_DL_UNKNOWN if the driver
  * does not report it. Returns 0, or -1 if the driver library could not be
- * loaded. */
-int cf_dl_api_version(int64_t *version) CF_DL_NOEXCEPT;
+ * loaded, with the reason written into err. Call this before anything else:
+ * it is what keeps the SDK from printing load failures to stderr. */
+int cf_dl_api_version(int64_t *version, char *err, size_t err_len) CF_DL_NOEXCEPT;
 
 /* Null if the driver library could not be loaded, or is older than the
  * headers the shim was built with. */

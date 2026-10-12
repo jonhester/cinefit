@@ -2,12 +2,8 @@ fn main() {
     println!("cargo::rerun-if-changed=shim");
     println!("cargo::rerun-if-changed=vendor/decklink-sdk/include");
 
-    // The SDK's dispatch layer dlopens libDeckLinkAPI.so, so this is Linux
-    // only. Elsewhere the crate builds empty and the shim is never compiled.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
-        return;
-    }
-
+    // The SDK's dispatch layer dlopens libDeckLinkAPI.so at run time, so this
+    // builds anywhere with a C++ compiler; only running needs the driver.
     // Blackmagic's file is built as shipped, without our warning flags: its
     // warnings are not ours to fix.
     cc::Build::new()

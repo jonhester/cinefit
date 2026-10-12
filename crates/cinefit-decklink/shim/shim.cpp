@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <dlfcn.h>
+
 #include "DeckLinkAPI.h"
 #include "DeckLinkAPIVersion.h"
 
@@ -49,10 +51,26 @@ int64_t integer(IDeckLinkProfileAttributes *a, BMDDeckLinkAttributeID id) {
 
 } // namespace
 
-extern "C" int cf_dl_api_version(int64_t *version) noexcept {
-    // Null when libDeckLinkAPI.so is missing: the driver is not installed.
+extern "C" int cf_dl_api_version(int64_t *version, char *err, size_t err_len) noexcept {
+    if (err_len) err[0] = '\0';
+
+    // Load the driver before the SDK does. When it is missing, the SDK prints
+    // dlerror() to stderr; this hands the reason to the caller instead. When it
+    // is present, the SDK's own dlopen finds it already loaded. The name is the
+    // one the SDK's dispatch layer uses, which it defines only in its .cpp.
+    void *lib = dlopen("libDeckLinkAPI.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!lib) {
+        const char *why = dlerror();
+        if (err_len) snprintf(err, err_len, "%s", why ? why : "unknown dlopen error");
+        return -1;
+    }
+
     IDeckLinkAPIInformation *info = CreateDeckLinkAPIInformationInstance();
-    if (!info) return -1;
+    dlclose(lib); // The SDK holds its own reference now.
+    if (!info) {
+        if (err_len) snprintf(err, err_len, "libDeckLinkAPI.so has no API information entry point");
+        return -1;
+    }
     if (info->GetInt(BMDDeckLinkAPIVersion, version) != S_OK)
         *version = CF_DL_UNKNOWN;
     info->Release();

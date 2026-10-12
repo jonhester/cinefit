@@ -7,9 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-
-# Capture needs the DeckLink driver, which only exists on Linux.
-[target.'cfg(target_os = "linux")'.dependencies]
 cinefit-decklink = { path = "../cinefit-decklink" }
 
 [lints]

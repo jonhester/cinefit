@@ -1,5 +1,8 @@
 # cinefit
 
+Runs on Linux with Blackmagic's Desktop Video driver. It builds and its tests
+run on any platform; without the driver, it reports that it is not loaded.
+
 ## License
 
 Licensed under either of
