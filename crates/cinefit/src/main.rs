@@ -39,6 +39,20 @@ enum Command {
         #[arg(long, default_value_t = 1.0, requires = "dump")]
         dump_every: f64,
     },
+    /// Show a test pattern on the display and measure flip pacing. Needs the
+    /// display to itself: nothing else may be driving it.
+    Pattern {
+        /// How long to run, in seconds.
+        #[arg(short = 't', long, default_value_t = 30.0)]
+        seconds: f64,
+        /// The mode, as WIDTHxHEIGHT@HZ. The default is a 17:9 panel's full
+        /// width at film rate.
+        #[arg(short, long, default_value = "4096x2160@23.976")]
+        mode: cinefit_kms::ModeRequest,
+        /// The DRM device; by default the first with a connected display.
+        #[arg(long)]
+        card: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -50,6 +64,11 @@ fn main() -> ExitCode {
             dump,
             dump_every,
         } => capture(seconds, device, dump, dump_every),
+        Command::Pattern {
+            seconds,
+            mode,
+            card,
+        } => pattern(seconds, mode, card),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -167,5 +186,99 @@ fn capture(
         let written = writer.join().map_err(|_| "dump writer panicked")?;
         println!("dumped {written} frames to {}", dir.display());
     }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pattern(
+    _seconds: f64,
+    _mode: cinefit_kms::ModeRequest,
+    _card: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("display output is only supported on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn pattern(
+    seconds: f64,
+    want: cinefit_kms::ModeRequest,
+    card: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use cinefit_kms::pattern;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let run_for = Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|d| !d.is_zero())
+        .ok_or("--seconds must be a positive number")?;
+
+    let mut out = cinefit_kms::Output::open(card.as_deref())?;
+    println!("output: {}", out.describe());
+    let modes = out.modes();
+    let Some(index) = cinefit_kms::choose_mode(&modes, &want) else {
+        eprintln!("progressive modes offered:");
+        for m in modes.iter().filter(|m| !m.interlaced) {
+            eprintln!("  {m}{}", if m.preferred { " (preferred)" } else { "" });
+        }
+        return Err(format!(
+            "no {}x{} mode within 0.01 Hz of {}",
+            want.width, want.height, want.refresh_hz
+        )
+        .into());
+    };
+    let mode = modes[index];
+    println!("mode: {mode}");
+    let (w, h) = (usize::from(mode.width), usize::from(mode.height));
+
+    // Two buffers: one on screen while the other is drawn.
+    let frames = [out.create_frame(index)?, out.create_frame(index)?];
+    for &f in &frames {
+        out.draw(f, |px, pitch| pattern::draw_background(px, pitch, w, h))?;
+    }
+    let mut bar_at: [Option<usize>; 2] = [None, None];
+    let x0 = pattern::bar_x(0, w);
+    out.draw(frames[0], |px, pitch| {
+        pattern::move_bar(px, pitch, w, h, None, x0)
+    })?;
+    bar_at[0] = Some(x0);
+    out.modeset(index, frames[0])?;
+
+    // Ctrl-C ends the run and still restores the display and prints the
+    // summary; a second one exits at once.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let mut presses = 0;
+    ctrlc::set_handler(move || {
+        presses += 1;
+        if presses > 1 {
+            std::process::exit(130);
+        }
+        flag.store(true, Ordering::Relaxed);
+    })?;
+
+    let started = Instant::now();
+    let mut pacing = cinefit_kms::Pacing::default();
+    let (mut shown, mut frame) = (0usize, 0u64);
+    while started.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
+        frame += 1;
+        let next = 1 - shown;
+        let x = pattern::bar_x(frame, w);
+        let old = bar_at[next];
+        out.draw(frames[next], |px, pitch| {
+            pattern::move_bar(px, pitch, w, h, old, x)
+        })?;
+        bar_at[next] = Some(x);
+        out.flip(frames[next])?;
+        let flip = out.wait_flip()?;
+        pacing.on_flip(flip.sequence, flip.at);
+        shown = next;
+    }
+    out.restore()?;
+
+    if stop.load(Ordering::Relaxed) {
+        println!("stopped early by Ctrl-C");
+    }
+    println!("ran {:.1} s", started.elapsed().as_secs_f64());
+    print!("{}", pacing.summary(mode.period()));
     Ok(())
 }
