@@ -115,7 +115,9 @@ typedef struct {
  * them makes the card drop frames. */
 
 /* Returns the BMDPixelFormat to re-enable the input with on the detected mode,
- * or 0 to leave it running as it is. */
+ * or 0 to leave it running as it is. Also called once from cf_dl_input_start,
+ * on the caller's thread, with enabled_mode 0, to choose the opening format.
+ * An input left running at process exit is stopped by an atexit handler. */
 typedef uint32_t (*cf_dl_format_cb)(void *ctx, const cf_dl_format *format);
 /* Hands over one reference to frame; the callee releases it. */
 typedef void (*cf_dl_frame_cb)(void *ctx, cf_dl_frame *frame, const cf_dl_frame_info *info);
@@ -123,7 +125,9 @@ typedef void (*cf_dl_frame_cb)(void *ctx, cf_dl_frame *frame, const cf_dl_frame_
 /* Null if the device has no capture input. */
 cf_dl_input *cf_dl_input_open(cf_dl_device *dev) CF_DL_NOEXCEPT;
 
-/* Enables the input with format detection and starts it. Returns 0, or the
+/* Enables the input with format detection and starts it: in the mode the card
+ * already detects, with on_format called once first to choose the pixel
+ * format, or in a fallback mode if it detects none. Returns 0, or the
  * failing call's HRESULT with its name in *failed_call. E_ACCESSDENIED from
  * EnableVideoInput means another program holds the input. Callbacks may run
  * from here until cf_dl_input_stop returns, with ctx passed through. */

@@ -488,6 +488,25 @@ mod tests {
     }
 
     #[test]
+    fn at_opening_a_format_is_always_named() {
+        // The shim asks once before enabling the input, with nothing enabled
+        // (mode and pixel format 0): the answer must name the format to open
+        // in, whatever the input is.
+        for flags in [
+            DETECTED_10BIT,
+            DETECTED_RGB444 | DETECTED_8BIT,
+            DETECTED_RGB444,
+            0,
+        ] {
+            let mut raw = raw_format(flags);
+            raw.enabled_mode = 0;
+            raw.enabled_pixel_format = 0;
+            let f = InputFormat::from(&raw);
+            assert_eq!(f.restart_with(), Some(f.capture_as()));
+        }
+    }
+
+    #[test]
     fn rate_stays_a_fraction() {
         let f = InputFormat::from(&raw_format(DETECTED_10BIT));
         assert_eq!((f.time_scale, f.frame_duration), (24000, 1001));
