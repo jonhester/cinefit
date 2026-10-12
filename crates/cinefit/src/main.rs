@@ -3,6 +3,7 @@
 
 mod capture;
 mod compare;
+mod follow;
 #[cfg(target_os = "linux")]
 mod play;
 mod record;
