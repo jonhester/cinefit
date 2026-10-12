@@ -45,6 +45,7 @@ On the machine with the hardware:
     cinefit probe --edid               # also the input EDID: may be an upstream hotplug
     cinefit gpu                        # Vulkan, libplacebo, v210 unpack and renders read back
     cinefit capture -t 20 [--dump DIR] # what arrives on the input
+    cinefit capture -t 180 --record DIR # every frame, through zstd (needs zstd)
     cinefit pattern -t 30 [--gpu] [--hdr]   # puts a picture on the display
 
 `CINEFIT_DOVI_DUMPS=DIR cargo test -p cinefit-dovi --test dumps` decodes saved
