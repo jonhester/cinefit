@@ -160,8 +160,11 @@ cf_pl_tex *cf_pl_import_dmabuf(cf_pl *pl, int fd, int w, int h, uint32_t fourcc,
         return NULL;
     }
     // libplacebo dup()s the fd for the import and closes only its own copy.
+    // Blit target too: a picture placed inside the target leaves bars, which
+    // libplacebo clears with a blit, and refuses to without this.
     pl_tex tex = pl_tex_create(gpu, pl_tex_params(
         .w = w, .h = h, .format = fmt, .renderable = true,
+        .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0,
         .import_handle = PL_HANDLE_DMA_BUF,
         .shared_mem = {
             .handle.fd = fd,
@@ -407,6 +410,13 @@ static enum pl_color_primaries primaries(int p) {
     return p == CF_PL_PRIM_BT2020 ? PL_COLOR_PRIM_BT_2020 : PL_COLOR_PRIM_BT_709;
 }
 
+/* Where in the target the picture goes, as x0, y0, x1, y1 in pixels, or the
+ * whole of it for NULL. libplacebo clears the rest to black. */
+static void set_place(struct pl_frame *target, const float *place) {
+    if (place)
+        target->crop = (pl_rect2df) { place[0], place[1], place[2], place[3] };
+}
+
 static enum pl_color_transfer transfer(int t) {
     switch (t) {
     case CF_PL_TRC_PQ:  return PL_COLOR_TRC_PQ;
@@ -416,7 +426,7 @@ static enum pl_color_transfer transfer(int t) {
 }
 
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
-                       cf_pl_tex *dst, int dst_prim, int dst_trc) {
+                       cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -452,6 +462,7 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
         .repr = pl_color_repr_rgb,
         .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
     };
+    set_place(&target, place);
 
     struct pl_render_params params = pl_render_default_params;
     params.dither_params = NULL;
@@ -616,7 +627,7 @@ int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *r, uint16_t *out) {
 }
 
 int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
-                     cf_pl_tex *dst, int dst_prim, int dst_trc) {
+                     cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place) {
     if (!src->filled) {
         log_err(pl, "RGB read before any frame was unpacked into it");
         return -1;
@@ -640,6 +651,7 @@ int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
         .repr = pl_color_repr_rgb,
         .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
     };
+    set_place(&target, place);
 
     struct pl_render_params params = pl_render_default_params;
     params.dither_params = NULL;
@@ -746,7 +758,7 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
 }
 
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
-                      cf_pl_tex *dst, int dst_prim, int dst_trc) {
+                      cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -802,6 +814,7 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
         .repr = pl_color_repr_rgb,
         .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
     };
+    set_place(&target, place);
 
     struct pl_render_params params = pl_render_default_params;
     params.dither_params = NULL;

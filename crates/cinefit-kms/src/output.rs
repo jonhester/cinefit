@@ -44,6 +44,8 @@ pub enum Error {
     NoDisplay,
     NoCrtc,
     NoPlane,
+    /// The primary plane takes none of the scanout formats used here.
+    NoScanoutFormat,
     /// The driver lacks a property every atomic driver should have.
     MissingProperty(&'static str),
     /// Another program holds the display (DRM master).
@@ -60,6 +62,9 @@ impl fmt::Display for Error {
             Error::NoDisplay => f.write_str("no DRM device has a connected display"),
             Error::NoCrtc => f.write_str("no CRTC can drive the connector"),
             Error::NoPlane => f.write_str("no primary plane for the CRTC"),
+            Error::NoScanoutFormat => {
+                f.write_str("the primary plane takes no XRGB2101010, XBGR2101010 or XRGB8888")
+            }
             Error::MissingProperty(p) => write!(f, "the driver has no {p} property"),
             Error::Busy => f.write_str("another program holds the display (DRM master)"),
             Error::NotScanout => f.write_str("wrong kind of frame for this operation"),
@@ -371,13 +376,37 @@ impl Output {
     }
 
     /// A scanout buffer the size of mode `index`, for the GPU to render into:
-    /// XRGB8888, linear. Linear because both the display engine and the GPU
-    /// always accept it, which the C++ version relied on for the same card;
-    /// tiled layouts can come later if rendering speed calls for them.
+    /// the deepest of [`scanout::PREFERRED`] the plane takes, linear. Linear
+    /// because both the display engine and the GPU always accept it, which
+    /// the C++ version relied on for the same card; tiled layouts can come
+    /// later if rendering speed calls for them.
+    ///
+    /// [`scanout::PREFERRED`]: crate::scanout::PREFERRED
     ///
     /// # Errors
     ///
     /// If GBM cannot allocate it or the driver cannot register it.
+    /// The format [`Self::create_scanout`] allocates: the first of
+    /// [`scanout::PREFERRED`] the primary plane lists.
+    ///
+    /// [`scanout::PREFERRED`]: crate::scanout::PREFERRED
+    ///
+    /// # Errors
+    ///
+    /// If the plane cannot be read or lists none of them.
+    pub fn scanout_format(&self) -> Result<gbm::Format, Error> {
+        let info = self
+            .card
+            .get_plane(self.plane)
+            .map_err(io("reading the plane's formats"))?;
+        let formats = info.formats();
+        crate::scanout::PREFERRED
+            .iter()
+            .find(|f| formats.contains(f))
+            .and_then(|&f| gbm::Format::try_from(f).ok())
+            .ok_or(Error::NoScanoutFormat)
+    }
+
     pub fn create_scanout(&mut self, index: usize) -> Result<usize, Error> {
         let (w, h) = self.modes[index].size();
         if self.gbm.is_none() {
@@ -390,12 +419,13 @@ impl Output {
                 .map_err(io("duplicating the DRM fd"))?;
             self.gbm = Some(gbm::Device::new(file).map_err(io("creating the GBM device"))?);
         }
+        let format = self.scanout_format()?;
         let gbm = self.gbm.as_ref().expect("created above");
         let bo = gbm
             .create_buffer_object_with_modifiers2::<()>(
                 w.into(),
                 h.into(),
-                gbm::Format::Xrgb8888,
+                format,
                 [gbm::Modifier::Linear].into_iter(),
                 gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
             )
@@ -536,9 +566,10 @@ impl Output {
                 {
                     set.push((conn, cs.handle, v));
                 }
-                // 10 bits on the wire, as HDR10 is defined.
+                // 10 bits on the wire, as HDR10 is defined, where the link
+                // carries them; 8 where it does not (`hdmi_bpc`).
                 if let Some(bpc) = p.max_bpc {
-                    set.push((conn, bpc, 10));
+                    set.push((conn, bpc, u64::from(timing(&mode).hdmi_bpc())));
                 }
             }
             None => {
