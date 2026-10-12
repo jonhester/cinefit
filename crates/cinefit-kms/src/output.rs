@@ -12,8 +12,9 @@ use std::time::Duration;
 use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
 use drm::control::{
-    AtomicCommitFlags, Device as ControlDevice, Event, Mode, ModeFlags, ModeTypeFlags, PlaneType,
-    RawResourceHandle, atomic::AtomicModeReq, connector, crtc, framebuffer, plane, property,
+    AtomicCommitFlags, Device as ControlDevice, Event, FbCmd2Flags, Mode, ModeFlags, ModeTypeFlags,
+    PlaneType, RawResourceHandle, atomic::AtomicModeReq, connector, crtc, framebuffer, plane,
+    property,
 };
 use drm::{ClientCapability, Device as BasicDevice};
 
@@ -47,6 +48,9 @@ pub enum Error {
     MissingProperty(&'static str),
     /// Another program holds the display (DRM master).
     Busy,
+    /// The operation needs the other kind of frame: CPU-drawn ones are drawn,
+    /// GBM ones exported and read back.
+    NotScanout,
 }
 
 impl fmt::Display for Error {
@@ -58,6 +62,7 @@ impl fmt::Display for Error {
             Error::NoPlane => f.write_str("no primary plane for the CRTC"),
             Error::MissingProperty(p) => write!(f, "the driver has no {p} property"),
             Error::Busy => f.write_str("another program holds the display (DRM master)"),
+            Error::NotScanout => f.write_str("wrong kind of frame for this operation"),
         }
     }
 }
@@ -91,9 +96,29 @@ struct ColorspaceProp {
 }
 
 /// A CPU-drawn scanout buffer.
-pub struct DumbFrame {
-    buffer: DumbBuffer,
+struct Frame {
+    buffer: FrameBuffer,
     fb: framebuffer::Handle,
+}
+
+/// What backs a frame: memory the CPU draws into, or a GBM scanout buffer
+/// the GPU renders into.
+enum FrameBuffer {
+    Dumb(DumbBuffer),
+    Gbm(gbm::BufferObject<()>),
+}
+
+/// A scanout buffer shared as a dma-buf, for a GPU API to render into.
+pub struct DmaBuf {
+    /// Ours to close; importers duplicate it.
+    pub fd: std::os::fd::OwnedFd,
+    pub width: u32,
+    pub height: u32,
+    /// DRM fourcc, e.g. XRGB8888.
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub stride: u32,
+    pub offset: u32,
 }
 
 /// How [`Output::restore`] left the display.
@@ -139,7 +164,10 @@ pub struct Output {
     saved: Vec<(RawResourceHandle, property::Handle, property::RawValue)>,
     mode_blob: Option<u64>,
     modeset: bool,
-    frames: Vec<DumbFrame>,
+    frames: Vec<Frame>,
+    /// Created on first use, on the card's own open file, so the buffers it
+    /// allocates belong to the same DRM client as the framebuffers.
+    gbm: Option<gbm::Device<File>>,
     /// HDR metadata for the next modeset; `None` signals SDR.
     hdr: Option<HdrStatic>,
     /// The blob on the connector now, and one queued for the next flip.
@@ -296,6 +324,7 @@ impl Output {
             mode_blob: None,
             modeset: false,
             frames: Vec::new(),
+            gbm: None,
             hdr: None,
             hdr_blob: None,
             pending_hdr_blob: None,
@@ -334,8 +363,96 @@ impl Output {
         if let Ok(mut map) = self.card.map_dumb_buffer(&mut buffer) {
             map.as_mut().fill(0);
         }
-        self.frames.push(DumbFrame { buffer, fb });
+        self.frames.push(Frame {
+            buffer: FrameBuffer::Dumb(buffer),
+            fb,
+        });
         Ok(self.frames.len() - 1)
+    }
+
+    /// A scanout buffer the size of mode `index`, for the GPU to render into:
+    /// XRGB8888, linear. Linear because both the display engine and the GPU
+    /// always accept it, which the C++ version relied on for the same card;
+    /// tiled layouts can come later if rendering speed calls for them.
+    ///
+    /// # Errors
+    ///
+    /// If GBM cannot allocate it or the driver cannot register it.
+    pub fn create_scanout(&mut self, index: usize) -> Result<usize, Error> {
+        let (w, h) = self.modes[index].size();
+        if self.gbm.is_none() {
+            // A duplicate of the card's fd: the same open file, so GEM handles
+            // GBM creates are valid for this client's framebuffers.
+            let file = self
+                .card
+                .0
+                .try_clone()
+                .map_err(io("duplicating the DRM fd"))?;
+            self.gbm = Some(gbm::Device::new(file).map_err(io("creating the GBM device"))?);
+        }
+        let gbm = self.gbm.as_ref().expect("created above");
+        let bo = gbm
+            .create_buffer_object_with_modifiers2::<()>(
+                w.into(),
+                h.into(),
+                gbm::Format::Xrgb8888,
+                [gbm::Modifier::Linear].into_iter(),
+                gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
+            )
+            .map_err(io("allocating a GBM scanout buffer"))?;
+        let fb = self
+            .card
+            .add_planar_framebuffer(&bo, FbCmd2Flags::MODIFIERS)
+            .map_err(io("registering a framebuffer"))?;
+        self.frames.push(Frame {
+            buffer: FrameBuffer::Gbm(bo),
+            fb,
+        });
+        Ok(self.frames.len() - 1)
+    }
+
+    /// Shares scanout frame `frame` as a dma-buf.
+    ///
+    /// # Errors
+    ///
+    /// If the frame is not a GBM scanout buffer, or cannot be exported.
+    pub fn export(&self, frame: usize) -> Result<DmaBuf, Error> {
+        let FrameBuffer::Gbm(bo) = &self.frames[frame].buffer else {
+            return Err(Error::NotScanout);
+        };
+        let fd = bo.fd_for_plane(0).map_err(|_| Error::Io {
+            what: "exporting a dma-buf",
+            source: io::Error::other("GBM returned no fd"),
+        })?;
+        Ok(DmaBuf {
+            fd,
+            width: bo.width(),
+            height: bo.height(),
+            fourcc: bo.format() as u32,
+            modifier: bo.modifier().into(),
+            stride: bo.stride_for_plane(0),
+            offset: bo.offset(0),
+        })
+    }
+
+    /// Reads scanout frame `frame` back through the CPU, with
+    /// `read(pixels, stride)`. For checks, not for every frame.
+    ///
+    /// # Errors
+    ///
+    /// If the frame is not a GBM scanout buffer, or cannot be mapped.
+    pub fn read_scanout<T>(
+        &self,
+        frame: usize,
+        read: impl FnOnce(&[u8], usize) -> T,
+    ) -> Result<T, Error> {
+        let FrameBuffer::Gbm(bo) = &self.frames[frame].buffer else {
+            return Err(Error::NotScanout);
+        };
+        bo.map(0, 0, bo.width(), bo.height(), |m| {
+            read(m.buffer(), m.stride() as usize)
+        })
+        .map_err(io("mapping a scanout buffer"))
     }
 
     /// Draws into frame `frame` with `draw(pixels, pitch)`.
@@ -344,11 +461,13 @@ impl Output {
     ///
     /// If the buffer cannot be mapped.
     pub fn draw(&mut self, frame: usize, draw: impl FnOnce(&mut [u8], usize)) -> Result<(), Error> {
-        let f = &mut self.frames[frame];
-        let pitch = drm::buffer::Buffer::pitch(&f.buffer) as usize;
+        let FrameBuffer::Dumb(buffer) = &mut self.frames[frame].buffer else {
+            return Err(Error::NotScanout);
+        };
+        let pitch = drm::buffer::Buffer::pitch(buffer) as usize;
         let mut map = self
             .card
-            .map_dumb_buffer(&mut f.buffer)
+            .map_dumb_buffer(buffer)
             .map_err(io("mapping a dumb buffer"))?;
         draw(map.as_mut(), pitch);
         Ok(())
@@ -677,7 +796,10 @@ impl Drop for Output {
         // device below releases everything anyway. Keeping them gains nothing.
         for f in std::mem::take(&mut self.frames) {
             let _ = self.card.destroy_framebuffer(f.fb);
-            let _ = self.card.destroy_dumb_buffer(f.buffer);
+            if let FrameBuffer::Dumb(b) = f.buffer {
+                let _ = self.card.destroy_dumb_buffer(b);
+            }
+            // A GBM buffer object frees itself when dropped.
         }
     }
 }

@@ -39,6 +39,9 @@ enum Command {
         #[arg(long, default_value_t = 1.0, requires = "dump")]
         dump_every: f64,
     },
+    /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
+    /// an identity render read back and compared. Touches no display.
+    Gpu,
     /// Show a test pattern on the display and measure flip pacing. Needs the
     /// display to itself: nothing else may be driving it.
     Pattern {
@@ -67,12 +70,21 @@ enum Command {
         /// Halfway through, change MaxCLL to this, with no modeset allowed.
         #[arg(long, requires = "hdr")]
         change_max_cll: Option<f64>,
+        /// Render each frame with libplacebo on the GPU, into scanout buffers,
+        /// scrolling, instead of drawing with the CPU.
+        #[arg(long)]
+        gpu: bool,
+        /// With --gpu: leave the GPU's clocks to the driver's default policy
+        /// instead of holding the standard stable power state. For A/B timing.
+        #[arg(long, requires = "gpu")]
+        no_pstate: bool,
     },
 }
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Probe => probe(),
+        Command::Gpu => gpu(),
         Command::Capture {
             seconds,
             device,
@@ -88,6 +100,8 @@ fn main() -> ExitCode {
             max_fall,
             max_mastering,
             change_max_cll,
+            gpu,
+            no_pstate,
         } => {
             let hdr = hdr.then_some(cinefit_kms::HdrStatic {
                 max_cll,
@@ -95,7 +109,7 @@ fn main() -> ExitCode {
                 max_mastering,
                 ..cinefit_kms::HdrStatic::BT2020_1000
             });
-            pattern(seconds, mode, card, hdr, change_max_cll)
+            pattern(seconds, mode, card, hdr, change_max_cll, gpu, !no_pstate)
         }
     };
     match result {
@@ -224,6 +238,8 @@ fn pattern(
     _card: Option<PathBuf>,
     _hdr: Option<cinefit_kms::HdrStatic>,
     _change_max_cll: Option<f64>,
+    _gpu: bool,
+    _pstate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("display output is only supported on Linux".into())
 }
@@ -235,6 +251,8 @@ fn pattern(
     card: Option<PathBuf>,
     hdr: Option<cinefit_kms::HdrStatic>,
     change_max_cll: Option<f64>,
+    gpu: bool,
+    pstate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cinefit_kms::pattern;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,17 +280,74 @@ fn pattern(
     println!("mode: {mode}");
     let (w, h) = (usize::from(mode.width), usize::from(mode.height));
 
-    // Two buffers: one on screen while the other is drawn.
-    let frames = [out.create_frame(index)?, out.create_frame(index)?];
-    for &f in &frames {
-        out.draw(f, |px, pitch| pattern::draw_background(px, pitch, w, h))?;
-    }
+    // Held for the whole run: the default clock policy never ramps up for a
+    // few milliseconds of work every frame. Released, by the kernel if need
+    // be, when this ends.
+    let _clocks = if gpu && pstate {
+        match cinefit_render::power::StablePstate::acquire() {
+            Ok(p) => {
+                println!("gpu clocks: {} (stable pstate, held until exit)", p.level());
+                Some(p)
+            }
+            Err(e) => {
+                println!("gpu clocks: not held: {e}");
+                None
+            }
+        }
+    } else {
+        if gpu {
+            println!("gpu clocks: default policy (--no-pstate)");
+        }
+        None
+    };
+
+    // Two buffers: one on screen while the other is drawn or rendered.
+    let placebo = if gpu {
+        Some(cinefit_render::Placebo::new()?)
+    } else {
+        None
+    };
+    let frames = if gpu {
+        [out.create_scanout(index)?, out.create_scanout(index)?]
+    } else {
+        [out.create_frame(index)?, out.create_frame(index)?]
+    };
+    // On the GPU path: the pattern uploaded once, and both scanout buffers
+    // imported as render targets.
+    let gpu_state = match &placebo {
+        Some(pl) => {
+            use std::os::fd::AsFd;
+            let mut targets = Vec::new();
+            for &f in &frames {
+                let b = out.export(f)?;
+                targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+                    fd: b.fd.as_fd(),
+                    width: b.width,
+                    height: b.height,
+                    fourcc: b.fourcc,
+                    modifier: b.modifier,
+                    stride: b.stride,
+                    offset: b.offset,
+                })?);
+            }
+            let src = pl.upload_rgba8(w as u32, h as u32, &pattern_rgba(w, h))?;
+            pl.render(&src, &targets[0], 0.0)?;
+            Some((pl, src, targets))
+        }
+        None => None,
+    };
     let mut bar_at: [Option<usize>; 2] = [None, None];
-    let x0 = pattern::bar_x(0, w);
-    out.draw(frames[0], |px, pitch| {
-        pattern::move_bar(px, pitch, w, h, None, x0)
-    })?;
-    bar_at[0] = Some(x0);
+    if gpu_state.is_none() {
+        for &f in &frames {
+            out.draw(f, |px, pitch| pattern::draw_background(px, pitch, w, h))?;
+        }
+        let x0 = pattern::bar_x(0, w);
+        out.draw(frames[0], |px, pitch| {
+            pattern::move_bar(px, pitch, w, h, None, x0)
+        })?;
+        bar_at[0] = Some(x0);
+    }
+    let mut render_ms: Vec<f64> = Vec::new();
     if let Some(h) = &hdr {
         if !h.is_coherent() {
             return Err(
@@ -320,12 +395,20 @@ fn pattern(
             );
         }
         let next = 1 - shown;
-        let x = pattern::bar_x(frame, w);
-        let old = bar_at[next];
-        out.draw(frames[next], |px, pitch| {
-            pattern::move_bar(px, pitch, w, h, old, x)
-        })?;
-        bar_at[next] = Some(x);
+        if let Some((pl, src, targets)) = &gpu_state {
+            // Whole pixels, so the scroll is exact rather than resampled.
+            let shift = (frame as usize * pattern::BAR_STEP % w) as f32;
+            let t = Instant::now();
+            pl.render(src, &targets[next], shift)?;
+            render_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        } else {
+            let x = pattern::bar_x(frame, w);
+            let old = bar_at[next];
+            out.draw(frames[next], |px, pitch| {
+                pattern::move_bar(px, pitch, w, h, old, x)
+            })?;
+            bar_at[next] = Some(x);
+        }
         out.flip(frames[next])?;
         let flip = out.wait_flip()?;
         pacing.on_flip(flip.sequence, flip.at);
@@ -339,5 +422,195 @@ fn pattern(
     }
     println!("ran {:.1} s", started.elapsed().as_secs_f64());
     print!("{}", pacing.summary(mode.period()));
+    if !render_ms.is_empty() {
+        render_ms.sort_by(f64::total_cmp);
+        let at = |q: f64| render_ms[((render_ms.len() - 1) as f64 * q) as usize];
+        println!(
+            "GPU render per frame, including the wait for it: median {:.2} ms, p95 {:.2}, max {:.2}",
+            at(0.5),
+            at(0.95),
+            at(1.0)
+        );
+    }
     Ok(())
+}
+
+fn gpu() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    let clocks = {
+        let p = cinefit_render::power::StablePstate::acquire();
+        match &p {
+            Ok(p) => println!(
+                "gpu clocks: {} on {} (stable pstate held)",
+                p.level(),
+                p.node()
+            ),
+            Err(e) => println!("gpu clocks: not held: {e}"),
+        }
+        p.ok()
+    };
+    let pl = cinefit_render::Placebo::new()?;
+    let info = pl.info();
+    let (major, minor, patch) = info.vulkan_version;
+    println!("device: {}", info.device_name);
+    println!(
+        "Vulkan {major}.{minor}.{patch}, libplacebo API {}",
+        info.placebo_api
+    );
+    println!("max texture: {}", info.max_tex_2d_dim);
+    println!(
+        "dma-buf import: {}",
+        if info.dma_buf_import { "yes" } else { "no" }
+    );
+
+    // The test pattern at full panel size, rendered unchanged and read back.
+    let (w, h) = (4096usize, 2160usize);
+    let rgba = pattern_rgba(w, h);
+    let started = Instant::now();
+    let out = pl.render_rgba8(w as u32, h as u32, &rgba)?;
+    let took = started.elapsed();
+    let max_diff = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<4>().0)
+        .flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c])))
+        .max()
+        .unwrap_or(0);
+    println!(
+        "identity render {w}x{h}: largest difference {max_diff} (of 255), {:.1} ms with upload and readback",
+        took.as_secs_f64() * 1000.0
+    );
+    if max_diff > 1 {
+        return Err("identity render changed the image".into());
+    }
+    scanout_check(&pl, w, h, &rgba)?;
+
+    // The hold must end with the program: check the level goes back.
+    #[cfg(target_os = "linux")]
+    if let Some(p) = clocks {
+        let node = p.node().to_owned();
+        drop(p);
+        let level = std::fs::read_to_string(format!(
+            "/sys/class/drm/{node}/device/power_dpm_force_performance_level"
+        ))
+        .unwrap_or_default();
+        println!("gpu clocks after release: {}", level.trim());
+    }
+    Ok(())
+}
+
+/// Renders the pattern into a real GBM scanout buffer through a dma-buf
+/// import, reads the buffer back through the CPU and compares. Allocates on
+/// the display device but shows nothing.
+#[cfg(target_os = "linux")]
+fn scanout_check(
+    pl: &cinefit_render::Placebo,
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsFd;
+
+    let mut out = cinefit_kms::Output::open(None)?;
+    let modes = out.modes();
+    let index = modes
+        .iter()
+        .position(|m| usize::from(m.width) == w && usize::from(m.height) == h)
+        .ok_or_else(|| format!("the display offers no {w}x{h} mode"))?;
+    let frame = out.create_scanout(index)?;
+    let buf = out.export(frame)?;
+    let target = pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+        fd: buf.fd.as_fd(),
+        width: buf.width,
+        height: buf.height,
+        fourcc: buf.fourcc,
+        modifier: buf.modifier,
+        stride: buf.stride,
+        offset: buf.offset,
+    })?;
+    let src = pl.upload_rgba8(w as u32, h as u32, rgba)?;
+    let started = Instant::now();
+    pl.render(&src, &target, 0.0)?;
+    let took = started.elapsed();
+
+    // XRGB8888 is B, G, R, X in memory.
+    let (max_diff, first_bad, samples) = out.read_scanout(frame, |px, stride| {
+        let mut worst = 0u8;
+        let mut first_bad = None;
+        for y in 0..h {
+            for x in 0..w {
+                let o = y * stride + x * 4;
+                let i = (y * w + x) * 4;
+                let d = [
+                    (px[o + 2], rgba[i]),
+                    (px[o + 1], rgba[i + 1]),
+                    (px[o], rgba[i + 2]),
+                ]
+                .iter()
+                .map(|(got, want)| got.abs_diff(*want))
+                .max()
+                .unwrap_or(0);
+                if d > 1 && first_bad.is_none() {
+                    first_bad = Some((x, y, px[o..o + 4].to_vec(), rgba[i..i + 4].to_vec()));
+                }
+                worst = worst.max(d);
+            }
+        }
+        // Raw bytes at a few known points: a corner (border), bars, the ramp.
+        let samples: Vec<_> = [
+            (0, 0),
+            (w / 16, h / 3),
+            (w * 3 / 16, h / 3),
+            (w / 2, h * 5 / 6),
+        ]
+        .iter()
+        .map(|&(x, y)| {
+            let o = y * stride + x * 4;
+            let i = (y * w + x) * 4;
+            (x, y, px[o..o + 4].to_vec(), rgba[i..i + 4].to_vec())
+        })
+        .collect::<Vec<_>>();
+        (worst, first_bad, samples)
+    })?;
+    // Raw bytes only when something is wrong: they tell a channel swap, a
+    // stride mix-up and missing writes apart at a glance.
+    if max_diff > 1 {
+        for (x, y, got, want) in samples.iter().chain(first_bad.iter()) {
+            println!("  ({x}, {y}): buffer bytes {got:02x?}, expected RGBA {want:02x?}");
+        }
+    }
+    println!(
+        "scanout render {w}x{h} (GBM, modifier {:#x}, stride {}): largest difference {max_diff} (of 255), {:.1} ms",
+        buf.modifier,
+        buf.stride,
+        took.as_secs_f64() * 1000.0
+    );
+    if max_diff > 1 {
+        return Err("render into the scanout buffer changed the image".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scanout_check(
+    _pl: &cinefit_render::Placebo,
+    _w: usize,
+    _h: usize,
+    _rgba: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+/// The static test pattern as RGBA8, rows packed.
+fn pattern_rgba(w: usize, h: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let rgb = cinefit_kms::pattern::background(x, y, w, h);
+            let o = (y * w + x) * 4;
+            rgba[o..o + 4].copy_from_slice(&[(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255]);
+        }
+    }
+    rgba
 }
