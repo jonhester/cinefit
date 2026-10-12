@@ -87,7 +87,7 @@ fn tunnel_frame(
         transfer: Transfer::Pq,
     };
     let target = pl.target_rgba16(w, h).expect("target");
-    pl.render_dovi(&planes, &color, target.texture(), out)
+    pl.render_dovi(&planes, &color, target.texture(), out, None)
         .expect("render");
     let rgba = target.download().expect("download");
     let mut r = Render {

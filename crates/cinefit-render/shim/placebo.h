@@ -80,7 +80,11 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size
  * before the first successful unpack, as cf_pl_render_ycbcr does. */
 int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint16_t *chroma);
 
-/* Colour descriptions, as plain ints so nothing but this header is shared. */
+/* Colour descriptions, as plain ints so nothing but this header is shared.
+ *
+ * Every render below takes `place`: x0, y0, x1, y1 in the target's pixels,
+ * where the picture goes, the rest cleared to black; NULL for the whole
+ * target. */
 #define CF_PL_MATRIX_BT709 0
 #define CF_PL_MATRIX_BT2020_NC 1
 #define CF_PL_PRIM_BT709 0
@@ -94,7 +98,7 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
  * into full-range RGB with dst_primaries and dst_trc. No dithering; waits for
  * the GPU. Returns 0, or -1 with the reason logged. */
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int primaries, int trc,
-                       cf_pl_tex *dst, int dst_primaries, int dst_trc);
+                       cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place);
 
 /* Uploads a tunneled Dolby Vision frame, captured as r210, into planes of
  * its size and unpacks the 12-bit ICtCp 4:2:2 inside it on the GPU: codes
@@ -114,7 +118,7 @@ typedef struct {
  * conversion (identity reshaping) to BT.2020 PQ, then into dst's primaries
  * and transfer. No dithering; waits for the GPU. Returns 0, or -1, logged. */
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
-                      cf_pl_tex *dst, int dst_primaries, int dst_trc);
+                      cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place);
 
 /* Captured RGB on the GPU: one rgba16 texture, w x h, each component stored
  * as its code shifted to the top of 16 bits (10-bit << 6, 8-bit << 8), plus
@@ -148,7 +152,7 @@ int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *rgb, uint16_t *out);
  * depth of the last unpack. No dithering; waits for the GPU. Returns 0, or
  * -1, logged. */
 int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int primaries, int trc,
-                     cf_pl_tex *dst, int dst_primaries, int dst_trc);
+                     cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place);
 
 /* A w x h RGBA 16-bit texture to render into and read back, for checks. Null
  * on failure, logged. */

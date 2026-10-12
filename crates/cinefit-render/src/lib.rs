@@ -181,6 +181,44 @@ impl Placebo {
     }
 }
 
+/// Where a picture goes in its target, in the target's pixels: `x0, y0` to
+/// `x1, y1`. A render with `None` fills the target.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl Rect {
+    /// The largest rectangle of a `width` x `height` picture's shape that fits
+    /// a `target_w` x `target_h` target, centred: bars at the sides or at the
+    /// top and bottom, never a stretch.
+    pub fn fit(width: u32, height: u32, target_w: u32, target_h: u32) -> Self {
+        let scale = f64::min(
+            f64::from(target_w) / f64::from(width.max(1)),
+            f64::from(target_h) / f64::from(height.max(1)),
+        );
+        let (w, h) = (f64::from(width) * scale, f64::from(height) * scale);
+        let (x0, y0) = (
+            (f64::from(target_w) - w) / 2.0,
+            (f64::from(target_h) - h) / 2.0,
+        );
+        Self {
+            x0: x0 as f32,
+            y0: y0 as f32,
+            x1: (x0 + w) as f32,
+            y1: (y0 + h) as f32,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn raw(place: Option<&Self>) -> Option<[f32; 4]> {
+        place.map(|r| [r.x0, r.y0, r.x1, r.y1])
+    }
+}
+
 /// A dma-buf to render into, as a scanout buffer describes it.
 #[derive(Debug, Clone, Copy)]
 pub struct DmaBufTarget<'a> {
@@ -558,15 +596,18 @@ impl Placebo {
         color: &DoviColor,
         dst: &Texture<'_>,
         dst_color: RgbColor,
+        place: Option<Rect>,
     ) -> Result<(), Error> {
+        let place = Rect::raw(place.as_ref());
         let flat = |m: &[[f64; 3]; 3]| std::array::from_fn(|i| m[i / 3][i % 3] as f32);
         let raw = ffi::Dovi {
             ycc_to_lms: flat(&color.ycc_to_lms),
             offset: color.offset.map(|o| o as f32),
             linear: flat(&color.linear),
         };
-        // SAFETY: `raw` is a struct whose layout the shim shares, read during
-        // the call; the planes and the texture belong to this live device.
+        // SAFETY: `raw` is a struct whose layout the shim shares, and `place`
+        // null or four floats, both read during the call; the planes and the
+        // texture belong to this live device.
         let rc = unsafe {
             ffi::cf_pl_render_dovi(
                 self.handle.as_ptr(),
@@ -575,6 +616,7 @@ impl Placebo {
                 dst.tex.as_ptr(),
                 primaries_raw(dst_color.primaries),
                 transfer_raw(dst_color.transfer),
+                place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
@@ -594,12 +636,15 @@ impl Placebo {
         color: YcbcrColor,
         dst: &Texture<'_>,
         dst_color: RgbColor,
+        place: Option<Rect>,
     ) -> Result<(), Error> {
+        let place = Rect::raw(place.as_ref());
         let matrix = match color.matrix {
             Matrix::Bt709 => ffi::MATRIX_BT709,
             Matrix::Bt2020Nc => ffi::MATRIX_BT2020_NC,
         };
-        // SAFETY: the planes and the texture belong to this live device.
+        // SAFETY: the planes and the texture belong to this live device;
+        // `place` is null or four floats, read during the call.
         let rc = unsafe {
             ffi::cf_pl_render_ycbcr(
                 self.handle.as_ptr(),
@@ -610,6 +655,7 @@ impl Placebo {
                 dst.tex.as_ptr(),
                 primaries_raw(dst_color.primaries),
                 transfer_raw(dst_color.transfer),
+                place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
@@ -693,12 +739,15 @@ impl Placebo {
         color: RgbSourceColor,
         dst: &Texture<'_>,
         dst_color: RgbColor,
+        place: Option<Rect>,
     ) -> Result<(), Error> {
+        let place = Rect::raw(place.as_ref());
         let levels = match color.levels {
             Levels::Full => ffi::LEVELS_FULL,
             Levels::Limited => ffi::LEVELS_LIMITED,
         };
-        // SAFETY: the source and the texture belong to this live device.
+        // SAFETY: the source and the texture belong to this live device;
+        // `place` is null or four floats, read during the call.
         let rc = unsafe {
             ffi::cf_pl_render_rgb(
                 self.handle.as_ptr(),
@@ -709,6 +758,7 @@ impl Placebo {
                 dst.tex.as_ptr(),
                 primaries_raw(dst_color.primaries),
                 transfer_raw(dst_color.transfer),
+                place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
@@ -788,5 +838,17 @@ mod tests {
         assert_eq!(info.device_name, "AMD Radeon RX 6400");
         assert_eq!(info.vulkan_version, (1, 4, 335));
         assert!(info.dma_buf_import);
+    }
+
+    #[test]
+    fn fit_keeps_the_shape_and_centres() {
+        // UHD on a 17:9 panel: bars at the sides.
+        let r = Rect::fit(3840, 2160, 4096, 2160);
+        assert_eq!((r.x0, r.y0, r.x1, r.y1), (128.0, 0.0, 3968.0, 2160.0));
+        // HD scales up to the full height.
+        assert_eq!(Rect::fit(1920, 1080, 4096, 2160), r);
+        // A wider picture gets bars at the top and bottom.
+        let r = Rect::fit(4096, 1716, 3840, 2160);
+        assert!((r.x1 - r.x0 - 3840.0).abs() < 1e-3 && r.y0 > 0.0);
     }
 }

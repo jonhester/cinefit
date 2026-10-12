@@ -5,6 +5,7 @@
 
 pub mod hdr;
 pub mod pattern;
+pub mod scanout;
 pub mod timing;
 
 #[cfg(target_os = "linux")]

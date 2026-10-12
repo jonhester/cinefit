@@ -42,6 +42,7 @@ fn unfilled(pl: &Placebo) -> Result<(), Box<dyn Error>> {
             },
             target.texture(),
             out,
+            None,
         )
         .is_err(),
         pl.render_rgb(
@@ -53,6 +54,7 @@ fn unfilled(pl: &Placebo) -> Result<(), Box<dyn Error>> {
             },
             target.texture(),
             out,
+            None,
         )
         .is_err(),
     ];
@@ -213,6 +215,7 @@ fn render(pl: &Placebo) -> Result<(), Box<dyn Error>> {
                 primaries,
                 transfer,
             },
+            None,
         )?;
         let out = target.download()?;
 
@@ -371,6 +374,7 @@ fn render_rgb(pl: &Placebo) -> Result<(), Box<dyn Error>> {
                     primaries,
                     transfer,
                 },
+                None,
             )?;
             let out = target.download()?;
             let (mut err, mut err_other, mut compared) = (0f64, 0f64, 0usize);
