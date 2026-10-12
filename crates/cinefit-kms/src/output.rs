@@ -17,6 +17,7 @@ use drm::control::{
 };
 use drm::{ClientCapability, Device as BasicDevice};
 
+use crate::hdr::HdrStatic;
 use crate::timing::ModeTiming;
 
 /// An open DRM device node.
@@ -76,12 +77,45 @@ struct Props {
     plane_crtc: property::Handle,
     src: [property::Handle; 4],
     dst: [property::Handle; 4],
+    /// HDR signalling: optional, since not every driver or connector has it.
+    hdr_metadata: Option<property::Handle>,
+    colorspace: Option<ColorspaceProp>,
+    max_bpc: Option<property::Handle>,
+}
+
+/// The connector's `Colorspace` enum, with the two values used here.
+struct ColorspaceProp {
+    handle: property::Handle,
+    default: Option<u64>,
+    bt2020_rgb: Option<u64>,
 }
 
 /// A CPU-drawn scanout buffer.
 pub struct DumbFrame {
     buffer: DumbBuffer,
     fb: framebuffer::Handle,
+}
+
+/// How [`Output::restore`] left the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restored {
+    /// Nothing had been changed.
+    NothingChanged,
+    /// The previous mode and plane state, with HDR cleared.
+    Previous,
+    /// The previous state no longer applied, so the output was turned off,
+    /// with HDR cleared.
+    TurnedOff,
+}
+
+impl fmt::Display for Restored {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Restored::NothingChanged => "nothing to restore",
+            Restored::Previous => "restored the previous state",
+            Restored::TurnedOff => "previous state no longer applied: turned the output off",
+        })
+    }
 }
 
 /// A completed flip: the vblank it landed on and when.
@@ -106,6 +140,11 @@ pub struct Output {
     mode_blob: Option<u64>,
     modeset: bool,
     frames: Vec<DumbFrame>,
+    /// HDR metadata for the next modeset; `None` signals SDR.
+    hdr: Option<HdrStatic>,
+    /// The blob on the connector now, and one queued for the next flip.
+    hdr_blob: Option<u64>,
+    pending_hdr_blob: Option<u64>,
 }
 
 impl Output {
@@ -236,6 +275,11 @@ impl Output {
                 get(&plane_props, "CRTC_W")?,
                 get(&plane_props, "CRTC_H")?,
             ],
+            hdr_metadata: conn_props.get("HDR_OUTPUT_METADATA").copied(),
+            colorspace: conn_props
+                .get("Colorspace")
+                .map(|&handle| colorspace_prop(&card, handle)),
+            max_bpc: conn_props.get("max bpc").copied(),
         };
 
         let connector_name = format!("{}-{}", conn.interface().as_str(), conn.interface_id());
@@ -252,6 +296,9 @@ impl Output {
             mode_blob: None,
             modeset: false,
             frames: Vec::new(),
+            hdr: None,
+            hdr_blob: None,
+            pending_hdr_blob: None,
         }))
     }
 
@@ -316,14 +363,11 @@ impl Output {
     pub fn modeset(&mut self, index: usize, frame: usize) -> Result<(), Error> {
         let mode = self.modes[index];
         let (w, h) = mode.size();
-        let blob = match self
-            .card
-            .create_property_blob(&mode)
-            .map_err(io("creating the mode blob"))?
-        {
-            property::Value::Blob(id) => id,
-            _ => unreachable!("create_property_blob returns a blob"),
-        };
+        let blob = blob_id(
+            self.card
+                .create_property_blob(&mode)
+                .map_err(io("creating the mode blob"))?,
+        );
 
         let p = &self.props;
         let conn: RawResourceHandle = self.connector.into();
@@ -353,24 +397,129 @@ impl Output {
             set.push((plane, *prop, v));
         }
 
+        // Colour signalling goes in the same commit as the mode: a separate
+        // commit would be a second modeset, and a second resync on the display.
+        let mut hdr_blob = None;
+        match &self.hdr {
+            Some(hdr) => {
+                let prop = p
+                    .hdr_metadata
+                    .ok_or(Error::MissingProperty("HDR_OUTPUT_METADATA"))?;
+                let id = blob_id(
+                    self.card
+                        .create_property_blob(&hdr.blob())
+                        .map_err(io("creating the HDR metadata blob"))?,
+                );
+                hdr_blob = Some(id);
+                set.push((conn, prop, id));
+                if let Some(cs) = &p.colorspace
+                    && let Some(v) = cs.bt2020_rgb
+                {
+                    set.push((conn, cs.handle, v));
+                }
+                // 10 bits on the wire, as HDR10 is defined.
+                if let Some(bpc) = p.max_bpc {
+                    set.push((conn, bpc, 10));
+                }
+            }
+            None => {
+                // Say SDR explicitly, so nothing another program left on the
+                // connector survives the modeset.
+                if let Some(prop) = p.hdr_metadata {
+                    set.push((conn, prop, 0));
+                }
+                if let Some(cs) = &p.colorspace
+                    && let Some(v) = cs.default
+                {
+                    set.push((conn, cs.handle, v));
+                }
+            }
+        }
+
         if !self.modeset {
             self.saved = self.current_values(&set);
         }
         let req = request(&set);
         // A test commit first: if another program holds the display, nothing
         // on screen changes before we find out.
-        commit(
+        let result = commit(
             &self.card,
             AtomicCommitFlags::TEST_ONLY | AtomicCommitFlags::ALLOW_MODESET,
             req.clone(),
-        )?;
-        commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, req)?;
+        )
+        .and_then(|()| commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, req));
+        if let Err(e) = result {
+            for id in [Some(blob), hdr_blob].into_iter().flatten() {
+                let _ = self.card.destroy_property_blob(id);
+            }
+            return Err(e);
+        }
 
         if let Some(old) = self.mode_blob.replace(blob) {
             let _ = self.card.destroy_property_blob(old);
         }
+        if let Some(old) = std::mem::replace(&mut self.hdr_blob, hdr_blob) {
+            let _ = self.card.destroy_property_blob(old);
+        }
         self.modeset = true;
         Ok(())
+    }
+
+    /// HDR metadata for the next [`Self::modeset`], or `None` for SDR.
+    pub fn set_hdr(&mut self, hdr: Option<HdrStatic>) {
+        self.hdr = hdr;
+    }
+
+    /// Changes the HDR metadata while already in HDR, carried by the next
+    /// [`Self::flip`]. That flip is not allowed to modeset, so if the driver
+    /// would need one for this change, the flip fails instead of the display
+    /// resyncing.
+    ///
+    /// # Errors
+    ///
+    /// If the connector has no HDR property, or the blob cannot be created.
+    pub fn update_hdr(&mut self, hdr: &HdrStatic) -> Result<(), Error> {
+        if self.props.hdr_metadata.is_none() {
+            return Err(Error::MissingProperty("HDR_OUTPUT_METADATA"));
+        }
+        let id = blob_id(
+            self.card
+                .create_property_blob(&hdr.blob())
+                .map_err(io("creating the HDR metadata blob"))?,
+        );
+        if let Some(old) = self.pending_hdr_blob.replace(id) {
+            let _ = self.card.destroy_property_blob(old);
+        }
+        self.hdr = Some(*hdr);
+        Ok(())
+    }
+
+    /// The connector's HDR signalling as it stands, read back from the
+    /// driver: whether a metadata blob is set, the colorspace, and max bpc.
+    pub fn hdr_state(&self) -> String {
+        let Ok(values) = self.card.get_properties(self.connector) else {
+            return "unreadable".into();
+        };
+        let (ids, vals) = values.as_props_and_values();
+        let value = |h: Option<property::Handle>| {
+            h.and_then(|h| ids.iter().position(|&id| id == h).map(|i| vals[i]))
+        };
+        let metadata = match value(self.props.hdr_metadata) {
+            None => "no HDR property".to_string(),
+            Some(0) => "no HDR metadata".to_string(),
+            Some(_) => "HDR metadata set".to_string(),
+        };
+        let colorspace = self
+            .props
+            .colorspace
+            .as_ref()
+            .and_then(|cs| {
+                let v = value(Some(cs.handle))?;
+                enum_name(&self.card, cs.handle, v)
+            })
+            .unwrap_or_else(|| "none".into());
+        let bpc = value(self.props.max_bpc).map_or("none".into(), |v| v.to_string());
+        format!("{metadata}, Colorspace {colorspace}, max bpc {bpc}")
     }
 
     /// Queues `frame` for the next vblank. Wait for it with [`Self::wait_flip`]
@@ -381,12 +530,22 @@ impl Output {
     /// If the driver refuses the flip.
     pub fn flip(&mut self, frame: usize) -> Result<(), Error> {
         let fb = u64::from(u32::from(RawResourceHandle::from(self.frames[frame].fb)));
-        let req = request(&[(self.plane.into(), self.props.fb_id, fb)]);
+        let mut set = vec![(self.plane.into(), self.props.fb_id, fb)];
+        let pending = self.pending_hdr_blob.take();
+        if let (Some(id), Some(prop)) = (pending, self.props.hdr_metadata) {
+            set.push((self.connector.into(), prop, id));
+        }
         commit(
             &self.card,
             AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
-            req,
-        )
+            request(&set),
+        )?;
+        if let Some(id) = pending
+            && let Some(old) = self.hdr_blob.replace(id)
+        {
+            let _ = self.card.destroy_property_blob(old);
+        }
+        Ok(())
     }
 
     /// Blocks until the queued flip completes.
@@ -411,40 +570,79 @@ impl Output {
         }
     }
 
-    /// Puts back every property the modeset changed. If the old values no
-    /// longer apply (another program's mode blob is gone, say), turns the
-    /// output off instead, which leaves the next program a clean start.
+    /// Puts back every property the modeset changed, except HDR: leaving
+    /// always clears the HDR metadata and sets `Colorspace` to `Default`, and
+    /// never re-applies an earlier program's metadata, which may be stale. If
+    /// the old values no longer apply (another program's mode blob is gone,
+    /// say), turns the output off instead, still clearing HDR and putting
+    /// `max bpc` back.
     ///
     /// # Errors
     ///
     /// If neither the old state nor "off" can be committed. The output then
     /// still counts as changed, so a later call (or the drop) tries again.
-    pub fn restore(&mut self) -> Result<(), Error> {
+    pub fn restore(&mut self) -> Result<Restored, Error> {
         if !self.modeset {
-            return Ok(());
+            return Ok(Restored::NothingChanged);
         }
-        let restored = commit(
+        let p = &self.props;
+        let conn: RawResourceHandle = self.connector.into();
+        let clear_hdr = |prop: property::Handle, value: u64| {
+            if Some(prop) == p.hdr_metadata {
+                Some(0)
+            } else if let Some(cs) = &p.colorspace
+                && prop == cs.handle
+            {
+                Some(cs.default.unwrap_or(value))
+            } else {
+                None
+            }
+        };
+
+        let previous: Vec<_> = self
+            .saved
+            .iter()
+            .map(|&(obj, prop, value)| (obj, prop, clear_hdr(prop, value).unwrap_or(value)))
+            .collect();
+        let outcome = commit(
             &self.card,
             AtomicCommitFlags::ALLOW_MODESET,
-            request(&self.saved),
-        );
-        let result = restored.or_else(|_| {
-            let p = &self.props;
-            let off = [
-                (self.connector.into(), p.connector_crtc, 0),
+            request(&previous),
+        )
+        .map(|()| Restored::Previous)
+        .or_else(|_| {
+            let mut off = vec![
+                (conn, p.connector_crtc, 0),
                 (self.crtc.into(), p.active, 0),
                 (self.crtc.into(), p.mode_id, 0),
                 (self.plane.into(), p.fb_id, 0),
                 (self.plane.into(), p.plane_crtc, 0),
             ];
+            // Off is not enough on its own: HDR signalling and max bpc
+            // belong to the connector and outlive the mode.
+            for &(obj, prop, value) in &self.saved {
+                if let Some(v) = clear_hdr(prop, value) {
+                    off.push((obj, prop, v));
+                } else if Some(prop) == p.max_bpc {
+                    off.push((obj, prop, value));
+                }
+            }
             commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, request(&off))
+                .map(|()| Restored::TurnedOff)
         });
-        result?;
+        let outcome = outcome?;
         self.modeset = false;
-        if let Some(blob) = self.mode_blob.take() {
+        for blob in [
+            self.mode_blob.take(),
+            self.hdr_blob.take(),
+            self.pending_hdr_blob.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let _ = self.card.destroy_property_blob(blob);
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn current_values(
@@ -482,6 +680,44 @@ impl Drop for Output {
             let _ = self.card.destroy_dumb_buffer(f.buffer);
         }
     }
+}
+
+fn blob_id(value: property::Value<'static>) -> u64 {
+    match value {
+        property::Value::Blob(id) => id,
+        _ => unreachable!("create_property_blob returns a blob"),
+    }
+}
+
+fn colorspace_prop(card: &Card, handle: property::Handle) -> ColorspaceProp {
+    let value = |name: &str| {
+        let info = card.get_property(handle).ok()?;
+        let property::ValueType::Enum(e) = info.value_type() else {
+            return None;
+        };
+        let (_, enums) = e.values();
+        enums
+            .iter()
+            .find(|v| v.name().to_str() == Ok(name))
+            .map(|v| v.value())
+    };
+    ColorspaceProp {
+        handle,
+        default: value("Default"),
+        bt2020_rgb: value("BT2020_RGB"),
+    }
+}
+
+fn enum_name(card: &Card, handle: property::Handle, value: u64) -> Option<String> {
+    let info = card.get_property(handle).ok()?;
+    let property::ValueType::Enum(e) = info.value_type() else {
+        return None;
+    };
+    let (_, enums) = e.values();
+    enums
+        .iter()
+        .find(|v| v.value() == value)
+        .map(|v| v.name().to_string_lossy().into_owned())
 }
 
 fn request(set: &[(RawResourceHandle, property::Handle, u64)]) -> AtomicModeReq {

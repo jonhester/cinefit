@@ -52,6 +52,21 @@ enum Command {
         /// The DRM device; by default the first with a connected display.
         #[arg(long)]
         card: Option<PathBuf>,
+        /// Signal HDR10 (PQ, BT.2020 primaries, D65) instead of SDR.
+        #[arg(long)]
+        hdr: bool,
+        /// MaxCLL to declare, in nits.
+        #[arg(long, default_value_t = 1000.0, requires = "hdr")]
+        max_cll: f64,
+        /// MaxFALL to declare, in nits.
+        #[arg(long, default_value_t = 400.0, requires = "hdr")]
+        max_fall: f64,
+        /// Mastering display peak to declare, in nits.
+        #[arg(long, default_value_t = 1000.0, requires = "hdr")]
+        max_mastering: f64,
+        /// Halfway through, change MaxCLL to this, with no modeset allowed.
+        #[arg(long, requires = "hdr")]
+        change_max_cll: Option<f64>,
     },
 }
 
@@ -68,7 +83,20 @@ fn main() -> ExitCode {
             seconds,
             mode,
             card,
-        } => pattern(seconds, mode, card),
+            hdr,
+            max_cll,
+            max_fall,
+            max_mastering,
+            change_max_cll,
+        } => {
+            let hdr = hdr.then_some(cinefit_kms::HdrStatic {
+                max_cll,
+                max_fall,
+                max_mastering,
+                ..cinefit_kms::HdrStatic::BT2020_1000
+            });
+            pattern(seconds, mode, card, hdr, change_max_cll)
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -194,6 +222,8 @@ fn pattern(
     _seconds: f64,
     _mode: cinefit_kms::ModeRequest,
     _card: Option<PathBuf>,
+    _hdr: Option<cinefit_kms::HdrStatic>,
+    _change_max_cll: Option<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("display output is only supported on Linux".into())
 }
@@ -203,6 +233,8 @@ fn pattern(
     seconds: f64,
     want: cinefit_kms::ModeRequest,
     card: Option<PathBuf>,
+    hdr: Option<cinefit_kms::HdrStatic>,
+    change_max_cll: Option<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cinefit_kms::pattern;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,7 +273,21 @@ fn pattern(
         pattern::move_bar(px, pitch, w, h, None, x0)
     })?;
     bar_at[0] = Some(x0);
+    if let Some(h) = &hdr {
+        if !h.is_coherent() {
+            return Err(
+                "incoherent HDR metadata: MaxFALL above MaxCLL, or MaxCLL above the mastering peak"
+                    .into(),
+            );
+        }
+        println!(
+            "HDR10: MaxCLL {}, MaxFALL {}, mastering {}-{} nits",
+            h.max_cll, h.max_fall, h.min_mastering, h.max_mastering
+        );
+    }
+    out.set_hdr(hdr);
     out.modeset(index, frames[0])?;
+    println!("after modeset: {}", out.hdr_state());
 
     // Ctrl-C ends the run and still restores the display and prints the
     // summary; a second one exits at once.
@@ -259,8 +305,20 @@ fn pattern(
     let started = Instant::now();
     let mut pacing = cinefit_kms::Pacing::default();
     let (mut shown, mut frame) = (0usize, 0u64);
+    let mut change = hdr.zip(change_max_cll);
     while started.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
         frame += 1;
+        if started.elapsed() >= run_for / 2
+            && let Some((h, cll)) = change.take()
+        {
+            let changed = cinefit_kms::HdrStatic { max_cll: cll, ..h };
+            out.update_hdr(&changed)?;
+            println!(
+                "{:.1} s: MaxCLL {} -> {cll}, sent with the next flip (no modeset allowed)",
+                started.elapsed().as_secs_f64(),
+                h.max_cll
+            );
+        }
         let next = 1 - shown;
         let x = pattern::bar_x(frame, w);
         let old = bar_at[next];
@@ -273,7 +331,8 @@ fn pattern(
         pacing.on_flip(flip.sequence, flip.at);
         shown = next;
     }
-    out.restore()?;
+    let restored = out.restore()?;
+    println!("{restored}; now: {}", out.hdr_state());
 
     if stop.load(Ordering::Relaxed) {
         println!("stopped early by Ctrl-C");
