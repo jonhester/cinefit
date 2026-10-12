@@ -70,6 +70,10 @@ enum Command {
         /// Halfway through, change MaxCLL to this, with no modeset allowed.
         #[arg(long, requires = "hdr")]
         change_max_cll: Option<f64>,
+        /// Render each frame with libplacebo on the GPU, into scanout buffers,
+        /// scrolling, instead of drawing with the CPU.
+        #[arg(long)]
+        gpu: bool,
     },
 }
 
@@ -92,6 +96,7 @@ fn main() -> ExitCode {
             max_fall,
             max_mastering,
             change_max_cll,
+            gpu,
         } => {
             let hdr = hdr.then_some(cinefit_kms::HdrStatic {
                 max_cll,
@@ -99,7 +104,7 @@ fn main() -> ExitCode {
                 max_mastering,
                 ..cinefit_kms::HdrStatic::BT2020_1000
             });
-            pattern(seconds, mode, card, hdr, change_max_cll)
+            pattern(seconds, mode, card, hdr, change_max_cll, gpu)
         }
     };
     match result {
@@ -228,6 +233,7 @@ fn pattern(
     _card: Option<PathBuf>,
     _hdr: Option<cinefit_kms::HdrStatic>,
     _change_max_cll: Option<f64>,
+    _gpu: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("display output is only supported on Linux".into())
 }
@@ -239,6 +245,7 @@ fn pattern(
     card: Option<PathBuf>,
     hdr: Option<cinefit_kms::HdrStatic>,
     change_max_cll: Option<f64>,
+    gpu: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cinefit_kms::pattern;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -266,17 +273,53 @@ fn pattern(
     println!("mode: {mode}");
     let (w, h) = (usize::from(mode.width), usize::from(mode.height));
 
-    // Two buffers: one on screen while the other is drawn.
-    let frames = [out.create_frame(index)?, out.create_frame(index)?];
-    for &f in &frames {
-        out.draw(f, |px, pitch| pattern::draw_background(px, pitch, w, h))?;
-    }
+    // Two buffers: one on screen while the other is drawn or rendered.
+    let placebo = if gpu {
+        Some(cinefit_render::Placebo::new()?)
+    } else {
+        None
+    };
+    let frames = if gpu {
+        [out.create_scanout(index)?, out.create_scanout(index)?]
+    } else {
+        [out.create_frame(index)?, out.create_frame(index)?]
+    };
+    // On the GPU path: the pattern uploaded once, and both scanout buffers
+    // imported as render targets.
+    let gpu_state = match &placebo {
+        Some(pl) => {
+            use std::os::fd::AsFd;
+            let mut targets = Vec::new();
+            for &f in &frames {
+                let b = out.export(f)?;
+                targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+                    fd: b.fd.as_fd(),
+                    width: b.width,
+                    height: b.height,
+                    fourcc: b.fourcc,
+                    modifier: b.modifier,
+                    stride: b.stride,
+                    offset: b.offset,
+                })?);
+            }
+            let src = pl.upload_rgba8(w as u32, h as u32, &pattern_rgba(w, h))?;
+            pl.render(&src, &targets[0], 0.0)?;
+            Some((pl, src, targets))
+        }
+        None => None,
+    };
     let mut bar_at: [Option<usize>; 2] = [None, None];
-    let x0 = pattern::bar_x(0, w);
-    out.draw(frames[0], |px, pitch| {
-        pattern::move_bar(px, pitch, w, h, None, x0)
-    })?;
-    bar_at[0] = Some(x0);
+    if gpu_state.is_none() {
+        for &f in &frames {
+            out.draw(f, |px, pitch| pattern::draw_background(px, pitch, w, h))?;
+        }
+        let x0 = pattern::bar_x(0, w);
+        out.draw(frames[0], |px, pitch| {
+            pattern::move_bar(px, pitch, w, h, None, x0)
+        })?;
+        bar_at[0] = Some(x0);
+    }
+    let mut render_ms: Vec<f64> = Vec::new();
     if let Some(h) = &hdr {
         if !h.is_coherent() {
             return Err(
@@ -324,12 +367,20 @@ fn pattern(
             );
         }
         let next = 1 - shown;
-        let x = pattern::bar_x(frame, w);
-        let old = bar_at[next];
-        out.draw(frames[next], |px, pitch| {
-            pattern::move_bar(px, pitch, w, h, old, x)
-        })?;
-        bar_at[next] = Some(x);
+        if let Some((pl, src, targets)) = &gpu_state {
+            // Whole pixels, so the scroll is exact rather than resampled.
+            let shift = (frame as usize * pattern::BAR_STEP % w) as f32;
+            let t = Instant::now();
+            pl.render(src, &targets[next], shift)?;
+            render_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        } else {
+            let x = pattern::bar_x(frame, w);
+            let old = bar_at[next];
+            out.draw(frames[next], |px, pitch| {
+                pattern::move_bar(px, pitch, w, h, old, x)
+            })?;
+            bar_at[next] = Some(x);
+        }
         out.flip(frames[next])?;
         let flip = out.wait_flip()?;
         pacing.on_flip(flip.sequence, flip.at);
@@ -343,6 +394,16 @@ fn pattern(
     }
     println!("ran {:.1} s", started.elapsed().as_secs_f64());
     print!("{}", pacing.summary(mode.period()));
+    if !render_ms.is_empty() {
+        render_ms.sort_by(f64::total_cmp);
+        let at = |q: f64| render_ms[((render_ms.len() - 1) as f64 * q) as usize];
+        println!(
+            "GPU render per frame, including the wait for it: median {:.2} ms, p95 {:.2}, max {:.2}",
+            at(0.5),
+            at(0.95),
+            at(1.0)
+        );
+    }
     Ok(())
 }
 
@@ -363,14 +424,7 @@ fn gpu() -> Result<(), Box<dyn std::error::Error>> {
 
     // The test pattern at full panel size, rendered unchanged and read back.
     let (w, h) = (4096usize, 2160usize);
-    let mut rgba = vec![0u8; w * h * 4];
-    for y in 0..h {
-        for x in 0..w {
-            let rgb = cinefit_kms::pattern::background(x, y, w, h);
-            let o = (y * w + x) * 4;
-            rgba[o..o + 4].copy_from_slice(&[(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255]);
-        }
-    }
+    let rgba = pattern_rgba(w, h);
     let started = Instant::now();
     let out = pl.render_rgba8(w as u32, h as u32, &rgba)?;
     let took = started.elapsed();
@@ -423,7 +477,7 @@ fn scanout_check(
     })?;
     let src = pl.upload_rgba8(w as u32, h as u32, rgba)?;
     let started = Instant::now();
-    pl.render(&src, &target)?;
+    pl.render(&src, &target, 0.0)?;
     let took = started.elapsed();
 
     // XRGB8888 is B, G, R, X in memory.
@@ -492,4 +546,17 @@ fn scanout_check(
     _rgba: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
+}
+
+/// The static test pattern as RGBA8, rows packed.
+fn pattern_rgba(w: usize, h: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let rgb = cinefit_kms::pattern::background(x, y, w, h);
+            let o = (y * w + x) * 4;
+            rgba[o..o + 4].copy_from_slice(&[(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255]);
+        }
+    }
+    rgba
 }

@@ -252,15 +252,22 @@ impl Placebo {
     }
 
     /// Renders `src` over the whole of `dst` and waits for the GPU to finish,
-    /// so `dst` can go to the display.
+    /// so `dst` can go to the display. `shift_x` scrolls the source left by
+    /// that many pixels, wrapping around; whole pixels keep it exact.
     ///
     /// # Errors
     ///
     /// [`Error::Render`] if libplacebo fails (see its log).
-    pub fn render(&self, src: &Texture<'_>, dst: &Texture<'_>) -> Result<(), Error> {
+    pub fn render(&self, src: &Texture<'_>, dst: &Texture<'_>, shift_x: f32) -> Result<(), Error> {
         // SAFETY: both textures belong to this live device.
-        let rc =
-            unsafe { ffi::cf_pl_render(self.handle.as_ptr(), src.tex.as_ptr(), dst.tex.as_ptr()) };
+        let rc = unsafe {
+            ffi::cf_pl_render(
+                self.handle.as_ptr(),
+                src.tex.as_ptr(),
+                dst.tex.as_ptr(),
+                shift_x,
+            )
+        };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
     }
 }

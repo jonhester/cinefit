@@ -54,7 +54,9 @@ cf_pl_tex *cf_pl_upload_rgba8(cf_pl *pl, int w, int h, const uint8_t *rgba);
 void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *tex);
 
 /* Renders src over the whole of dst, both sRGB, without dithering, and waits
- * for the GPU to finish. Returns 0, or -1 with the reason logged. */
-int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst);
+ * for the GPU to finish. shift_x scrolls the source left by that many pixels,
+ * wrapping around, for a pattern that moves. Returns 0, or -1 with the
+ * reason logged. */
+int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst, float shift_x);
 
 #endif

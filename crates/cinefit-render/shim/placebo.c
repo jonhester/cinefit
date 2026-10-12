@@ -184,15 +184,27 @@ void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *t) {
     pl_tex_destroy(pl->vk->gpu, &tex);
 }
 
-int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst) {
+int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst, float shift_x) {
+    pl_tex s = unwrap_tex(src), d = unwrap_tex(dst);
     struct pl_frame image = {
         .num_planes = 1,
-        .planes = {{ .texture = unwrap_tex(src), .components = 3, .component_mapping = {0, 1, 2} }},
+        .planes = {{
+            .texture = s,
+            .components = 3,
+            .component_mapping = {0, 1, 2},
+            // A crop past the edge wraps around instead of smearing it.
+            .address_mode = PL_TEX_ADDRESS_REPEAT,
+        }},
+        .repr = pl_color_repr_rgb,
+        .color = pl_color_space_srgb,
+        .crop = { shift_x, 0, shift_x + (float)s->params.w, (float)s->params.h },
+    };
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes = {{ .texture = d, .components = 3, .component_mapping = {0, 1, 2} }},
         .repr = pl_color_repr_rgb,
         .color = pl_color_space_srgb,
     };
-    struct pl_frame target = image;
-    target.planes[0].texture = unwrap_tex(dst);
 
     struct pl_render_params params = pl_render_default_params;
     params.dither_params = NULL;
