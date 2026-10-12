@@ -8,3 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/jonhester/cinefit"
 
 [workspace.dependencies]
+
+[workspace.lints.clippy]
+# Every `unsafe` block must say why it is sound, in a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "deny"

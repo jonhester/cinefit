@@ -1,4 +1,5 @@
 # cinefit
+
 ## License
 
 Licensed under either of
@@ -7,6 +8,12 @@ Licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.
+
+Third-party code vendored in this repository is under its own license, kept
+next to it:
+
+- Blackmagic Design DeckLink SDK headers:
+  [crates/cinefit-decklink/vendor/decklink-sdk/LICENSE](crates/cinefit-decklink/vendor/decklink-sdk/LICENSE)
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
