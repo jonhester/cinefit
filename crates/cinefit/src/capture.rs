@@ -116,25 +116,26 @@ impl TunnelStats {
             "Dolby Vision tunnel: decoded in {} of {} RGB frames",
             self.decoded, self.checked
         );
-        if self.decoded == 0 {
-            return;
+        if self.decoded > 0 {
+            let nits: Vec<_> = self
+                .l2_targets
+                .iter()
+                .map(|&pq| format!("{:.0}", cinefit_dovi::pq_to_nits(pq)))
+                .collect();
+            let _ = writeln!(
+                s,
+                "  L1 changes: {}, L2 targets: {} nits, L5 in {} frames",
+                self.l1_changes,
+                if nits.is_empty() {
+                    "none".into()
+                } else {
+                    nits.join(", ")
+                },
+                self.l5
+            );
         }
-        let nits: Vec<_> = self
-            .l2_targets
-            .iter()
-            .map(|&pq| format!("{:.0}", cinefit_dovi::pq_to_nits(pq)))
-            .collect();
-        let _ = writeln!(
-            s,
-            "  L1 changes: {}, L2 targets: {} nits, L5 in {} frames",
-            self.l1_changes,
-            if nits.is_empty() {
-                "none".into()
-            } else {
-                nits.join(", ")
-            },
-            self.l5
-        );
+        // Always shown: "decoded in 0" alone cannot tell a frame without the
+        // tunnel from a tunnel that failed to decode.
         let _ = writeln!(
             s,
             "  not a tunnel: {}, needed a fallback copy: {}, no metadata: {}",
