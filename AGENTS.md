@@ -46,6 +46,7 @@ On the machine with the hardware:
     cinefit gpu                        # Vulkan, libplacebo, v210 unpack and renders read back
     cinefit capture -t 20 [--dump DIR] # what arrives on the input
     cinefit capture -t 180 --record DIR # every frame, through zstd (needs zstd)
+    cinefit compare TUNNEL HDR10       # two recordings aligned, rendered, compared (GPU)
     cinefit pattern -t 30 [--gpu] [--hdr]   # puts a picture on the display
     cinefit play --dry-run             # capture, mode, signalling, first render; display untouched
     cinefit play -t 30                 # capture to screen: puts the input on the display

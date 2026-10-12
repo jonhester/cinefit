@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod capture;
+mod compare;
 #[cfg(target_os = "linux")]
 mod play;
 mod record;
@@ -98,6 +99,22 @@ enum Command {
         #[arg(long, requires = "gpu")]
         no_pstate: bool,
     },
+    /// Compare the same content recorded twice with `capture --record`, as a
+    /// Dolby Vision tunnel and as HDR10: align the recordings, render matched
+    /// frames through each path, and report how far apart they are (#24).
+    /// Uses the GPU; touches no display or capture card.
+    Compare {
+        /// The tunnel recording (r210).
+        tunnel: PathBuf,
+        /// The HDR10 recording (v210).
+        hdr10: PathBuf,
+        /// Frame pairs to compare, spread through the recordings.
+        #[arg(long, default_value_t = 12)]
+        pairs: usize,
+        /// The largest start offset to try between the recordings, in frames.
+        #[arg(long, default_value_t = 240)]
+        max_shift: i64,
+    },
     /// Capture to screen: show the input on the display, at the source's
     /// frame rate, with its HDR signalling, and measure what arrived and what
     /// was shown. Needs the input and the display to itself.
@@ -132,6 +149,17 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Probe { edid } => probe(edid),
         Command::Gpu => gpu(),
+        Command::Compare {
+            tunnel,
+            hdr10,
+            pairs,
+            max_shift,
+        } => compare_run(compare::Options {
+            tunnel,
+            hdr10,
+            pairs,
+            max_shift,
+        }),
         Command::Capture {
             seconds,
             device,
@@ -568,6 +596,16 @@ fn play_options(
 #[cfg(not(target_os = "linux"))]
 fn play(_opts: ()) -> Result<(), Box<dyn std::error::Error>> {
     Err("playing is only supported on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn compare_run(opts: compare::Options) -> Result<(), Box<dyn std::error::Error>> {
+    compare::run(opts)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn compare_run(_opts: compare::Options) -> Result<(), Box<dyn std::error::Error>> {
+    Err("comparing renders is only supported on Linux".into())
 }
 
 fn gpu() -> Result<(), Box<dyn std::error::Error>> {
