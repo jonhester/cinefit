@@ -6,8 +6,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <set>
 
 #include "DeckLinkAPI.h"
 
@@ -46,12 +48,15 @@ static_assert(offsetof(cf_dl_frame_info, max_fall) == 144, "layout must match sr
 
 namespace {
 
-// The input starts in a mode no source here sends, so format detection always
-// reports the real format at least once. Starting in the mode that arrives
-// means no change is ever reported, and the detected sampling and bit depth
-// are never seen: the first capture run, of a 2160p23.98 source, showed that.
-constexpr BMDDisplayMode kInitialMode = bmdModeHD720p50;
-constexpr BMDPixelFormat kInitialPixelFormat = bmdFormat10BitYUV;
+// The input opens in the mode the card already detects, read from its status
+// with the sampling and bit depth, so the common case never restarts. It used
+// to open in 720p50, a mode no source here sends, to force a format change
+// and so learn the detected flags; that made every open restart the input
+// inside the callback within its first frames, which the C++ version never
+// did. With no signal detected, the C++ version's guess: the card reports
+// the real format when one arrives.
+constexpr BMDDisplayMode kFallbackMode = bmdMode4K2160p2398;
+constexpr BMDPixelFormat kFallbackPixelFormat = bmdFormat10BitYUV;
 
 bool same_iid(REFIID a, REFIID b) { return memcmp(&a, &b, sizeof a) == 0; }
 
@@ -129,13 +134,13 @@ public:
     }
 
     void arm(cf_dl_format_cb on_format, cf_dl_frame_cb on_frame, void *ctx,
-             BMDTimeScale scale) {
+             BMDDisplayMode mode, BMDPixelFormat pixel_format, BMDTimeScale scale) {
         std::lock_guard<std::mutex> g(mu_);
         on_format_ = on_format;
         on_frame_ = on_frame;
         ctx_ = ctx;
-        mode_ = kInitialMode;
-        pixel_format_ = kInitialPixelFormat;
+        mode_ = mode;
+        pixel_format_ = pixel_format;
         scale_ = scale;
         active_ = true;
     }
@@ -232,8 +237,8 @@ private:
     cf_dl_format_cb on_format_ = nullptr;
     cf_dl_frame_cb on_frame_ = nullptr;
     void *ctx_ = nullptr;
-    BMDDisplayMode mode_ = kInitialMode;
-    BMDPixelFormat pixel_format_ = kInitialPixelFormat;
+    BMDDisplayMode mode_ = kFallbackMode;
+    BMDPixelFormat pixel_format_ = kFallbackPixelFormat;
     BMDTimeScale scale_ = 0;
 };
 
@@ -241,15 +246,111 @@ private:
 
 struct cf_dl_input {
     IDeckLinkInput *input;
+    IDeckLinkStatus *status;    /* null if the device has none */
     Callback *cb;
     bool started;
+    int64_t opened_connection;  /* the input selected before open, or 0 */
 };
 
+namespace {
+
+// Inputs started and not yet stopped. A process that ends without stopping
+// its input (std::process::exit on a second Ctrl-C, say) leaves the driver
+// with it enabled; this stops them at exit instead. Function-local statics,
+// constructed before the atexit registration, so they outlive the handler.
+std::mutex &started_mu() {
+    static std::mutex m;
+    return m;
+}
+std::set<cf_dl_input *> &started_inputs() {
+    static std::set<cf_dl_input *> s;
+    return s;
+}
+
+void stop_all_at_exit() {
+    std::set<cf_dl_input *> left;
+    {
+        std::lock_guard<std::mutex> g(started_mu());
+        left = started_inputs();
+    }
+    for (cf_dl_input *in : left) cf_dl_input_stop(in);
+}
+
+void track_started(cf_dl_input *in) {
+    static std::once_flag once;
+    std::call_once(once, [] { std::atexit(stop_all_at_exit); });
+    std::lock_guard<std::mutex> g(started_mu());
+    started_inputs().insert(in);
+}
+
+void untrack(cf_dl_input *in) {
+    std::lock_guard<std::mutex> g(started_mu());
+    started_inputs().erase(in);
+}
+
+// The mode and pixel format to open in: the detected mode and the format the
+// handler asks for, which tells it the format as a change would; or, with no
+// signal detected or no status to read it from, the fallback.
+void opening_mode(cf_dl_input *in, cf_dl_format_cb on_format, void *ctx,
+                  BMDDisplayMode *mode, BMDPixelFormat *pixel_format) {
+    *mode = kFallbackMode;
+    *pixel_format = kFallbackPixelFormat;
+    int64_t detected = 0, flags = 0;
+    if (!in->status ||
+        in->status->GetInt(bmdDeckLinkStatusDetectedVideoInputMode, &detected) != S_OK ||
+        detected == 0 || detected == bmdModeUnknown ||
+        in->status->GetInt(bmdDeckLinkStatusDetectedVideoInputFormatFlags, &flags) != S_OK)
+        return;
+    IDeckLinkDisplayMode *dm = nullptr;
+    if (in->input->GetDisplayMode(static_cast<BMDDisplayMode>(detected), &dm) != S_OK || !dm)
+        return;
+    cf_dl_format f;
+    memset(&f, 0, sizeof f);
+    BMDTimeValue duration = 0;
+    BMDTimeScale scale = 0;
+    if (dm->GetFrameRate(&duration, &scale) != S_OK) duration = scale = 0;
+    f.frame_duration = duration;
+    f.time_scale = scale;
+    f.width = static_cast<int32_t>(dm->GetWidth());
+    f.height = static_cast<int32_t>(dm->GetHeight());
+    f.display_mode = static_cast<BMDDisplayMode>(detected);
+    f.detected_flags = static_cast<BMDDetectedVideoInputFormatFlags>(flags);
+    // Nothing enabled yet, so the handler always names a format.
+    f.enabled_mode = 0;
+    f.enabled_pixel_format = 0;
+    dm->Release();
+    const uint32_t want = on_format(ctx, &f);
+    if (want != 0) {
+        *mode = static_cast<BMDDisplayMode>(detected);
+        *pixel_format = want;
+    }
+}
+
+} // namespace
+
 extern "C" cf_dl_input *cf_dl_input_open(cf_dl_device *dev) noexcept {
+    IDeckLink *device = reinterpret_cast<IDeckLink *>(dev);
     IDeckLinkInput *input = nullptr;
-    if (reinterpret_cast<IDeckLink *>(dev)->QueryInterface(IID_IDeckLinkInput, (void **)&input) != S_OK || !input)
+    if (device->QueryInterface(IID_IDeckLinkInput, (void **)&input) != S_OK || !input)
         return nullptr;
-    return new cf_dl_input{input, new Callback(input), false};
+    // Select the HDMI input for this session, as the C++ version does, and
+    // only if something else is selected: every change of the input is a
+    // hotplug on the HDMI port, and the Denon upstream does not reliably
+    // recover from one (it keeps sending the signal and its metadata with a
+    // black picture until its input is cycled). Not written to the card's
+    // preferences: whether to persist it is a separate decision.
+    IDeckLinkConfiguration *cfg = nullptr;
+    int64_t connection = 0;
+    if (device->QueryInterface(IID_IDeckLinkConfiguration, (void **)&cfg) == S_OK && cfg) {
+        if (cfg->GetInt(bmdDeckLinkConfigVideoInputConnection, &connection) != S_OK)
+            connection = 0;
+        else if (connection != bmdVideoConnectionHDMI)
+            cfg->SetInt(bmdDeckLinkConfigVideoInputConnection, bmdVideoConnectionHDMI);
+        cfg->Release();
+    }
+    IDeckLinkStatus *status = nullptr;
+    if (device->QueryInterface(IID_IDeckLinkStatus, (void **)&status) != S_OK) status = nullptr;
+    return new cf_dl_input{input, status, new Callback(input), false, connection};
 }
 
 extern "C" int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
@@ -257,16 +358,20 @@ extern "C" int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
                                      const char **failed_call) noexcept {
     if (in->started) return S_OK;
 
-    // Frames can arrive before the first format change, in the initial mode,
-    // so stream times need its scale from the start.
+    BMDDisplayMode mode;
+    BMDPixelFormat pixel_format;
+    opening_mode(in, on_format, ctx, &mode, &pixel_format);
+
+    // Frames arrive in the opening mode until any format change, so stream
+    // times need its scale from the start.
     BMDTimeScale scale = 0;
     IDeckLinkDisplayMode *dm = nullptr;
-    if (in->input->GetDisplayMode(kInitialMode, &dm) == S_OK && dm) {
+    if (in->input->GetDisplayMode(mode, &dm) == S_OK && dm) {
         BMDTimeValue duration = 0;
         if (dm->GetFrameRate(&duration, &scale) != S_OK) scale = 0;
         dm->Release();
     }
-    in->cb->arm(on_format, on_frame, ctx, scale);
+    in->cb->arm(on_format, on_frame, ctx, mode, pixel_format, scale);
 
     HRESULT hr = in->input->SetCallback(in->cb);
     if (hr != S_OK) {
@@ -274,8 +379,7 @@ extern "C" int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
         in->cb->disarm();
         return hr;
     }
-    hr = in->input->EnableVideoInput(kInitialMode, kInitialPixelFormat,
-                                     bmdVideoInputEnableFormatDetection);
+    hr = in->input->EnableVideoInput(mode, pixel_format, bmdVideoInputEnableFormatDetection);
     if (hr != S_OK) {
         *failed_call = "EnableVideoInput";
         in->cb->disarm();
@@ -291,6 +395,7 @@ extern "C" int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
         return hr;
     }
     in->started = true;
+    track_started(in);
     return S_OK;
 }
 
@@ -303,6 +408,11 @@ extern "C" void cf_dl_input_stop(cf_dl_input *in) noexcept {
     in->input->DisableVideoInput();
     in->input->SetCallback(nullptr);
     in->started = false;
+    untrack(in);
+}
+
+extern "C" int64_t cf_dl_input_opened_connection(cf_dl_input *in) noexcept {
+    return in->opened_connection;
 }
 
 extern "C" uint64_t cf_dl_input_failed_restarts(cf_dl_input *in) noexcept {
@@ -312,6 +422,7 @@ extern "C" uint64_t cf_dl_input_failed_restarts(cf_dl_input *in) noexcept {
 extern "C" void cf_dl_input_release(cf_dl_input *in) noexcept {
     cf_dl_input_stop(in);
     in->cb->Release();
+    if (in->status) in->status->Release();
     in->input->Release();
     delete in;
 }

@@ -12,7 +12,9 @@ cinefit-dovi = { path = "../cinefit-dovi" }
 cinefit-kms = { path = "../cinefit-kms" }
 cinefit-render = { path = "../cinefit-render" }
 clap = { version = "4.5", features = ["derive"] }
-ctrlc = "3.4"
+# termination: SIGTERM (from timeout or kill) ends a run as Ctrl-C does, so the
+# capture input is stopped rather than left enabled in the driver.
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [lints]
 workspace = true

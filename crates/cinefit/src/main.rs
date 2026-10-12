@@ -285,6 +285,7 @@ fn capture(
     // has finished.
     let ran = started.elapsed();
     let failed_restarts = running.failed_restarts();
+    let saved_hdmi = running.saved_input_was_hdmi();
     // Stops the input; no callback runs after this.
     drop(running);
 
@@ -301,6 +302,18 @@ fn capture(
             r.dropped
         );
     }
+    // A saved input other than HDMI means the card reverts to it as this run
+    // ends: a hotplug on the HDMI port, after which the Denon upstream may
+    // send a black picture until its input is cycled.
+    println!(
+        "card's saved input: {}",
+        match saved_hdmi {
+            Some(true) => "HDMI",
+            Some(false) =>
+                "not HDMI: HDMI was selected for this run only, and the card reverts as it ends (a hotplug)",
+            None => "unreadable",
+        }
+    );
     // Dropping the capture dropped the handler and its sender, so the writer
     // finishes once the queue is written.
     if let (Some(writer), Some(dir)) = (writer, &dump_dir) {

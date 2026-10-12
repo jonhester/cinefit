@@ -335,6 +335,18 @@ impl Capture {
         // SAFETY: the input is live for as long as `self`.
         unsafe { ffi::cf_dl_input_failed_restarts(self.input.as_ptr()) }
     }
+
+    /// Whether the card's saved input was already HDMI when this capture
+    /// opened it, or `None` if it could not be read. `Some(false)` means HDMI
+    /// was selected for this session only, and the card reverts to the saved
+    /// input when the capture ends: a hotplug on the HDMI port, which the
+    /// Denon upstream does not reliably recover from.
+    pub fn saved_input_was_hdmi(&self) -> Option<bool> {
+        // SAFETY: the input is live for as long as `self`.
+        let raw = unsafe { ffi::cf_dl_input_opened_connection(self.input.as_ptr()) };
+        // bmdVideoConnectionHDMI.
+        (raw != 0).then_some(raw == 1 << 1)
+    }
 }
 
 impl Drop for Capture {
@@ -485,6 +497,25 @@ mod tests {
     fn restart_on_new_pixel_format_in_the_same_mode() {
         let f = InputFormat::from(&raw_format(DETECTED_RGB444 | DETECTED_8BIT));
         assert_eq!(f.restart_with(), Some(PixelFormat::Argb8));
+    }
+
+    #[test]
+    fn at_opening_a_format_is_always_named() {
+        // The shim asks once before enabling the input, with nothing enabled
+        // (mode and pixel format 0): the answer must name the format to open
+        // in, whatever the input is.
+        for flags in [
+            DETECTED_10BIT,
+            DETECTED_RGB444 | DETECTED_8BIT,
+            DETECTED_RGB444,
+            0,
+        ] {
+            let mut raw = raw_format(flags);
+            raw.enabled_mode = 0;
+            raw.enabled_pixel_format = 0;
+            let f = InputFormat::from(&raw);
+            assert_eq!(f.restart_with(), Some(f.capture_as()));
+        }
     }
 
     #[test]
