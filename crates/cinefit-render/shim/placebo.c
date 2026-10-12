@@ -5,8 +5,10 @@
 #include <string.h>
 
 #include <libplacebo/config.h>
+#include <libplacebo/dispatch.h>
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
+#include <libplacebo/shaders/custom.h>
 #include <libplacebo/vulkan.h>
 
 /* The API the shim is written against. A different libplacebo fails the build
@@ -17,6 +19,7 @@ struct cf_pl {
     pl_log log;
     pl_vulkan vk;
     pl_renderer renderer;
+    pl_dispatch dispatch;
     cf_pl_log_cb log_cb;
     void *log_ctx;
 };
@@ -56,11 +59,18 @@ cf_pl *cf_pl_create(cf_pl_log_cb log_cb, void *ctx, char *err, size_t err_len) {
         cf_pl_destroy(pl);
         return NULL;
     }
+    pl->dispatch = pl_dispatch_create(pl->log, pl->vk->gpu);
+    if (!pl->dispatch) {
+        if (err_len) snprintf(err, err_len, "pl_dispatch_create failed");
+        cf_pl_destroy(pl);
+        return NULL;
+    }
     return pl;
 }
 
 void cf_pl_destroy(cf_pl *pl) {
     if (!pl) return;
+    pl_dispatch_destroy(&pl->dispatch);
     pl_renderer_destroy(&pl->renderer);
     pl_vulkan_destroy(&pl->vk);
     pl_log_destroy(&pl->log);
@@ -212,6 +222,246 @@ int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst, float shift_x) {
     // Before the display reads the buffer, the GPU must be done writing it.
     // Waiting here is the simple way; a fence handed to the flip can replace
     // it later.
+    pl_gpu_finish(pl->vk->gpu);
+    return 0;
+}
+
+struct cf_pl_planes {
+    pl_tex luma, chroma;
+    pl_tex packed;      /* the frame as uploaded; sized on first use */
+    int w, h;
+};
+
+static pl_fmt storable_fmt(struct cf_pl *pl, const char *name) {
+    pl_fmt fmt = pl_find_named_fmt(pl->vk->gpu, name);
+    if (!fmt || !(fmt->caps & PL_FMT_CAP_STORABLE) || !(fmt->caps & PL_FMT_CAP_SAMPLEABLE)) {
+        log_err(pl, "a plane format is not both storable and sampleable");
+        return NULL;
+    }
+    return fmt;
+}
+
+cf_pl_planes *cf_pl_planes_create(cf_pl *pl, int w, int h) {
+    pl_gpu gpu = pl->vk->gpu;
+    pl_fmt f_luma = storable_fmt(pl, "r16"), f_chroma = storable_fmt(pl, "rg16");
+    if (!f_luma || !f_chroma) return NULL;
+    struct cf_pl_planes *p = calloc(1, sizeof *p);
+    if (!p) return NULL;
+    p->w = w;
+    p->h = h;
+    // Host readable only so the checks can read them back.
+    p->luma = pl_tex_create(gpu, pl_tex_params(
+        .w = w, .h = h, .format = f_luma,
+        .sampleable = true, .storable = true, .host_readable = true));
+    p->chroma = pl_tex_create(gpu, pl_tex_params(
+        .w = (w + 1) / 2, .h = h, .format = f_chroma,
+        .sampleable = true, .storable = true, .host_readable = true));
+    if (!p->luma || !p->chroma) {
+        cf_pl_planes_destroy(pl, p);
+        return NULL;
+    }
+    return p;
+}
+
+void cf_pl_planes_destroy(cf_pl *pl, cf_pl_planes *p) {
+    if (!p) return;
+    pl_gpu gpu = pl->vk->gpu;
+    pl_tex_destroy(gpu, &p->luma);
+    pl_tex_destroy(gpu, &p->chroma);
+    pl_tex_destroy(gpu, &p->packed);
+    free(p);
+}
+
+/* One invocation per v210 group: six pixels in four little-endian 32-bit
+ * words, three 10-bit components each (the C++ version's layout, checked
+ * against the card there):
+ *
+ *   word 0:  bits  0-9 Cb0   10-19 Y0    20-29 Cr0
+ *   word 1:  bits  0-9 Y1    10-19 Cb1   20-29 Y2
+ *   word 2:  bits  0-9 Cr1   10-19 Y3    20-29 Cb2
+ *   word 3:  bits  0-9 Y4    10-19 Cr2   20-29 Y5
+ *
+ * The frame is uploaded as an r32u texture, one texel per word, so the
+ * upload honours the card's stride and the shader reads exact integers.
+ * Codes are stored shifted left by 6, which a 16-bit unorm holds exactly and
+ * libplacebo undoes with bit_shift = 6. The names carry a prefix because
+ * libplacebo #defines each one over the whole shader. */
+static const char V210_HEADER[] =
+    "float cf_unorm(uint code) { return float(code << 6) / 65535.0; }\n";
+
+static const char V210_BODY[] =
+    "ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (id.x < cf_groups && id.y < cf_height) {\n"
+    "    uint w0 = texelFetch(cf_packed, ivec2(4 * id.x + 0, id.y), 0).r;\n"
+    "    uint w1 = texelFetch(cf_packed, ivec2(4 * id.x + 1, id.y), 0).r;\n"
+    "    uint w2 = texelFetch(cf_packed, ivec2(4 * id.x + 2, id.y), 0).r;\n"
+    "    uint w3 = texelFetch(cf_packed, ivec2(4 * id.x + 3, id.y), 0).r;\n"
+    "    uint y[6] = uint[6](w0 >> 10, w1, w1 >> 20, w2 >> 10, w3, w3 >> 20);\n"
+    "    uint cb[3] = uint[3](w0, w1 >> 10, w2 >> 20);\n"
+    "    uint cr[3] = uint[3](w0 >> 20, w2, w3 >> 10);\n"
+    "    for (int i = 0; i < 6; i++) {\n"
+    "        int x = 6 * id.x + i;\n"
+    "        if (x < cf_width)\n"
+    "            imageStore(cf_luma, ivec2(x, id.y), vec4(cf_unorm(y[i] & 0x3FFu), 0.0, 0.0, 1.0));\n"
+    "    }\n"
+    /* ceil(width / 2) pairs: an odd width's last pixel still has one. */
+    "    for (int i = 0; i < 3; i++) {\n"
+    "        int x = 3 * id.x + i;\n"
+    "        if (x < (cf_width + 1) / 2)\n"
+    "            imageStore(cf_chroma, ivec2(x, id.y),\n"
+    "                       vec4(cf_unorm(cb[i] & 0x3FFu), cf_unorm(cr[i] & 0x3FFu), 0.0, 1.0));\n"
+    "    }\n"
+    "}\n";
+
+/* Workgroup width; one row of groups per workgroup row. */
+#define V210_LOCAL 64
+
+int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t row_bytes) {
+    pl_gpu gpu = pl->vk->gpu;
+    int groups = (p->w + 5) / 6;
+    if (row_bytes % 16 || row_bytes < (size_t)groups * 16) {
+        log_err(pl, "v210 stride is not a multiple of 16 covering the width");
+        return -1;
+    }
+    pl_fmt f_packed = pl_find_named_fmt(gpu, "r32u");
+    if (!f_packed) {
+        log_err(pl, "no r32u texture format");
+        return -1;
+    }
+    if (!pl_tex_recreate(gpu, &p->packed, pl_tex_params(
+            .w = (int)(row_bytes / 4), .h = p->h, .format = f_packed,
+            .sampleable = true, .host_writable = true)))
+        return -1;
+    if (!pl_tex_upload(gpu, pl_tex_transfer_params(
+            .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes)))
+        return -1;
+
+    pl_shader sh = pl_dispatch_begin(pl->dispatch);
+    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = "v210 unpack",
+        .header = V210_HEADER,
+        .body = V210_BODY,
+        .input = PL_SHADER_SIG_NONE,
+        .output = PL_SHADER_SIG_NONE,
+        .compute = true,
+        .compute_group_size = {V210_LOCAL, 1},
+        .descriptors = (struct pl_shader_desc[]) {
+            {
+                .desc = { .name = "cf_packed", .type = PL_DESC_SAMPLED_TEX },
+                // Integer texels: fetched, never filtered.
+                .binding = { .object = p->packed, .sample_mode = PL_TEX_SAMPLE_NEAREST },
+            },
+            {
+                .desc = { .name = "cf_luma", .type = PL_DESC_STORAGE_IMG,
+                          .access = PL_DESC_ACCESS_WRITEONLY },
+                .binding.object = p->luma,
+            },
+            {
+                .desc = { .name = "cf_chroma", .type = PL_DESC_STORAGE_IMG,
+                          .access = PL_DESC_ACCESS_WRITEONLY },
+                .binding.object = p->chroma,
+            },
+        },
+        .num_descriptors = 3,
+        .variables = (struct pl_shader_var[]) {
+            { .var = pl_var_int("cf_width"),  .data = &p->w },
+            { .var = pl_var_int("cf_height"), .data = &p->h },
+            { .var = pl_var_int("cf_groups"), .data = &groups },
+        },
+        .num_variables = 3,
+    });
+    if (!ok) {
+        pl_dispatch_abort(pl->dispatch, &sh);
+        log_err(pl, "v210 unpack shader rejected");
+        return -1;
+    }
+    if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
+            .shader = &sh,
+            .dispatch_size = {(groups + V210_LOCAL - 1) / V210_LOCAL, p->h, 1})))
+        return -1;
+    return 0;
+}
+
+int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *p, uint16_t *luma, uint16_t *chroma) {
+    pl_gpu gpu = pl->vk->gpu;
+    if (!pl_tex_download(gpu, pl_tex_transfer_params(
+            .tex = p->luma, .ptr = luma, .row_pitch = (size_t)p->w * 2)))
+        return -1;
+    if (!pl_tex_download(gpu, pl_tex_transfer_params(
+            .tex = p->chroma, .ptr = chroma, .row_pitch = (size_t)((p->w + 1) / 2) * 4)))
+        return -1;
+    pl_gpu_finish(gpu);
+    return 0;
+}
+
+static enum pl_color_primaries primaries(int p) {
+    return p == CF_PL_PRIM_BT2020 ? PL_COLOR_PRIM_BT_2020 : PL_COLOR_PRIM_BT_709;
+}
+
+static enum pl_color_transfer transfer(int t) {
+    switch (t) {
+    case CF_PL_TRC_PQ:  return PL_COLOR_TRC_PQ;
+    case CF_PL_TRC_HLG: return PL_COLOR_TRC_HLG;
+    default:            return PL_COLOR_TRC_BT_1886;
+    }
+}
+
+int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
+                       cf_pl_tex *dst, int dst_prim, int dst_trc) {
+    struct pl_frame image = {
+        .num_planes = 2,
+        .planes = {
+            { .texture = src->luma, .components = 1, .component_mapping = {PL_CHANNEL_Y} },
+            { .texture = src->chroma, .components = 2,
+              .component_mapping = {PL_CHANNEL_CB, PL_CHANNEL_CR} },
+        },
+        .repr = {
+            .sys = matrix == CF_PL_MATRIX_BT2020_NC ? PL_COLOR_SYSTEM_BT_2020_NC
+                                                    : PL_COLOR_SYSTEM_BT_709,
+            .levels = PL_COLOR_LEVELS_LIMITED,
+            .bits = { .sample_depth = 16, .color_depth = 10, .bit_shift = 6 },
+        },
+        .color = { .primaries = primaries(prim), .transfer = transfer(trc) },
+    };
+    // HDMI 4:2:2 is co-sited: each chroma sample sits on an even luma pixel.
+    // A plane built by hand has shift_x 0, which libplacebo reads as centred
+    // between two luma pixels.
+    pl_frame_set_chroma_location(&image, PL_CHROMA_LEFT);
+
+    pl_tex d = unwrap_tex(dst);
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes = {{ .texture = d, .components = 3, .component_mapping = {0, 1, 2} }},
+        .repr = pl_color_repr_rgb,
+        .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
+    };
+
+    struct pl_render_params params = pl_render_default_params;
+    params.dither_params = NULL;
+    // Peak detection would measure the frame and change the source's HDR
+    // metadata, which turns a render between identical colour spaces into a
+    // tone mapping. Passthrough wants none.
+    params.peak_detect_params = NULL;
+    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    pl_gpu_finish(pl->vk->gpu);
+    return 0;
+}
+
+cf_pl_tex *cf_pl_target_rgba16(cf_pl *pl, int w, int h) {
+    pl_fmt fmt = pl_find_named_fmt(pl->vk->gpu, "rgba16");
+    if (!fmt) {
+        log_err(pl, "no rgba16 texture format");
+        return NULL;
+    }
+    return wrap_tex(pl_tex_create(pl->vk->gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .renderable = true, .host_readable = true)));
+}
+
+int cf_pl_download_rgba16(cf_pl *pl, cf_pl_tex *t, uint16_t *out) {
+    pl_tex tex = unwrap_tex(t);
+    if (!pl_tex_download(pl->vk->gpu, pl_tex_transfer_params(
+            .tex = tex, .ptr = out, .row_pitch = (size_t)tex->params.w * 8)))
+        return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
 }

@@ -42,12 +42,14 @@ machine with everything installed will not notice it missing.
 On the machine with the hardware:
 
     cinefit probe                      # devices; opens nothing
-    cinefit gpu                        # Vulkan, libplacebo, scanout renders read back
+    cinefit gpu                        # Vulkan, libplacebo, v210 unpack and renders read back
     cinefit capture -t 20 [--dump DIR] # what arrives on the input
     cinefit pattern -t 30 [--gpu] [--hdr]   # puts a picture on the display
 
 `CINEFIT_DOVI_DUMPS=DIR cargo test -p cinefit-dovi --test dumps` decodes saved
-frames; it is skipped when the variable is unset.
+frames, and `CINEFIT_V210_STILLS=DIR cargo test -p cinefit-render --test
+v210_stills` unpacks saved `v210` frames on the GPU against the CPU; each is
+skipped when its variable is unset.
 
 ## Hard rules
 
