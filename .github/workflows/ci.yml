@@ -10,9 +10,10 @@ env:
 
 jobs:
   check:
-    # Linux, the only platform cinefit runs on. The shim builds against the
-    # vendored SDK headers; no driver is needed to build or to run the tests.
-    runs-on: ubuntu-latest
+    # Linux, the only platform cinefit runs on. The DeckLink shim builds
+    # against the vendored SDK headers; no driver is needed to build or to run
+    # the tests. 26.04 because its libplacebo (7.360) is the one the rig runs.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
