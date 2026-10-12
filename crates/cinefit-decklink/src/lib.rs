@@ -17,6 +17,12 @@ const VIDEO_CONNECTION_HDMI: i64 = 1 << 1;
 pub enum Error {
     /// `libDeckLinkAPI.so` could not be loaded: the driver is not installed.
     DriverNotLoaded,
+    /// The driver loaded but did not report its version, so it cannot be
+    /// checked against [`ApiVersion::REQUIRED`].
+    VersionUnreported,
+    /// The driver is older than the SDK headers this crate is built with, and
+    /// lacks the entry points they call.
+    DriverTooOld { found: ApiVersion },
 }
 
 impl fmt::Display for Error {
@@ -25,11 +31,51 @@ impl fmt::Display for Error {
             Error::DriverNotLoaded => {
                 f.write_str("DeckLink driver not loaded (is Desktop Video installed?)")
             }
+            Error::VersionUnreported => f.write_str("DeckLink driver did not report its version"),
+            Error::DriverTooOld { found } => write!(
+                f,
+                "DeckLink driver {found} is too old: Desktop Video {} or newer is required",
+                ApiVersion::REQUIRED
+            ),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// A driver API version, e.g. 16.4.
+///
+/// Fields are in significance order, so the derived ordering compares versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ApiVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl ApiVersion {
+    /// The oldest driver the vendored SDK headers work with.
+    pub const REQUIRED: Self = Self::from_raw(ffi::REQUIRED_API_VERSION);
+
+    /// Decodes the SDK's 0xMMmmpp00 encoding.
+    const fn from_raw(raw: i64) -> Self {
+        Self {
+            major: (raw >> 24) as u8,
+            minor: (raw >> 16) as u8,
+            patch: (raw >> 8) as u8,
+        }
+    }
+}
+
+impl fmt::Display for ApiVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)?;
+        if self.patch != 0 {
+            write!(f, ".{}", self.patch)?;
+        }
+        Ok(())
+    }
+}
 
 /// What a device says about itself. `None` means the device did not report the
 /// attribute, which is not the same as reporting `false`.
@@ -72,32 +118,43 @@ pub use self::linux::*;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{DeviceInfo, Error, c_string, ffi};
-    use std::mem::MaybeUninit;
+    use super::{ApiVersion, DeviceInfo, Error, ffi};
     use std::ptr::NonNull;
 
-    /// The installed driver's API version, e.g. "16.4".
+    /// The installed driver's API version.
     ///
     /// # Errors
     ///
-    /// [`Error::DriverNotLoaded`] if the Desktop Video driver is not installed.
-    pub fn api_version() -> Result<String, Error> {
-        let mut buf = [0u8; 64];
-        // SAFETY: the shim writes at most `buf.len()` bytes, NUL-terminated.
-        let rc = unsafe { ffi::cf_dl_api_version(buf.as_mut_ptr().cast(), buf.len()) };
+    /// [`Error::DriverNotLoaded`] if the Desktop Video driver is not installed,
+    /// or [`Error::VersionUnreported`] if it does not say which version it is.
+    pub fn api_version() -> Result<ApiVersion, Error> {
+        let mut raw = ffi::UNKNOWN;
+        // SAFETY: the shim writes one `i64` through the pointer, which is live.
+        let rc = unsafe { ffi::cf_dl_api_version(&mut raw) };
         if rc != 0 {
             return Err(Error::DriverNotLoaded);
         }
-        Ok(c_string(&buf))
+        if raw == ffi::UNKNOWN {
+            return Err(Error::VersionUnreported);
+        }
+        Ok(ApiVersion::from_raw(raw))
     }
 
     /// Every DeckLink device the driver can see, in the driver's order.
     ///
     /// # Errors
     ///
-    /// [`Error::DriverNotLoaded`] if the Desktop Video driver is not installed.
-    /// No devices is not an error: the result is empty.
+    /// Any error from [`api_version`], or [`Error::DriverTooOld`] if the driver
+    /// predates [`ApiVersion::REQUIRED`]. No devices is not an error: the
+    /// result is empty.
     pub fn devices() -> Result<Vec<Device>, Error> {
+        // An old driver lacks the iterator entry point, and the SDK reports
+        // that the same way as a missing driver, so check first.
+        let found = api_version()?;
+        if found < ApiVersion::REQUIRED {
+            return Err(Error::DriverTooOld { found });
+        }
+
         // SAFETY: no preconditions; null means the driver is not loaded.
         let it =
             NonNull::new(unsafe { ffi::cf_dl_iterator_create() }).ok_or(Error::DriverNotLoaded)?;
@@ -112,7 +169,7 @@ mod linux {
         Ok(out)
     }
 
-    struct Iter(NonNull<ffi::Iterator>);
+    struct Iter(NonNull<ffi::IteratorHandle>);
 
     impl Drop for Iter {
         fn drop(&mut self) {
@@ -127,18 +184,15 @@ mod linux {
     /// Not `Send` or `Sync` for now: nothing needs a device on another thread
     /// yet, and the SDK's threading rules for it are not established here.
     #[derive(Debug)]
-    pub struct Device(NonNull<ffi::Device>);
+    pub struct Device(NonNull<ffi::DeviceHandle>);
 
     impl Device {
         /// What the device reports about itself; see [`DeviceInfo`].
         pub fn info(&self) -> DeviceInfo {
-            let mut raw = MaybeUninit::<ffi::DeviceInfo>::uninit();
-            // SAFETY: the device is live, and the shim initialises every byte
-            // of `raw` (it zeroes the struct before filling it).
-            let raw = unsafe {
-                ffi::cf_dl_device_get_info(self.0.as_ptr(), raw.as_mut_ptr());
-                raw.assume_init()
-            };
+            let mut raw = ffi::DeviceInfo::UNREPORTED;
+            // SAFETY: the device is live, and `raw` is a valid, writable struct
+            // whose layout the shim shares.
+            unsafe { ffi::cf_dl_device_get_info(self.0.as_ptr(), &mut raw) };
             DeviceInfo::from(&raw)
         }
     }
@@ -204,6 +258,29 @@ mod tests {
         let info = DeviceInfo::from(&r);
         assert_eq!(info.supports_capture, Some(false));
         assert_eq!(info.hdmi_input, Some(false));
+    }
+
+    #[test]
+    fn api_version_decodes_sdk_encoding() {
+        // What Desktop Video 16.4 reports.
+        let v = ApiVersion::from_raw(0x1004_0000);
+        assert_eq!((v.major, v.minor, v.patch), (16, 4, 0));
+        assert_eq!(v.to_string(), "16.4");
+        assert_eq!(ApiVersion::from_raw(0x0f03_0100).to_string(), "15.3.1");
+        assert_eq!(ApiVersion::REQUIRED.to_string(), "16.0");
+    }
+
+    #[test]
+    fn api_versions_order_by_significance() {
+        let v = |major, minor, patch| ApiVersion {
+            major,
+            minor,
+            patch,
+        };
+        assert!(v(15, 3, 1) < ApiVersion::REQUIRED);
+        assert!(v(15, 9, 9) < v(16, 0, 0));
+        assert!(v(16, 0, 1) > ApiVersion::REQUIRED);
+        assert!(v(16, 4, 0) > v(16, 0, 9));
     }
 
     #[test]

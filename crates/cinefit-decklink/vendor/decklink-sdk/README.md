@@ -16,4 +16,8 @@ needs only these files; running needs the Desktop Video driver installed.
 
 To upgrade, download the SDK from
 <https://www.blackmagicdesign.com/desktopvideo_sdk> and replace `include/`
-with its `Linux/include` folder, then update the version above.
+with its `Linux/include` folder, then update the version above and
+`REQUIRED_API_VERSION` in `src/ffi.rs` (the build fails until you do).
+
+The vendored version is also the oldest driver cinefit runs against: upgrading
+it raises the Desktop Video version users need.

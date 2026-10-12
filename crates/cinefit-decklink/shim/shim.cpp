@@ -6,11 +6,21 @@
 #include <cstring>
 
 #include "DeckLinkAPI.h"
+#include "DeckLinkAPIVersion.h"
 
-// The Rust side declares this struct by hand and asserts the same numbers.
+// The Rust side declares this struct by hand and asserts the same numbers. Every
+// field is checked, so a reorder fails the build as well as a resize.
 static_assert(sizeof(cf_dl_device_info) == 288, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_device_info, display_name) == 0, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_device_info, model_name) == 128, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_device_info, persistent_id) == 256, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_device_info, video_io_support) == 264, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_device_info, input_connections) == 272, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_device_info, input_format_detection) == 280, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_device_info, hdr_metadata) == 284, "layout must match src/ffi.rs");
+// The oldest driver these headers work with. src/ffi.rs repeats it, so an SDK
+// upgrade fails the build until both sides agree.
+static_assert(BLACKMAGIC_DECKLINK_API_VERSION == 0x10000000, "update REQUIRED_API_VERSION in src/ffi.rs");
 
 namespace {
 
@@ -19,11 +29,9 @@ IDeckLink *unwrap(cf_dl_device *p) { return reinterpret_cast<IDeckLink *>(p); }
 
 // On Linux the SDK returns strings as malloc'd `const char *` that the caller
 // owns, so each one is copied out and freed here rather than crossing into Rust.
+// It is freed on every path, whether or not there is room to copy it.
 void take_string(const char *s, char *dst, size_t len) {
-    if (len == 0) return;
-    dst[0] = '\0';
-    if (!s) return;
-    snprintf(dst, len, "%s", s);
+    if (len != 0) snprintf(dst, len, "%s", s ? s : "");
     free(const_cast<char *>(s));
 }
 
@@ -41,34 +49,31 @@ int64_t integer(IDeckLinkProfileAttributes *a, BMDDeckLinkAttributeID id) {
 
 } // namespace
 
-extern "C" int cf_dl_api_version(char *buf, size_t len) {
+extern "C" int cf_dl_api_version(int64_t *version) noexcept {
     // Null when libDeckLinkAPI.so is missing: the driver is not installed.
     IDeckLinkAPIInformation *info = CreateDeckLinkAPIInformationInstance();
     if (!info) return -1;
-    const char *s = nullptr;
-    if (info->GetString(BMDDeckLinkAPIVersion, &s) == S_OK)
-        take_string(s, buf, len);
-    else if (len)
-        buf[0] = '\0';
+    if (info->GetInt(BMDDeckLinkAPIVersion, version) != S_OK)
+        *version = CF_DL_UNKNOWN;
     info->Release();
     return 0;
 }
 
-extern "C" cf_dl_iterator *cf_dl_iterator_create(void) {
+extern "C" cf_dl_iterator *cf_dl_iterator_create(void) noexcept {
     return reinterpret_cast<cf_dl_iterator *>(CreateDeckLinkIteratorInstance());
 }
 
-extern "C" cf_dl_device *cf_dl_iterator_next(cf_dl_iterator *it) {
+extern "C" cf_dl_device *cf_dl_iterator_next(cf_dl_iterator *it) noexcept {
     IDeckLink *dev = nullptr;
     if (unwrap(it)->Next(&dev) != S_OK) return nullptr;
     return reinterpret_cast<cf_dl_device *>(dev);
 }
 
-extern "C" void cf_dl_iterator_release(cf_dl_iterator *it) {
+extern "C" void cf_dl_iterator_release(cf_dl_iterator *it) noexcept {
     unwrap(it)->Release();
 }
 
-extern "C" void cf_dl_device_get_info(cf_dl_device *handle, cf_dl_device_info *out) {
+extern "C" void cf_dl_device_get_info(cf_dl_device *handle, cf_dl_device_info *out) noexcept {
     IDeckLink *dev = unwrap(handle);
     memset(out, 0, sizeof *out);
 
@@ -90,6 +95,6 @@ extern "C" void cf_dl_device_get_info(cf_dl_device *handle, cf_dl_device_info *o
     if (attrs) attrs->Release();
 }
 
-extern "C" void cf_dl_device_release(cf_dl_device *dev) {
+extern "C" void cf_dl_device_release(cf_dl_device *dev) noexcept {
     unwrap(dev)->Release();
 }

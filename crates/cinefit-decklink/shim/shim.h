@@ -7,11 +7,19 @@
 #ifndef CINEFIT_DECKLINK_SHIM_H
 #define CINEFIT_DECKLINK_SHIM_H
 
-#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* Rust calls these through `extern "C"`, which must not unwind. noexcept makes
+ * an escaping C++ exception terminate here instead. Every declaration needs the
+ * same exception specification, so the header carries it too. */
+#ifdef __cplusplus
+#define CF_DL_NOEXCEPT noexcept
+#else
+#define CF_DL_NOEXCEPT
 #endif
 
 /* Opaque handles. Each holds one SDK reference, dropped by its _release. */
@@ -32,18 +40,21 @@ typedef struct {
     int32_t hdr_metadata;            /* 1, 0, or CF_DL_UNKNOWN */
 } cf_dl_device_info;
 
-/* Writes the driver's API version into buf. Returns 0, or -1 if the driver
- * library could not be loaded. */
-int cf_dl_api_version(char *buf, size_t len);
+/* Writes the driver's API version into *version, encoded like the SDK's
+ * BLACKMAGIC_DECKLINK_API_VERSION (0xMMmmpp00), or CF_DL_UNKNOWN if the driver
+ * does not report it. Returns 0, or -1 if the driver library could not be
+ * loaded. */
+int cf_dl_api_version(int64_t *version) CF_DL_NOEXCEPT;
 
-/* Null if the driver library could not be loaded. */
-cf_dl_iterator *cf_dl_iterator_create(void);
+/* Null if the driver library could not be loaded, or is older than the
+ * headers the shim was built with. */
+cf_dl_iterator *cf_dl_iterator_create(void) CF_DL_NOEXCEPT;
 /* The next device, or null when there are no more. */
-cf_dl_device *cf_dl_iterator_next(cf_dl_iterator *it);
-void cf_dl_iterator_release(cf_dl_iterator *it);
+cf_dl_device *cf_dl_iterator_next(cf_dl_iterator *it) CF_DL_NOEXCEPT;
+void cf_dl_iterator_release(cf_dl_iterator *it) CF_DL_NOEXCEPT;
 
-void cf_dl_device_get_info(cf_dl_device *dev, cf_dl_device_info *out);
-void cf_dl_device_release(cf_dl_device *dev);
+void cf_dl_device_get_info(cf_dl_device *dev, cf_dl_device_info *out) CF_DL_NOEXCEPT;
+void cf_dl_device_release(cf_dl_device *dev) CF_DL_NOEXCEPT;
 
 #ifdef __cplusplus
 }

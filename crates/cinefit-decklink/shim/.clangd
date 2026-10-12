@@ -1,0 +1,4 @@
+# Editor support only: the build gets its flags from build.rs, which clangd
+# cannot see. Relative paths resolve from this directory.
+CompileFlags:
+  Add: [-std=c++17, -I../vendor/decklink-sdk/include]

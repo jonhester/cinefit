@@ -1,3 +1,6 @@
+// Unsafe code lives in the wrapper crates (cinefit-decklink), behind safe APIs.
+#![forbid(unsafe_code)]
+
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
