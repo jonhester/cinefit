@@ -6,9 +6,11 @@
 
 mod capture;
 mod ffi;
+pub mod mailbox;
 mod metadata;
 
 pub use capture::{Capture, Frame, FrameInfo, Handler, InputFormat, PixelFormat, Pixels, Sampling};
+pub use mailbox::Mailbox;
 pub use metadata::{Chromaticity, ColorInfo, Colorspace, Eotf, HdrMetadata};
 
 use std::ffi::CStr;
