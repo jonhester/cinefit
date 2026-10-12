@@ -38,8 +38,10 @@ pub enum PixelFormat {
     V210,
     /// 8-bit ARGB, bit-exact for 8-bit RGB input.
     Argb8,
-    /// `r210`: 10-bit RGB. Used only so deeper RGB input is detected and
-    /// counted; the card's level handling for it is unverified.
+    /// `r210`: 10-bit RGB, big-endian. The SDK documents it as SMPTE levels
+    /// (64-940), but the card passes 8-bit RGB through unscaled, as
+    /// `code << 2` from 0 to 1020 (measured on tunneled Dolby Vision frames,
+    /// whose checksums would not survive a rescale).
     Rgb10,
     /// Anything else the card reports.
     Other(u32),

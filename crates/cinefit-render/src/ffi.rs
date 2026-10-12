@@ -31,6 +31,13 @@ pub struct Planes {
     _opaque: [u8; 0],
 }
 
+/// Opaque `cf_pl_rgb`.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct Rgb {
+    _opaque: [u8; 0],
+}
+
 /// Opaque `cf_pl_tex`.
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -96,6 +103,26 @@ unsafe extern "C" {
         dst_primaries: c_int,
         dst_trc: c_int,
     ) -> c_int;
+    pub fn cf_pl_rgb_create(pl: *mut Handle, w: c_int, h: c_int) -> *mut Rgb;
+    pub fn cf_pl_rgb_destroy(pl: *mut Handle, rgb: *mut Rgb);
+    pub fn cf_pl_unpack_rgb(
+        pl: *mut Handle,
+        rgb: *mut Rgb,
+        data: *const u8,
+        row_bytes: usize,
+        format: c_int,
+    ) -> c_int;
+    pub fn cf_pl_rgb_download(pl: *mut Handle, rgb: *mut Rgb, out: *mut u16) -> c_int;
+    pub fn cf_pl_render_rgb(
+        pl: *mut Handle,
+        src: *mut Rgb,
+        levels: c_int,
+        primaries: c_int,
+        trc: c_int,
+        dst: *mut Tex,
+        dst_primaries: c_int,
+        dst_trc: c_int,
+    ) -> c_int;
     pub fn cf_pl_target_rgba16(pl: *mut Handle, w: c_int, h: c_int) -> *mut Tex;
     pub fn cf_pl_download_rgba16(pl: *mut Handle, tex: *mut Tex, out: *mut u16) -> c_int;
 }
@@ -110,6 +137,10 @@ mod color {
     pub const TRC_BT1886: i32 = 0;
     pub const TRC_PQ: i32 = 1;
     pub const TRC_HLG: i32 = 2;
+    pub const R210: i32 = 0;
+    pub const ARGB8: i32 = 1;
+    pub const LEVELS_FULL: i32 = 0;
+    pub const LEVELS_LIMITED: i32 = 1;
 }
 #[cfg(target_os = "linux")]
 pub use color::*;

@@ -230,6 +230,7 @@ struct cf_pl_planes {
     pl_tex luma, chroma;
     pl_tex packed;      /* the frame as uploaded; sized on first use */
     int w, h;
+    bool filled;        /* an unpack has written the planes */
 };
 
 static pl_fmt storable_fmt(struct cf_pl *pl, const char *name) {
@@ -379,11 +380,17 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
             .shader = &sh,
             .dispatch_size = {(groups + V210_LOCAL - 1) / V210_LOCAL, p->h, 1})))
         return -1;
+    p->filled = true;
     return 0;
 }
 
 int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *p, uint16_t *luma, uint16_t *chroma) {
     pl_gpu gpu = pl->vk->gpu;
+    // Until then the textures hold whatever the allocation did.
+    if (!p->filled) {
+        log_err(pl, "planes read before any frame was unpacked into them");
+        return -1;
+    }
     if (!pl_tex_download(gpu, pl_tex_transfer_params(
             .tex = p->luma, .ptr = luma, .row_pitch = (size_t)p->w * 2)))
         return -1;
@@ -408,6 +415,10 @@ static enum pl_color_transfer transfer(int t) {
 
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
                        cf_pl_tex *dst, int dst_prim, int dst_trc) {
+    if (!src->filled) {
+        log_err(pl, "planes read before any frame was unpacked into them");
+        return -1;
+    }
     struct pl_frame image = {
         .num_planes = 2,
         .planes = {
@@ -462,6 +473,173 @@ int cf_pl_download_rgba16(cf_pl *pl, cf_pl_tex *t, uint16_t *out) {
     if (!pl_tex_download(pl->vk->gpu, pl_tex_transfer_params(
             .tex = tex, .ptr = out, .row_pitch = (size_t)tex->params.w * 8)))
         return -1;
+    pl_gpu_finish(pl->vk->gpu);
+    return 0;
+}
+
+struct cf_pl_rgb {
+    pl_tex rgb;
+    pl_tex packed;      /* the frame as uploaded; sized on first use */
+    int w, h;
+    int depth;          /* of the last unpack: 10 or 8 */
+    bool filled;        /* an unpack has written the texture */
+};
+
+cf_pl_rgb *cf_pl_rgb_create(cf_pl *pl, int w, int h) {
+    pl_fmt fmt = storable_fmt(pl, "rgba16");
+    if (!fmt) return NULL;
+    struct cf_pl_rgb *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->w = w;
+    r->h = h;
+    r->depth = 10;
+    r->rgb = pl_tex_create(pl->vk->gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt,
+        .sampleable = true, .storable = true, .host_readable = true));
+    if (!r->rgb) {
+        cf_pl_rgb_destroy(pl, r);
+        return NULL;
+    }
+    return r;
+}
+
+void cf_pl_rgb_destroy(cf_pl *pl, cf_pl_rgb *r) {
+    if (!r) return;
+    pl_tex_destroy(pl->vk->gpu, &r->rgb);
+    pl_tex_destroy(pl->vk->gpu, &r->packed);
+    free(r);
+}
+
+/* One invocation per pixel, one 32-bit word each. The upload is an r32u
+ * texture, so the shader sees each word as the CPU reads it little-endian:
+ * r210's big-endian word is byte-swapped back, and ARGB8's bytes A, R, G, B
+ * are the word's low byte first. */
+static const char RGB_BODY[] =
+    "ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (id.x < cf_width && id.y < cf_height) {\n"
+    "    uint w = texelFetch(cf_packed, id, 0).r;\n"
+    "    vec3 c;\n"
+    "    if (cf_format == 0) {\n"
+    "        w = (w >> 24) | ((w >> 8) & 0xFF00u) | ((w << 8) & 0xFF0000u) | (w << 24);\n"
+    "        c = vec3((uvec3(w >> 20, w >> 10, w) & 0x3FFu) << 6) / 65535.0;\n"
+    "    } else {\n"
+    "        c = vec3((uvec3(w >> 8, w >> 16, w >> 24) & 0xFFu) << 8) / 65535.0;\n"
+    "    }\n"
+    "    imageStore(cf_rgb, id, vec4(c, 1.0));\n"
+    "}\n";
+
+#define RGB_LOCAL_X 32
+#define RGB_LOCAL_Y 8
+
+int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *r, const uint8_t *data, size_t row_bytes, int format) {
+    pl_gpu gpu = pl->vk->gpu;
+    if (format != CF_PL_R210 && format != CF_PL_ARGB8) {
+        log_err(pl, "unknown RGB capture format");
+        return -1;
+    }
+    if (row_bytes % 4 || row_bytes < (size_t)r->w * 4) {
+        log_err(pl, "RGB stride is not whole words covering the width");
+        return -1;
+    }
+    pl_fmt f_packed = pl_find_named_fmt(gpu, "r32u");
+    if (!f_packed) {
+        log_err(pl, "no r32u texture format");
+        return -1;
+    }
+    if (!pl_tex_recreate(gpu, &r->packed, pl_tex_params(
+            .w = (int)(row_bytes / 4), .h = r->h, .format = f_packed,
+            .sampleable = true, .host_writable = true)))
+        return -1;
+    if (!pl_tex_upload(gpu, pl_tex_transfer_params(
+            .tex = r->packed, .ptr = (void *)data, .row_pitch = row_bytes)))
+        return -1;
+
+    pl_shader sh = pl_dispatch_begin(pl->dispatch);
+    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = format == CF_PL_R210 ? "r210 unpack" : "ARGB8 unpack",
+        .body = RGB_BODY,
+        .input = PL_SHADER_SIG_NONE,
+        .output = PL_SHADER_SIG_NONE,
+        .compute = true,
+        .compute_group_size = {RGB_LOCAL_X, RGB_LOCAL_Y},
+        .descriptors = (struct pl_shader_desc[]) {
+            {
+                .desc = { .name = "cf_packed", .type = PL_DESC_SAMPLED_TEX },
+                .binding = { .object = r->packed, .sample_mode = PL_TEX_SAMPLE_NEAREST },
+            },
+            {
+                .desc = { .name = "cf_rgb", .type = PL_DESC_STORAGE_IMG,
+                          .access = PL_DESC_ACCESS_WRITEONLY },
+                .binding.object = r->rgb,
+            },
+        },
+        .num_descriptors = 2,
+        .variables = (struct pl_shader_var[]) {
+            { .var = pl_var_int("cf_width"),  .data = &r->w },
+            { .var = pl_var_int("cf_height"), .data = &r->h },
+            { .var = pl_var_int("cf_format"), .data = &format },
+        },
+        .num_variables = 3,
+    });
+    if (!ok) {
+        pl_dispatch_abort(pl->dispatch, &sh);
+        log_err(pl, "RGB unpack shader rejected");
+        return -1;
+    }
+    if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
+            .shader = &sh,
+            .dispatch_size = {(r->w + RGB_LOCAL_X - 1) / RGB_LOCAL_X,
+                              (r->h + RGB_LOCAL_Y - 1) / RGB_LOCAL_Y, 1})))
+        return -1;
+    r->depth = format == CF_PL_R210 ? 10 : 8;
+    r->filled = true;
+    return 0;
+}
+
+int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *r, uint16_t *out) {
+    // Until then the texture holds whatever the allocation did.
+    if (!r->filled) {
+        log_err(pl, "RGB read before any frame was unpacked into it");
+        return -1;
+    }
+    if (!pl_tex_download(pl->vk->gpu, pl_tex_transfer_params(
+            .tex = r->rgb, .ptr = out, .row_pitch = (size_t)r->w * 8)))
+        return -1;
+    pl_gpu_finish(pl->vk->gpu);
+    return 0;
+}
+
+int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
+                     cf_pl_tex *dst, int dst_prim, int dst_trc) {
+    if (!src->filled) {
+        log_err(pl, "RGB read before any frame was unpacked into it");
+        return -1;
+    }
+    struct pl_frame image = {
+        .num_planes = 1,
+        .planes = {{ .texture = src->rgb, .components = 3, .component_mapping = {0, 1, 2} }},
+        .repr = {
+            .sys = PL_COLOR_SYSTEM_RGB,
+            .levels = levels == CF_PL_LEVELS_LIMITED ? PL_COLOR_LEVELS_LIMITED
+                                                     : PL_COLOR_LEVELS_FULL,
+            .bits = { .sample_depth = 16, .color_depth = src->depth,
+                      .bit_shift = 16 - src->depth },
+        },
+        .color = { .primaries = primaries(prim), .transfer = transfer(trc) },
+    };
+    pl_tex d = unwrap_tex(dst);
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes = {{ .texture = d, .components = 3, .component_mapping = {0, 1, 2} }},
+        .repr = pl_color_repr_rgb,
+        .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
+    };
+
+    struct pl_render_params params = pl_render_default_params;
+    params.dither_params = NULL;
+    // As in cf_pl_render_ycbcr: no tone mapping between identical spaces.
+    params.peak_detect_params = NULL;
+    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
 }
