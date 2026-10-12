@@ -39,6 +39,9 @@ enum Command {
         #[arg(long, default_value_t = 1.0, requires = "dump")]
         dump_every: f64,
     },
+    /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
+    /// an identity render read back and compared. Touches no display.
+    Gpu,
     /// Show a test pattern on the display and measure flip pacing. Needs the
     /// display to itself: nothing else may be driving it.
     Pattern {
@@ -73,6 +76,7 @@ enum Command {
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Probe => probe(),
+        Command::Gpu => gpu(),
         Command::Capture {
             seconds,
             device,
@@ -339,5 +343,51 @@ fn pattern(
     }
     println!("ran {:.1} s", started.elapsed().as_secs_f64());
     print!("{}", pacing.summary(mode.period()));
+    Ok(())
+}
+
+fn gpu() -> Result<(), Box<dyn std::error::Error>> {
+    let pl = cinefit_render::Placebo::new()?;
+    let info = pl.info();
+    let (major, minor, patch) = info.vulkan_version;
+    println!("device: {}", info.device_name);
+    println!(
+        "Vulkan {major}.{minor}.{patch}, libplacebo API {}",
+        info.placebo_api
+    );
+    println!("max texture: {}", info.max_tex_2d_dim);
+    println!(
+        "dma-buf import: {}",
+        if info.dma_buf_import { "yes" } else { "no" }
+    );
+
+    // The test pattern at full panel size, rendered unchanged and read back.
+    let (w, h) = (4096usize, 2160usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let rgb = cinefit_kms::pattern::background(x, y, w, h);
+            let o = (y * w + x) * 4;
+            rgba[o..o + 4].copy_from_slice(&[(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255]);
+        }
+    }
+    let started = Instant::now();
+    let out = pl.render_rgba8(w as u32, h as u32, &rgba)?;
+    let took = started.elapsed();
+    let max_diff = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<4>().0)
+        .flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c])))
+        .max()
+        .unwrap_or(0);
+    println!(
+        "identity render {w}x{h}: largest difference {max_diff} (of 255), {:.1} ms with upload and readback",
+        took.as_secs_f64() * 1000.0
+    );
+    if max_diff > 1 {
+        return Err("identity render changed the image".into());
+    }
     Ok(())
 }

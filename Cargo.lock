@@ -116,6 +116,7 @@ dependencies = [
  "cinefit-decklink",
  "cinefit-dovi",
  "cinefit-kms",
+ "cinefit-render",
  "clap",
  "ctrlc",
 ]
@@ -139,6 +140,14 @@ name = "cinefit-kms"
 version = "0.1.0"
 dependencies = [
  "drm",
+]
+
+[[package]]
+name = "cinefit-render"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "pkg-config",
 ]
 
 [[package]]
@@ -349,6 +358,12 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "proc-macro2"
