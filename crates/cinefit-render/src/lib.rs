@@ -9,9 +9,12 @@ mod ffi;
 #[cfg(target_os = "linux")]
 pub mod power;
 pub mod rgb;
+pub mod tunnel;
 pub mod v210;
 
-pub use color::{Levels, Matrix, Primaries, RgbColor, RgbSourceColor, Transfer, YcbcrColor};
+pub use color::{
+    DoviColor, Levels, Matrix, Primaries, RgbColor, RgbSourceColor, Transfer, YcbcrColor,
+};
 
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
@@ -280,8 +283,8 @@ impl Placebo {
 }
 
 /// Captured 4:2:2 YCbCr on the GPU, as planes libplacebo renders from: see
-/// [`v210::Planes`] for the layout. Each sample is stored as its 10-bit code
-/// shifted left by 6. Destroyed on drop; the borrow keeps it from outliving
+/// [`v210::Planes`] for the layout. Each sample is stored as its code shifted
+/// to the top of 16 bits: v210's 10 bits by 6, a tunnel's 12 by 4. Destroyed on drop; the borrow keeps it from outliving
 /// its device.
 #[cfg(target_os = "linux")]
 pub struct GpuPlanes<'p> {
@@ -309,7 +312,8 @@ impl GpuPlanes<'_> {
         self.height
     }
 
-    /// Reads the planes back as stored (`code << 6`), for checks.
+    /// Reads the planes back as stored (`code << 6` for v210, `code << 4`
+    /// for a tunnel), for checks.
     ///
     /// # Errors
     ///
@@ -500,6 +504,77 @@ impl Placebo {
                 planes.raw.as_ptr(),
                 data.as_ptr(),
                 row_bytes,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// Uploads a tunneled Dolby Vision frame, captured as `r210`, and unpacks
+    /// the 12-bit 4:2:2 inside it into `planes` on the GPU: see [`tunnel`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] for an odd width, a stride that is not whole words
+    /// covering it, or short `data`; [`Error::Render`] if libplacebo fails.
+    pub fn unpack_tunnel(
+        &self,
+        planes: &mut GpuPlanes<'_>,
+        data: &[u8],
+        row_bytes: usize,
+    ) -> Result<(), Error> {
+        if !planes.width.is_multiple_of(2)
+            || !row_bytes.is_multiple_of(4)
+            || row_bytes < planes.width * 4
+            || data.len() < row_bytes.saturating_mul(planes.height)
+        {
+            return Err(Error::BadInput);
+        }
+        // SAFETY: `data` holds row_bytes * height bytes, which the shim
+        // uploads; the planes belong to this live device, and `&mut` keeps
+        // anything else from using them meanwhile.
+        let rc = unsafe {
+            ffi::cf_pl_unpack_tunnel(
+                self.handle.as_ptr(),
+                planes.raw.as_ptr(),
+                data.as_ptr(),
+                row_bytes,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// Renders planes holding a tunnel through libplacebo's Dolby Vision
+    /// conversion with `color`, the frame's own, to BT.2020 PQ and into an
+    /// RGB target with `dst_color`, and waits for the GPU. Reshaping is the
+    /// identity: the player has composed the picture.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if the planes hold no tunnel or libplacebo fails
+    /// (see its log).
+    pub fn render_dovi(
+        &self,
+        src: &GpuPlanes<'_>,
+        color: &DoviColor,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+    ) -> Result<(), Error> {
+        let flat = |m: &[[f64; 3]; 3]| std::array::from_fn(|i| m[i / 3][i % 3] as f32);
+        let raw = ffi::Dovi {
+            ycc_to_lms: flat(&color.ycc_to_lms),
+            offset: color.offset.map(|o| o as f32),
+            linear: flat(&color.linear),
+        };
+        // SAFETY: `raw` is a struct whose layout the shim shares, read during
+        // the call; the planes and the texture belong to this live device.
+        let rc = unsafe {
+            ffi::cf_pl_render_dovi(
+                self.handle.as_ptr(),
+                src.raw.as_ptr(),
+                &raw,
+                dst.tex.as_ptr(),
+                primaries_raw(dst_color.primaries),
+                transfer_raw(dst_color.transfer),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }

@@ -75,7 +75,8 @@ pub struct DmMetadata {
     /// The colourist's trims, one per target display.
     pub level2: Vec<Level2>,
     pub level4: Option<Level4>,
-    /// The active area. Defined for HDMI, not seen sent by a UB820.
+    /// The active area. Defined for HDMI; a UB820 has not sent it, but only
+    /// content without bars has been captured, where there is none to send.
     pub level5: Option<Level5>,
     /// Blocks of any other level, kept as raw `(level, payload)`.
     pub other: Vec<(u8, Vec<u8>)>,
@@ -242,7 +243,8 @@ pub(crate) mod tests {
         for c in [8192i16, 799, 1681, 8192, -933, 1091, 8192, 267, -5545] {
             s.extend(c.to_be_bytes());
         }
-        for off in [0x0800_0000u32, 0x0800_0000, 0x0800_0000] {
+        // As a UB820 sends them: luma 0, chroma centred (over 2^28).
+        for off in [0u32, 0x0800_0000, 0x0800_0000] {
             s.extend(off.to_be_bytes());
         }
         for c in [17081i16, -349, -349, -349, 17081, -349, -349, -349, 17081] {

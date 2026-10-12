@@ -50,7 +50,8 @@ On the machine with the hardware:
 
 `CINEFIT_DOVI_DUMPS=DIR cargo test -p cinefit-dovi --test dumps` decodes saved
 frames. On the GPU against the CPU, `CINEFIT_RENDER_DUMPS=DIR cargo test -p
-cinefit-render --test dumps` unpacks a dump directory in any capture format,
+cinefit-render --test dumps` unpacks a dump directory in any capture format
+(and renders Dolby Vision tunnel frames with their own metadata),
 and `CINEFIT_V210_STILLS=DIR cargo test -p cinefit-render --test v210_stills`
 a directory of compressed `v210` stills. Each is skipped when its variable is
 unset.
