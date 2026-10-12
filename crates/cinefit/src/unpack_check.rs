@@ -11,10 +11,57 @@ use cinefit_render::{
 };
 
 pub fn run(pl: &Placebo) -> Result<(), Box<dyn Error>> {
+    unfilled(pl)?;
     unpack(pl)?;
     render(pl)?;
     unpack_rgb(pl)?;
     render_rgb(pl)
+}
+
+/// Textures that no unpack has written hold whatever the allocation left, so
+/// reading or rendering them must fail rather than succeed with garbage. The
+/// shim logs each refusal.
+fn unfilled(pl: &Placebo) -> Result<(), Box<dyn Error>> {
+    let planes = pl.planes(8, 2)?;
+    let rgb = pl.rgb(8, 2)?;
+    let target = pl.target_rgba16(8, 2)?;
+    let (pq, bt2020) = (Transfer::Pq, Primaries::Bt2020);
+    let out = RgbColor {
+        primaries: bt2020,
+        transfer: pq,
+    };
+    let refused = [
+        planes.download().is_err(),
+        rgb.download().is_err(),
+        pl.render_ycbcr(
+            &planes,
+            YcbcrColor {
+                matrix: Matrix::Bt2020Nc,
+                primaries: bt2020,
+                transfer: pq,
+            },
+            target.texture(),
+            out,
+        )
+        .is_err(),
+        pl.render_rgb(
+            &rgb,
+            RgbSourceColor {
+                levels: Levels::Limited,
+                primaries: bt2020,
+                transfer: pq,
+            },
+            target.texture(),
+            out,
+        )
+        .is_err(),
+    ];
+    let n = refused.iter().filter(|&&r| r).count();
+    println!("before any unpack: {n} of 4 reads and renders refused (the four log lines above)");
+    if n != 4 {
+        return Err("a texture no unpack wrote was read or rendered".into());
+    }
+    Ok(())
 }
 
 /// xorshift64: reproducible noise, no dependency.

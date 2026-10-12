@@ -76,7 +76,8 @@ void cf_pl_planes_destroy(cf_pl *pl, cf_pl_planes *planes);
 int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size_t row_bytes);
 
 /* Reads the planes back as stored, rows packed: w * h luma samples and
- * ceil(w/2) * h Cb, Cr pairs. For checks. Returns 0, or -1, logged. */
+ * ceil(w/2) * h Cb, Cr pairs. For checks. Returns 0, or -1, logged; -1 also
+ * before the first successful unpack, as cf_pl_render_ycbcr does. */
 int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint16_t *chroma);
 
 /* Colour descriptions, as plain ints so nothing but this header is shared. */
@@ -115,7 +116,8 @@ void cf_pl_rgb_destroy(cf_pl *pl, cf_pl_rgb *rgb);
 int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *rgb, const uint8_t *data, size_t row_bytes, int format);
 
 /* Reads the texture back as stored: w * h * 4 values (R, G, B, and an opaque
- * alpha), rows packed. For checks. Returns 0, or -1, logged. */
+ * alpha), rows packed. For checks. Returns 0, or -1, logged; -1 also before
+ * the first successful unpack, as cf_pl_render_rgb does. */
 int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *rgb, uint16_t *out);
 
 #define CF_PL_LEVELS_FULL 0

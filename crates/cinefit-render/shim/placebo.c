@@ -230,6 +230,7 @@ struct cf_pl_planes {
     pl_tex luma, chroma;
     pl_tex packed;      /* the frame as uploaded; sized on first use */
     int w, h;
+    bool filled;        /* an unpack has written the planes */
 };
 
 static pl_fmt storable_fmt(struct cf_pl *pl, const char *name) {
@@ -379,11 +380,17 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
             .shader = &sh,
             .dispatch_size = {(groups + V210_LOCAL - 1) / V210_LOCAL, p->h, 1})))
         return -1;
+    p->filled = true;
     return 0;
 }
 
 int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *p, uint16_t *luma, uint16_t *chroma) {
     pl_gpu gpu = pl->vk->gpu;
+    // Until then the textures hold whatever the allocation did.
+    if (!p->filled) {
+        log_err(pl, "planes read before any frame was unpacked into them");
+        return -1;
+    }
     if (!pl_tex_download(gpu, pl_tex_transfer_params(
             .tex = p->luma, .ptr = luma, .row_pitch = (size_t)p->w * 2)))
         return -1;
@@ -408,6 +415,10 @@ static enum pl_color_transfer transfer(int t) {
 
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
                        cf_pl_tex *dst, int dst_prim, int dst_trc) {
+    if (!src->filled) {
+        log_err(pl, "planes read before any frame was unpacked into them");
+        return -1;
+    }
     struct pl_frame image = {
         .num_planes = 2,
         .planes = {
@@ -471,6 +482,7 @@ struct cf_pl_rgb {
     pl_tex packed;      /* the frame as uploaded; sized on first use */
     int w, h;
     int depth;          /* of the last unpack: 10 or 8 */
+    bool filled;        /* an unpack has written the texture */
 };
 
 cf_pl_rgb *cf_pl_rgb_create(cf_pl *pl, int w, int h) {
@@ -580,10 +592,16 @@ int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *r, const uint8_t *data, size_t row_by
                               (r->h + RGB_LOCAL_Y - 1) / RGB_LOCAL_Y, 1})))
         return -1;
     r->depth = format == CF_PL_R210 ? 10 : 8;
+    r->filled = true;
     return 0;
 }
 
 int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *r, uint16_t *out) {
+    // Until then the texture holds whatever the allocation did.
+    if (!r->filled) {
+        log_err(pl, "RGB read before any frame was unpacked into it");
+        return -1;
+    }
     if (!pl_tex_download(pl->vk->gpu, pl_tex_transfer_params(
             .tex = r->rgb, .ptr = out, .row_pitch = (size_t)r->w * 8)))
         return -1;
@@ -593,6 +611,10 @@ int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *r, uint16_t *out) {
 
 int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
                      cf_pl_tex *dst, int dst_prim, int dst_trc) {
+    if (!src->filled) {
+        log_err(pl, "RGB read before any frame was unpacked into it");
+        return -1;
+    }
     struct pl_frame image = {
         .num_planes = 1,
         .planes = {{ .texture = src->rgb, .components = 3, .component_mapping = {0, 1, 2} }},
