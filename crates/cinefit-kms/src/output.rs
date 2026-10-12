@@ -133,17 +133,26 @@ impl Output {
                 v
             }
         };
+        // A device named explicitly must work. While searching, one that
+        // fails (a basic framebuffer device without the atomic API, say) is
+        // skipped, and its error only reported if nothing else works.
+        let explicit = path.is_some();
+        let mut last_error = None;
         for p in candidates {
-            let file = OpenOptions::new()
+            let opened = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&p)
-                .map_err(io("opening the DRM device"))?;
-            if let Some(out) = Self::from_card(Card(file), p)? {
-                return Ok(out);
+                .map_err(io("opening the DRM device"))
+                .and_then(|file| Self::from_card(Card(file), p));
+            match opened {
+                Ok(Some(out)) => return Ok(out),
+                Ok(None) => {}
+                Err(e) if explicit => return Err(e),
+                Err(e) => last_error = Some(e),
             }
         }
-        Err(Error::NoDisplay)
+        Err(last_error.unwrap_or(Error::NoDisplay))
     }
 
     fn from_card(card: Card, path: PathBuf) -> Result<Option<Self>, Error> {
@@ -172,13 +181,24 @@ impl Output {
             .and_then(|e| e.crtc());
         let crtc = match current {
             Some(c) => c,
-            None => conn
-                .encoders()
-                .iter()
-                .filter_map(|&e| card.get_encoder(e).ok())
-                .flat_map(|e| res.filter_crtcs(e.possible_crtcs()))
-                .next()
-                .ok_or(Error::NoCrtc)?,
+            None => {
+                // Never take a CRTC that is driving another display.
+                let busy: Vec<crtc::Handle> = res
+                    .connectors()
+                    .iter()
+                    .filter(|&&c| c != conn.handle())
+                    .filter_map(|&c| card.get_connector(c, false).ok())
+                    .filter_map(|c| c.current_encoder())
+                    .filter_map(|e| card.get_encoder(e).ok())
+                    .filter_map(|e| e.crtc())
+                    .collect();
+                conn.encoders()
+                    .iter()
+                    .filter_map(|&e| card.get_encoder(e).ok())
+                    .flat_map(|e| res.filter_crtcs(e.possible_crtcs()))
+                    .find(|c| !busy.contains(c))
+                    .ok_or(Error::NoCrtc)?
+            }
         };
 
         let plane = card
@@ -397,7 +417,8 @@ impl Output {
     ///
     /// # Errors
     ///
-    /// If neither the old state nor "off" can be committed.
+    /// If neither the old state nor "off" can be committed. The output then
+    /// still counts as changed, so a later call (or the drop) tries again.
     pub fn restore(&mut self) -> Result<(), Error> {
         if !self.modeset {
             return Ok(());
@@ -418,11 +439,12 @@ impl Output {
             ];
             commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, request(&off))
         });
+        result?;
         self.modeset = false;
         if let Some(blob) = self.mode_blob.take() {
             let _ = self.card.destroy_property_blob(blob);
         }
-        result
+        Ok(())
     }
 
     fn current_values(
@@ -452,6 +474,9 @@ impl Output {
 impl Drop for Output {
     fn drop(&mut self) {
         let _ = self.restore();
+        // Destroyed even if restoring failed: removing a framebuffer that is
+        // on screen makes the kernel turn the output off, and closing the
+        // device below releases everything anyway. Keeping them gains nothing.
         for f in std::mem::take(&mut self.frames) {
             let _ = self.card.destroy_framebuffer(f.fb);
             let _ = self.card.destroy_dumb_buffer(f.buffer);
