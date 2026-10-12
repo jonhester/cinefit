@@ -332,6 +332,20 @@ extern "C" cf_dl_input *cf_dl_input_open(cf_dl_device *dev) noexcept {
     IDeckLinkInput *input = nullptr;
     if (device->QueryInterface(IID_IDeckLinkInput, (void **)&input) != S_OK || !input)
         return nullptr;
+    // Select the HDMI input for this session, as the C++ version does, and
+    // only if something else is selected: every change of the input is a
+    // hotplug on the HDMI port, and the Denon upstream does not reliably
+    // recover from one (it keeps sending the signal and its metadata with a
+    // black picture until its input is cycled). Not written to the card's
+    // preferences: whether to persist it is a separate decision.
+    IDeckLinkConfiguration *cfg = nullptr;
+    if (device->QueryInterface(IID_IDeckLinkConfiguration, (void **)&cfg) == S_OK && cfg) {
+        int64_t connection = 0;
+        if (cfg->GetInt(bmdDeckLinkConfigVideoInputConnection, &connection) == S_OK &&
+            connection != bmdVideoConnectionHDMI)
+            cfg->SetInt(bmdDeckLinkConfigVideoInputConnection, bmdVideoConnectionHDMI);
+        cfg->Release();
+    }
     IDeckLinkStatus *status = nullptr;
     if (device->QueryInterface(IID_IDeckLinkStatus, (void **)&status) != S_OK) status = nullptr;
     return new cf_dl_input{input, status, new Callback(input), false};
