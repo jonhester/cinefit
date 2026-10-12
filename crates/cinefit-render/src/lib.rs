@@ -5,6 +5,8 @@
 //! reports that.
 
 mod ffi;
+#[cfg(target_os = "linux")]
+pub mod power;
 
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]

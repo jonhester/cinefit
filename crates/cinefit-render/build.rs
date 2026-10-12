@@ -13,6 +13,9 @@ fn main() {
         .expect("libplacebo >= 7.360 (on Ubuntu 26.04: apt install libplacebo-dev)");
     let vulkan = pkg_config::probe_library("vulkan")
         .expect("Vulkan headers (on Ubuntu: apt install libvulkan-dev)");
+    // For holding the GPU's clocks (src/power.rs).
+    pkg_config::probe_library("libdrm_amdgpu")
+        .expect("libdrm_amdgpu (on Ubuntu: apt install libdrm-dev)");
 
     cc::Build::new()
         .file("shim/placebo.c")

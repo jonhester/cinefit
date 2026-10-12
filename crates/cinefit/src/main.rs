@@ -74,6 +74,10 @@ enum Command {
         /// scrolling, instead of drawing with the CPU.
         #[arg(long)]
         gpu: bool,
+        /// With --gpu: leave the GPU's clocks to the driver's default policy
+        /// instead of holding the standard stable power state. For A/B timing.
+        #[arg(long, requires = "gpu")]
+        no_pstate: bool,
     },
 }
 
@@ -97,6 +101,7 @@ fn main() -> ExitCode {
             max_mastering,
             change_max_cll,
             gpu,
+            no_pstate,
         } => {
             let hdr = hdr.then_some(cinefit_kms::HdrStatic {
                 max_cll,
@@ -104,7 +109,7 @@ fn main() -> ExitCode {
                 max_mastering,
                 ..cinefit_kms::HdrStatic::BT2020_1000
             });
-            pattern(seconds, mode, card, hdr, change_max_cll, gpu)
+            pattern(seconds, mode, card, hdr, change_max_cll, gpu, !no_pstate)
         }
     };
     match result {
@@ -234,6 +239,7 @@ fn pattern(
     _hdr: Option<cinefit_kms::HdrStatic>,
     _change_max_cll: Option<f64>,
     _gpu: bool,
+    _pstate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("display output is only supported on Linux".into())
 }
@@ -246,6 +252,7 @@ fn pattern(
     hdr: Option<cinefit_kms::HdrStatic>,
     change_max_cll: Option<f64>,
     gpu: bool,
+    pstate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cinefit_kms::pattern;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -272,6 +279,27 @@ fn pattern(
     let mode = modes[index];
     println!("mode: {mode}");
     let (w, h) = (usize::from(mode.width), usize::from(mode.height));
+
+    // Held for the whole run: the default clock policy never ramps up for a
+    // few milliseconds of work every frame. Released, by the kernel if need
+    // be, when this ends.
+    let _clocks = if gpu && pstate {
+        match cinefit_render::power::StablePstate::acquire() {
+            Ok(p) => {
+                println!("gpu clocks: {} (stable pstate, held until exit)", p.level());
+                Some(p)
+            }
+            Err(e) => {
+                println!("gpu clocks: not held: {e}");
+                None
+            }
+        }
+    } else {
+        if gpu {
+            println!("gpu clocks: default policy (--no-pstate)");
+        }
+        None
+    };
 
     // Two buffers: one on screen while the other is drawn or rendered.
     let placebo = if gpu {
@@ -408,6 +436,19 @@ fn pattern(
 }
 
 fn gpu() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    let clocks = {
+        let p = cinefit_render::power::StablePstate::acquire();
+        match &p {
+            Ok(p) => println!(
+                "gpu clocks: {} on {} (stable pstate held)",
+                p.level(),
+                p.node()
+            ),
+            Err(e) => println!("gpu clocks: not held: {e}"),
+        }
+        p.ok()
+    };
     let pl = cinefit_render::Placebo::new()?;
     let info = pl.info();
     let (major, minor, patch) = info.vulkan_version;
@@ -443,7 +484,20 @@ fn gpu() -> Result<(), Box<dyn std::error::Error>> {
     if max_diff > 1 {
         return Err("identity render changed the image".into());
     }
-    scanout_check(&pl, w, h, &rgba)
+    scanout_check(&pl, w, h, &rgba)?;
+
+    // The hold must end with the program: check the level goes back.
+    #[cfg(target_os = "linux")]
+    if let Some(p) = clocks {
+        let node = p.node().to_owned();
+        drop(p);
+        let level = std::fs::read_to_string(format!(
+            "/sys/class/drm/{node}/device/power_dpm_force_performance_level"
+        ))
+        .unwrap_or_default();
+        println!("gpu clocks after release: {}", level.trim());
+    }
+    Ok(())
 }
 
 /// Renders the pattern into a real GBM scanout buffer through a dma-buf
