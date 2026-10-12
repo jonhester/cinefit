@@ -1,6 +1,6 @@
 //! `cinefit capture`: run the input for a while and report what arrived.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -45,8 +45,105 @@ pub struct Stats {
     /// many had any of the low two bits set in the rows checked.
     pub r210_checked: u64,
     pub r210_low_bits_set: u64,
+    /// Tunneled Dolby Vision, looked for in every RGB frame.
+    pub tunnel: TunnelStats,
     last_stream_time: Option<i64>,
     last_middle_row: Vec<u8>,
+}
+
+/// What the tunnel decoder found in the RGB frames of a run.
+#[derive(Debug, Default)]
+pub struct TunnelStats {
+    /// RGB frames looked at.
+    pub checked: u64,
+    pub decoded: u64,
+    /// Frames whose first packet failed its CRC in all three copies: no tunnel.
+    pub not_tunnel: u64,
+    /// Frames whose packets passed their CRCs but did not decode, by reason.
+    pub errors: BTreeMap<String, u64>,
+    /// Decoded frames that needed a second or third copy of some packet.
+    pub fallback: u64,
+    /// Decoded frames saying "no metadata in this picture".
+    pub no_metadata: u64,
+    /// Times L1 changed between decoded frames: roughly, shot changes.
+    pub l1_changes: u64,
+    /// Every L2 target seen, as 12-bit PQ.
+    pub l2_targets: BTreeSet<u16>,
+    /// Decoded frames carrying L5, the active area.
+    pub l5: u64,
+    last_l1: Option<cinefit_dovi::Level1>,
+}
+
+impl TunnelStats {
+    pub fn on_frame(&mut self, result: &Result<cinefit_dovi::Tunnel, cinefit_dovi::Error>) {
+        self.checked += 1;
+        let tunnel = match result {
+            Ok(t) => t,
+            Err(cinefit_dovi::Error::NoPacket { packet: 0 }) => {
+                self.not_tunnel += 1;
+                return;
+            }
+            Err(e) => {
+                *self.errors.entry(e.to_string()).or_default() += 1;
+                return;
+            }
+        };
+        self.decoded += 1;
+        if tunnel.copies_used.iter().any(|&c| c != 0) {
+            self.fallback += 1;
+        }
+        let Some(m) = &tunnel.metadata else {
+            self.no_metadata += 1;
+            return;
+        };
+        if m.level1 != self.last_l1 && self.last_l1.is_some() {
+            self.l1_changes += 1;
+        }
+        self.last_l1 = m.level1;
+        self.l2_targets
+            .extend(m.level2.iter().map(|b| b.target_max_pq));
+        if m.level5.is_some() {
+            self.l5 += 1;
+        }
+    }
+
+    fn summary(&self, s: &mut String) {
+        if self.checked == 0 {
+            return;
+        }
+        let _ = writeln!(
+            s,
+            "Dolby Vision tunnel: decoded in {} of {} RGB frames",
+            self.decoded, self.checked
+        );
+        if self.decoded == 0 {
+            return;
+        }
+        let nits: Vec<_> = self
+            .l2_targets
+            .iter()
+            .map(|&pq| format!("{:.0}", cinefit_dovi::pq_to_nits(pq)))
+            .collect();
+        let _ = writeln!(
+            s,
+            "  L1 changes: {}, L2 targets: {} nits, L5 in {} frames",
+            self.l1_changes,
+            if nits.is_empty() {
+                "none".into()
+            } else {
+                nits.join(", ")
+            },
+            self.l5
+        );
+        let _ = writeln!(
+            s,
+            "  not a tunnel: {}, needed a fallback copy: {}, no metadata: {}",
+            self.not_tunnel, self.fallback, self.no_metadata
+        );
+        for (why, n) in &self.errors {
+            let _ = writeln!(s, "  failed: {why}: {n}");
+        }
+    }
 }
 
 impl Stats {
@@ -202,6 +299,7 @@ impl Stats {
                 self.r210_low_bits_set, self.r210_checked
             );
         }
+        self.tunnel.summary(&mut s);
         let _ = writeln!(s, "failed restarts: {failed_restarts}");
         s
     }
@@ -314,16 +412,35 @@ impl Handler for Recorder {
         if !info.has_input {
             return;
         }
-        let rows = frame.pixels().and_then(|p| {
-            if let Some(dump) = &self.dump {
-                dump.offer(at, &info, p.bytes());
-            }
-            let first = p.row(0)?.to_vec();
-            let middle = p.row(info.height as usize / 2)?.to_vec();
-            Some((first, middle))
-        });
+        let rows =
+            frame.pixels().and_then(|p| {
+                if let Some(dump) = &self.dump {
+                    dump.offer(at, &info, p.bytes());
+                }
+                // Only RGB can carry the tunnel. Decoding reads at most a few
+                // thousand pixels, cheap enough for the SDK's thread.
+                let (w, stride) = (info.width as usize, info.row_bytes);
+                let tunnel =
+                    match info.pixel_format {
+                        PixelFormat::Rgb10 => Some(cinefit_dovi::decode(
+                            cinefit_dovi::r210_parity(p.bytes(), w, stride),
+                        )),
+                        PixelFormat::Argb8 => Some(cinefit_dovi::decode(
+                            cinefit_dovi::argb8_parity(p.bytes(), w, stride),
+                        )),
+                        _ => None,
+                    };
+                let first = p.row(0)?.to_vec();
+                let middle = p.row(info.height as usize / 2)?.to_vec();
+                Some((first, middle, tunnel))
+            });
         match rows {
-            Some((first, middle)) => stats.on_pixels(&info, &first, &middle),
+            Some((first, middle, tunnel)) => {
+                stats.on_pixels(&info, &first, &middle);
+                if let Some(t) = &tunnel {
+                    stats.tunnel.on_frame(t);
+                }
+            }
             None => stats.pixel_read_failures += 1,
         }
         // `frame` drops here, handing its buffer straight back to the card.
@@ -527,5 +644,68 @@ mod tests {
         s.on_pixels(&info, &[], &[9, 2, 3]);
         s.on_pixels(&info, &[], &[1, 2]); // new size: not compared
         assert_eq!((s.middle_row_changed, s.middle_row_compared), (1, 2));
+    }
+
+    fn tunnel(l1_max: u16, targets: &[u16]) -> cinefit_dovi::Tunnel {
+        use cinefit_dovi::{DmMetadata, Header, Level1, Level2, packet::PacketType};
+        cinefit_dovi::Tunnel {
+            header: Header {
+                packet_type: PacketType::First,
+                metadata_type: 0,
+                affected_metadata_id: 0,
+                metadata_version: 0,
+                current_metadata_id: 0,
+                no_metadata: false,
+                end_of_stream: false,
+            },
+            copies_used: vec![0, 0],
+            metadata: Some(DmMetadata {
+                scene_refresh: false,
+                ycc_to_rgb: [0; 9],
+                ycc_to_rgb_offset: [0; 3],
+                rgb_to_lms: [0; 9],
+                signal_bit_depth: 12,
+                signal_color_space: 2,
+                source_min_pq: 62,
+                source_max_pq: 3696,
+                level1: Some(Level1 {
+                    min_pq: 62,
+                    max_pq: l1_max,
+                    avg_pq: 819,
+                }),
+                level2: targets
+                    .iter()
+                    .map(|&t| Level2 {
+                        target_max_pq: t,
+                        trim_slope: 2048,
+                        trim_offset: 2048,
+                        trim_power: 2048,
+                        trim_chroma_weight: 2048,
+                        trim_saturation_gain: 2048,
+                        ms_weight: 2048,
+                    })
+                    .collect(),
+                level4: None,
+                level5: None,
+                other: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn tunnel_stats_count_shots_targets_and_misses() {
+        let mut t = TunnelStats::default();
+        t.on_frame(&Ok(tunnel(3686, &[2081, 2851])));
+        t.on_frame(&Ok(tunnel(3686, &[2081, 2851])));
+        t.on_frame(&Ok(tunnel(3465, &[2081, 2851, 3388])));
+        t.on_frame(&Err(cinefit_dovi::Error::NoPacket { packet: 0 }));
+        t.on_frame(&Err(cinefit_dovi::Error::NoPacket { packet: 1 }));
+        assert_eq!((t.checked, t.decoded, t.not_tunnel), (5, 3, 1));
+        assert_eq!(t.l1_changes, 1);
+        assert_eq!(
+            t.l2_targets.iter().copied().collect::<Vec<_>>(),
+            [2081, 2851, 3388]
+        );
+        assert_eq!(t.errors.values().sum::<u64>(), 1);
     }
 }

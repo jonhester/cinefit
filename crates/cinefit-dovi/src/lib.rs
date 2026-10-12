@@ -38,6 +38,17 @@ pub fn decode(parity: impl Fn(usize) -> Option<bool>) -> Result<Tunnel, Error> {
     packet::decode(&parity)
 }
 
+/// A 12-bit PQ code (0-4095), as the metadata uses, in cd/m² (SMPTE ST 2084).
+pub fn pq_to_nits(code: u16) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = 2523.0 / 4096.0 * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = 2413.0 / 4096.0 * 32.0;
+    const C3: f64 = 2392.0 / 4096.0 * 32.0;
+    let e = (f64::from(code) / 4095.0).powf(1.0 / M2);
+    10000.0 * ((e - C1).max(0.0) / (C2 - C3 * e)).powf(1.0 / M1)
+}
+
 /// Bit `i` of a frame captured as `r210`, where each pixel is a big-endian
 /// word of 2 unused bits and 10-bit red, green and blue. The tunnel's 8-bit
 /// values arrive padded to 10 bits, so the top 8 bits of each are the data.
@@ -97,5 +108,14 @@ mod tests {
         let px = [0xFF, 0b1, 0b10, 0b100, 0x00, 0b1, 0b1, 0b0];
         let bit = argb8_parity(&px, 2, 8);
         assert_eq!((bit(0), bit(1)), (Some(true), Some(false)));
+    }
+
+    #[test]
+    fn pq_codes_convert_to_nits() {
+        let near = |code, nits: f64| (pq_to_nits(code) - nits).abs() < nits * 0.002 + 0.001;
+        assert!(near(0, 0.0));
+        assert!(near(2081, 100.1)); // the 100-nit L2 target a UB820 sends
+        assert!(near(3079, 1000.6));
+        assert!(near(4095, 10000.0));
     }
 }

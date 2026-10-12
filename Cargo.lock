@@ -67,6 +67,7 @@ name = "cinefit"
 version = "0.1.0"
 dependencies = [
  "cinefit-decklink",
+ "cinefit-dovi",
  "clap",
 ]
 
