@@ -16,3 +16,7 @@ pkg-config = "0.3"
 
 [lints]
 workspace = true
+
+# The dumps test decodes each tunnel frame's own metadata.
+[dev-dependencies]
+cinefit-dovi = { path = "../cinefit-dovi" }

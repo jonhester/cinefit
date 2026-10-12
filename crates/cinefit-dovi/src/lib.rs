@@ -17,9 +17,11 @@
 //! reliable test, which is why [`decode`] returning [`Error::NoPacket`] for
 //! packet 0 doubles as "not a tunnel".
 
+pub mod conversion;
 pub mod metadata;
 pub mod packet;
 
+pub use conversion::Conversion;
 pub use metadata::{DmMetadata, Level1, Level2, Level4, Level5};
 pub use packet::{Error, Header, Tunnel};
 

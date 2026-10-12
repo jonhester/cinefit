@@ -148,6 +148,7 @@ name = "cinefit-render"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "cinefit-dovi",
  "pkg-config",
 ]
 

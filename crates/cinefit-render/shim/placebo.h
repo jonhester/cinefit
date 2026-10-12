@@ -61,8 +61,8 @@ int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst, float shift_x);
 
 /* Captured YCbCr 4:2:2 on the GPU: a luma plane (r16, w x h) and a chroma
  * plane (rg16, Cb and Cr interleaved, ceil(w/2) x h), each sample stored as
- * its 10-bit code shifted left by 6, plus the texture the packed frame is
- * uploaded into. Destroy with cf_pl_planes_destroy before cf_pl_destroy. */
+ * its code shifted to the top of 16 bits (v210's 10 bits by 6, a tunnel's
+ * 12 by 4), plus the texture the packed frame is uploaded into. Destroy with cf_pl_planes_destroy before cf_pl_destroy. */
 typedef struct cf_pl_planes cf_pl_planes;
 
 /* Null on failure, logged. */
@@ -95,6 +95,26 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
  * the GPU. Returns 0, or -1 with the reason logged. */
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int primaries, int trc,
                        cf_pl_tex *dst, int dst_primaries, int dst_trc);
+
+/* Uploads a tunneled Dolby Vision frame, captured as r210, into planes of
+ * its size and unpacks the 12-bit ICtCp 4:2:2 inside it on the GPU: codes
+ * stored shifted left by 4. The width must be even. Returns 0, or -1,
+ * logged. */
+int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size_t row_bytes);
+
+/* A tunnel frame's conversion, from its metadata. Matrices row-major, rows
+ * the outputs; the offset is subtracted from the normalised signal. */
+typedef struct {
+    float ycc_to_lms[9];
+    float offset[3];
+    float linear[9];
+} cf_pl_dovi;
+
+/* Renders planes holding a tunnel through libplacebo's Dolby Vision
+ * conversion (identity reshaping) to BT.2020 PQ, then into dst's primaries
+ * and transfer. No dithering; waits for the GPU. Returns 0, or -1, logged. */
+int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
+                      cf_pl_tex *dst, int dst_primaries, int dst_trc);
 
 /* Captured RGB on the GPU: one rgba16 texture, w x h, each component stored
  * as its code shifted to the top of 16 bits (10-bit << 6, 8-bit << 8), plus
