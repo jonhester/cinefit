@@ -4,6 +4,7 @@
 #include "shim.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <mutex>
@@ -20,7 +21,7 @@ static_assert(offsetof(cf_dl_format, detected_flags) == 28, "layout must match s
 static_assert(offsetof(cf_dl_format, enabled_mode) == 32, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_format, enabled_pixel_format) == 36, "layout must match src/ffi.rs");
 
-static_assert(sizeof(cf_dl_frame_info) == 40, "layout must match src/ffi.rs");
+static_assert(sizeof(cf_dl_frame_info) == 152, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, stream_time) == 0, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, stream_duration) == 8, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, row_bytes) == 16, "layout must match src/ffi.rs");
@@ -28,6 +29,20 @@ static_assert(offsetof(cf_dl_frame_info, width) == 24, "layout must match src/ff
 static_assert(offsetof(cf_dl_frame_info, height) == 28, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, pixel_format) == 32, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, flags) == 36, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, colorspace) == 40, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, eotf) == 48, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, red_x) == 56, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, red_y) == 64, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, green_x) == 72, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, green_y) == 80, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, blue_x) == 88, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, blue_y) == 96, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, white_x) == 104, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, white_y) == 112, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, max_mastering) == 120, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, min_mastering) == 128, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, max_cll) == 136, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, max_fall) == 144, "layout must match src/ffi.rs");
 
 namespace {
 
@@ -39,6 +54,51 @@ constexpr BMDDisplayMode kInitialMode = bmdModeHD720p50;
 constexpr BMDPixelFormat kInitialPixelFormat = bmdFormat10BitYUV;
 
 bool same_iid(REFIID a, REFIID b) { return memcmp(&a, &b, sizeof a) == 0; }
+
+// Reads the frame's metadata into info. Everything starts unreported, so a
+// value the card does not give reads as absent rather than as zero.
+void read_metadata(IDeckLinkVideoInputFrame *frame, cf_dl_frame_info &info) {
+    const double nan = std::nan("");
+    info.colorspace = CF_DL_UNKNOWN;
+    info.eotf = CF_DL_UNKNOWN;
+    double *hdr[] = {&info.red_x, &info.red_y, &info.green_x, &info.green_y,
+                     &info.blue_x, &info.blue_y, &info.white_x, &info.white_y,
+                     &info.max_mastering, &info.min_mastering, &info.max_cll,
+                     &info.max_fall};
+    for (double *v : hdr) *v = nan;
+
+    IDeckLinkVideoFrameMetadataExtensions *meta = nullptr;
+    if (frame->QueryInterface(IID_IDeckLinkVideoFrameMetadataExtensions, (void **)&meta) != S_OK || !meta)
+        return;
+
+    int64_t i = 0;
+    if (meta->GetInt(bmdDeckLinkFrameMetadataColorspace, &i) == S_OK) info.colorspace = i;
+    if (meta->GetInt(bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc, &i) == S_OK) info.eotf = i;
+
+    // The HDR values are only meaningful on a frame flagged as carrying them.
+    if (frame->GetFlags() & bmdFrameContainsHDRMetadata) {
+        const BMDDeckLinkFrameMetadataID ids[] = {
+            bmdDeckLinkFrameMetadataHDRDisplayPrimariesRedX,
+            bmdDeckLinkFrameMetadataHDRDisplayPrimariesRedY,
+            bmdDeckLinkFrameMetadataHDRDisplayPrimariesGreenX,
+            bmdDeckLinkFrameMetadataHDRDisplayPrimariesGreenY,
+            bmdDeckLinkFrameMetadataHDRDisplayPrimariesBlueX,
+            bmdDeckLinkFrameMetadataHDRDisplayPrimariesBlueY,
+            bmdDeckLinkFrameMetadataHDRWhitePointX,
+            bmdDeckLinkFrameMetadataHDRWhitePointY,
+            bmdDeckLinkFrameMetadataHDRMaxDisplayMasteringLuminance,
+            bmdDeckLinkFrameMetadataHDRMinDisplayMasteringLuminance,
+            bmdDeckLinkFrameMetadataHDRMaximumContentLightLevel,
+            bmdDeckLinkFrameMetadataHDRMaximumFrameAverageLightLevel,
+        };
+        static_assert(sizeof ids / sizeof ids[0] == sizeof hdr / sizeof hdr[0], "one ID per field");
+        for (size_t k = 0; k < sizeof ids / sizeof ids[0]; k++) {
+            double d = 0;
+            if (meta->GetFloat(ids[k], &d) == S_OK) *hdr[k] = d;
+        }
+    }
+    meta->Release();
+}
 
 // The SDK's callback object. COM-refcounted: the SDK holds a reference while it
 // is registered, and cf_dl_input holds one for its lifetime.
@@ -151,6 +211,7 @@ public:
         info.height = static_cast<int32_t>(frame->GetHeight());
         info.pixel_format = frame->GetPixelFormat();
         info.flags = frame->GetFlags();
+        read_metadata(frame, info);
 
         // The SDK only lends the frame for this call. The reference taken here
         // goes to Rust, which releases it when it drops the frame.

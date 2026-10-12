@@ -88,6 +88,19 @@ typedef struct {
     int32_t  height;
     uint32_t pixel_format;          /* BMDPixelFormat */
     uint32_t flags;                 /* BMDFrameFlags */
+    /* Per-frame metadata. Integers are CF_DL_UNKNOWN and floats NaN when the
+     * frame does not report them; the HDR values are read only when the frame
+     * is flagged bmdFrameContainsHDRMetadata, so none are stale. */
+    int64_t  colorspace;            /* BMDColorspace */
+    int64_t  eotf;                  /* 0-7, as in CTA-861.3 */
+    double   red_x, red_y;          /* mastering display primaries, 0-1 */
+    double   green_x, green_y;
+    double   blue_x, blue_y;
+    double   white_x, white_y;
+    double   max_mastering;         /* cd/m2 */
+    double   min_mastering;         /* cd/m2 */
+    double   max_cll;               /* cd/m2 */
+    double   max_fall;              /* cd/m2 */
 } cf_dl_frame_info;
 
 /* Both callbacks run on the SDK's thread and must return quickly: stalling

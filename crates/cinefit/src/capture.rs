@@ -5,7 +5,9 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use cinefit_decklink::{Frame, FrameInfo, Handler, InputFormat, PixelFormat};
+use cinefit_decklink::{
+    Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, PixelFormat,
+};
 
 /// What a capture run saw. Counting only: frames are dropped as soon as they
 /// are counted, so the card's buffers are never held.
@@ -23,6 +25,14 @@ pub struct Stats {
     pub missed: u64,
     /// Frames that carried no stream time, so could not be checked for gaps.
     pub untimed: u64,
+    /// Frames by transfer function and colorspace; `None` is unreported.
+    pub signal: BTreeMap<(Option<Eotf>, Option<Colorspace>), u64>,
+    /// HDR static metadata over the run, one entry per change: when it
+    /// started, the value (`None` for frames without any), and how many
+    /// consecutive frames carried it.
+    pub hdr: Vec<(Duration, Option<HdrMetadata>, u64)>,
+    /// Frames the card flagged as carrying Dolby Vision metadata.
+    pub dolby_vision_flagged: u64,
     last_stream_time: Option<i64>,
 }
 
@@ -33,13 +43,26 @@ impl Stats {
         self.last_stream_time = None;
     }
 
-    pub fn on_frame(&mut self, info: &FrameInfo) {
+    pub fn on_frame(&mut self, at: Duration, info: &FrameInfo) {
         if !info.has_input {
             self.no_input += 1;
             self.last_stream_time = None;
             return;
         }
         *self.frames.entry(info.pixel_format).or_default() += 1;
+
+        let color = &info.color;
+        *self
+            .signal
+            .entry((color.eotf, color.colorspace))
+            .or_default() += 1;
+        match self.hdr.last_mut() {
+            Some((_, value, n)) if *value == color.hdr => *n += 1,
+            _ => self.hdr.push((at, color.hdr, 1)),
+        }
+        if info.dolby_vision_flagged {
+            self.dolby_vision_flagged += 1;
+        }
 
         let (Some(t), Some(d)) = (info.stream_time, info.duration) else {
             self.untimed += 1;
@@ -94,6 +117,33 @@ impl Stats {
             let _ = writeln!(s, "  {pf}: {n}");
         }
         let _ = writeln!(s, "no input source: {}", self.no_input);
+
+        let _ = writeln!(s, "signal:");
+        let or_unreported = |v: Option<String>| v.unwrap_or_else(|| "unreported".into());
+        for ((eotf, cs), n) in &self.signal {
+            let _ = writeln!(
+                s,
+                "  {}, {}: {n}",
+                or_unreported(eotf.map(|e| e.to_string())),
+                or_unreported(cs.map(|c| c.to_string())),
+            );
+        }
+        // A changing value is the point of the check, but a value that flips
+        // every frame would flood the summary.
+        const SHOWN: usize = 20;
+        let _ = writeln!(
+            s,
+            "HDR metadata: {} change(s)",
+            self.hdr.len().saturating_sub(1)
+        );
+        for (at, value, n) in self.hdr.iter().take(SHOWN) {
+            let value = value.map_or_else(|| "none".to_string(), |m| m.to_string());
+            let _ = writeln!(s, "  {:6.2} s  {value} ({n} frames)", at.as_secs_f64());
+        }
+        if self.hdr.len() > SHOWN {
+            let _ = writeln!(s, "  ... {} more", self.hdr.len() - SHOWN);
+        }
+        let _ = writeln!(s, "Dolby Vision flag: {} frames", self.dolby_vision_flagged);
         let _ = writeln!(
             s,
             "stream gaps: {} (about {} frames missed)",
@@ -129,7 +179,8 @@ impl Handler for Recorder {
     }
 
     fn frame(&self, frame: Frame) {
-        lock(&self.stats).on_frame(frame.info());
+        let at = self.started.elapsed();
+        lock(&self.stats).on_frame(at, frame.info());
         // `frame` drops here, handing its buffer straight back to the card.
     }
 }
@@ -143,6 +194,13 @@ pub fn lock(stats: &Mutex<Stats>) -> std::sync::MutexGuard<'_, Stats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cinefit_decklink::ColorInfo;
+
+    const NO_COLOR: ColorInfo = ColorInfo {
+        colorspace: None,
+        eotf: None,
+        hdr: None,
+    };
 
     fn frame(t: i64) -> FrameInfo {
         FrameInfo {
@@ -153,6 +211,21 @@ mod tests {
             stream_time: Some(t),
             duration: Some(1001),
             has_input: true,
+            color: NO_COLOR,
+            dolby_vision_flagged: false,
+        }
+    }
+
+    fn hdr(max_cll: f64) -> HdrMetadata {
+        HdrMetadata {
+            red: None,
+            green: None,
+            blue: None,
+            white: None,
+            max_mastering: Some(1000.0),
+            min_mastering: Some(0.005),
+            max_cll: Some(max_cll),
+            max_fall: Some(400.0),
         }
     }
 
@@ -160,7 +233,7 @@ mod tests {
     fn steady_stream_has_no_gaps() {
         let mut s = Stats::default();
         for i in 0..100 {
-            s.on_frame(&frame(i * 1001));
+            s.on_frame(Duration::ZERO, &frame(i * 1001));
         }
         assert_eq!(s.total_frames(), 100);
         assert_eq!((s.gaps, s.missed), (0, 0));
@@ -169,30 +242,33 @@ mod tests {
     #[test]
     fn a_skipped_stretch_is_one_gap_counting_its_frames() {
         let mut s = Stats::default();
-        s.on_frame(&frame(0));
-        s.on_frame(&frame(1001));
-        s.on_frame(&frame(4 * 1001)); // frames 2 and 3 never arrived
+        s.on_frame(Duration::ZERO, &frame(0));
+        s.on_frame(Duration::ZERO, &frame(1001));
+        s.on_frame(Duration::ZERO, &frame(4 * 1001)); // frames 2 and 3 never arrived
         assert_eq!((s.gaps, s.missed), (1, 2));
     }
 
     #[test]
     fn one_tick_of_jitter_is_not_a_gap() {
         let mut s = Stats::default();
-        s.on_frame(&frame(0));
-        s.on_frame(&frame(1002));
-        s.on_frame(&frame(2002));
+        s.on_frame(Duration::ZERO, &frame(0));
+        s.on_frame(Duration::ZERO, &frame(1002));
+        s.on_frame(Duration::ZERO, &frame(2002));
         assert_eq!(s.gaps, 0);
     }
 
     #[test]
     fn no_input_frames_are_counted_apart_and_reset_timing() {
         let mut s = Stats::default();
-        s.on_frame(&frame(0));
-        s.on_frame(&FrameInfo {
-            has_input: false,
-            ..frame(1001)
-        });
-        s.on_frame(&frame(50 * 1001)); // after a signal loss: not a gap
+        s.on_frame(Duration::ZERO, &frame(0));
+        s.on_frame(
+            Duration::ZERO,
+            &FrameInfo {
+                has_input: false,
+                ..frame(1001)
+            },
+        );
+        s.on_frame(Duration::ZERO, &frame(50 * 1001)); // after a signal loss: not a gap
         assert_eq!(s.no_input, 1);
         assert_eq!(s.total_frames(), 2);
         assert_eq!(s.gaps, 0);
@@ -201,10 +277,13 @@ mod tests {
     #[test]
     fn frames_without_stream_time_are_counted_as_untimed() {
         let mut s = Stats::default();
-        s.on_frame(&FrameInfo {
-            stream_time: None,
-            ..frame(0)
-        });
+        s.on_frame(
+            Duration::ZERO,
+            &FrameInfo {
+                stream_time: None,
+                ..frame(0)
+            },
+        );
         assert_eq!(s.untimed, 1);
         assert_eq!(s.total_frames(), 1);
     }
@@ -212,12 +291,61 @@ mod tests {
     #[test]
     fn frames_are_counted_by_pixel_format() {
         let mut s = Stats::default();
-        s.on_frame(&frame(0));
-        s.on_frame(&FrameInfo {
-            pixel_format: PixelFormat::Argb8,
-            ..frame(1001)
-        });
+        s.on_frame(Duration::ZERO, &frame(0));
+        s.on_frame(
+            Duration::ZERO,
+            &FrameInfo {
+                pixel_format: PixelFormat::Argb8,
+                ..frame(1001)
+            },
+        );
         assert_eq!(s.frames.get(&PixelFormat::V210), Some(&1));
         assert_eq!(s.frames.get(&PixelFormat::Argb8), Some(&1));
+    }
+
+    #[test]
+    fn hdr_metadata_is_kept_as_a_timeline_of_changes() {
+        let mut s = Stats::default();
+        let with = |m: Option<HdrMetadata>, t| FrameInfo {
+            color: ColorInfo { hdr: m, ..NO_COLOR },
+            ..frame(t)
+        };
+        s.on_frame(Duration::ZERO, &with(None, 0));
+        s.on_frame(Duration::from_secs(1), &with(Some(hdr(637.0)), 1001));
+        s.on_frame(Duration::from_secs(2), &with(Some(hdr(637.0)), 2002));
+        s.on_frame(Duration::from_secs(3), &with(Some(hdr(1000.0)), 3003));
+        let runs: Vec<_> = s
+            .hdr
+            .iter()
+            .map(|(at, m, n)| (at.as_secs(), m.and_then(|m| m.max_cll), *n))
+            .collect();
+        assert_eq!(
+            runs,
+            [(0, None, 1), (1, Some(637.0), 2), (3, Some(1000.0), 1)]
+        );
+    }
+
+    #[test]
+    fn signal_is_counted_by_eotf_and_colorspace() {
+        let mut s = Stats::default();
+        let sdr = |cs| FrameInfo {
+            color: ColorInfo {
+                eotf: Some(Eotf::Sdr),
+                colorspace: Some(cs),
+                hdr: None,
+            },
+            ..frame(0)
+        };
+        s.on_frame(Duration::ZERO, &sdr(Colorspace::Rec709));
+        s.on_frame(Duration::ZERO, &sdr(Colorspace::Rec2020));
+        s.on_frame(Duration::ZERO, &sdr(Colorspace::Rec2020));
+        assert_eq!(
+            s.signal.get(&(Some(Eotf::Sdr), Some(Colorspace::Rec709))),
+            Some(&1)
+        );
+        assert_eq!(
+            s.signal.get(&(Some(Eotf::Sdr), Some(Colorspace::Rec2020))),
+            Some(&2)
+        );
     }
 }

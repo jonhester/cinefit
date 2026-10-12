@@ -91,9 +91,23 @@ pub struct FrameInfo {
     pub height: i32,
     pub pixel_format: u32,
     pub flags: u32,
+    pub colorspace: i64,
+    pub eotf: i64,
+    pub red_x: f64,
+    pub red_y: f64,
+    pub green_x: f64,
+    pub green_y: f64,
+    pub blue_x: f64,
+    pub blue_y: f64,
+    pub white_x: f64,
+    pub white_y: f64,
+    pub max_mastering: f64,
+    pub min_mastering: f64,
+    pub max_cll: f64,
+    pub max_fall: f64,
 }
 
-const _: () = assert!(size_of::<FrameInfo>() == 40);
+const _: () = assert!(size_of::<FrameInfo>() == 152);
 const _: () = assert!(offset_of!(FrameInfo, stream_time) == 0);
 const _: () = assert!(offset_of!(FrameInfo, stream_duration) == 8);
 const _: () = assert!(offset_of!(FrameInfo, row_bytes) == 16);
@@ -101,6 +115,20 @@ const _: () = assert!(offset_of!(FrameInfo, width) == 24);
 const _: () = assert!(offset_of!(FrameInfo, height) == 28);
 const _: () = assert!(offset_of!(FrameInfo, pixel_format) == 32);
 const _: () = assert!(offset_of!(FrameInfo, flags) == 36);
+const _: () = assert!(offset_of!(FrameInfo, colorspace) == 40);
+const _: () = assert!(offset_of!(FrameInfo, eotf) == 48);
+const _: () = assert!(offset_of!(FrameInfo, red_x) == 56);
+const _: () = assert!(offset_of!(FrameInfo, red_y) == 64);
+const _: () = assert!(offset_of!(FrameInfo, green_x) == 72);
+const _: () = assert!(offset_of!(FrameInfo, green_y) == 80);
+const _: () = assert!(offset_of!(FrameInfo, blue_x) == 88);
+const _: () = assert!(offset_of!(FrameInfo, blue_y) == 96);
+const _: () = assert!(offset_of!(FrameInfo, white_x) == 104);
+const _: () = assert!(offset_of!(FrameInfo, white_y) == 112);
+const _: () = assert!(offset_of!(FrameInfo, max_mastering) == 120);
+const _: () = assert!(offset_of!(FrameInfo, min_mastering) == 128);
+const _: () = assert!(offset_of!(FrameInfo, max_cll) == 136);
+const _: () = assert!(offset_of!(FrameInfo, max_fall) == 144);
 
 /// Opaque `cf_dl_input`.
 #[repr(C)]

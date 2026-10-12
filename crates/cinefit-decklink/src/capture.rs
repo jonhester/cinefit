@@ -8,7 +8,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
 use std::ptr::{self, NonNull};
 
-use crate::{Device, Error, ffi};
+use crate::{ColorInfo, Device, Error, ffi};
 
 // BMDDetectedVideoInputFormatFlags.
 const DETECTED_RGB444: u32 = 1 << 1;
@@ -17,6 +17,7 @@ const DETECTED_10BIT: u32 = 1 << 4;
 const DETECTED_8BIT: u32 = 1 << 5;
 
 // BMDFrameFlags.
+const FRAME_CONTAINS_DOLBY_VISION_METADATA: u32 = 1 << 4;
 const FRAME_HAS_NO_INPUT_SOURCE: u32 = 1 << 31;
 
 // E_ACCESSDENIED from the SDK's LinuxCOM.h.
@@ -181,7 +182,7 @@ impl fmt::Display for InputFormat {
 }
 
 /// What the shim reads off a frame as it arrives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameInfo {
     pub width: u32,
     pub height: u32,
@@ -194,6 +195,11 @@ pub struct FrameInfo {
     pub duration: Option<i64>,
     /// False for frames the card delivers while nothing is on its input.
     pub has_input: bool,
+    /// Colorspace, transfer function and HDR static metadata.
+    pub color: ColorInfo,
+    /// The card's own Dolby Vision flag. The SDK documents Dolby Vision
+    /// metadata for output only; this records whether input ever sets it.
+    pub dolby_vision_flagged: bool,
 }
 
 impl From<&ffi::FrameInfo> for FrameInfo {
@@ -207,6 +213,8 @@ impl From<&ffi::FrameInfo> for FrameInfo {
             stream_time: known(raw.stream_time),
             duration: known(raw.stream_duration),
             has_input: raw.flags & FRAME_HAS_NO_INPUT_SOURCE == 0,
+            color: ColorInfo::from(raw),
+            dolby_vision_flagged: raw.flags & FRAME_CONTAINS_DOLBY_VISION_METADATA != 0,
         }
     }
 }
@@ -449,13 +457,12 @@ mod tests {
     #[test]
     fn frame_info_decodes_unknowns_and_no_input() {
         let raw = ffi::FrameInfo {
-            stream_time: ffi::UNKNOWN,
-            stream_duration: ffi::UNKNOWN,
             row_bytes: 10240,
             width: 3840,
             height: 2160,
             pixel_format: PixelFormat::V210.to_raw(),
             flags: FRAME_HAS_NO_INPUT_SOURCE,
+            ..crate::metadata::tests::unreported()
         };
         let info = FrameInfo::from(&raw);
         assert_eq!(info.stream_time, None);
@@ -463,5 +470,7 @@ mod tests {
         assert_eq!(info.row_bytes, 10240);
         assert_eq!(info.pixel_format, PixelFormat::V210);
         assert!(!info.has_input);
+        assert!(!info.dolby_vision_flagged);
+        assert_eq!(info.color.hdr, None);
     }
 }
