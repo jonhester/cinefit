@@ -5,3 +5,6 @@ rustc-ice-*.txt
 
 # Frames saved by `cinefit capture --dump`.
 /dumps/
+
+# libplacebo built by scripts/build-libplacebo.sh.
+/.deps/

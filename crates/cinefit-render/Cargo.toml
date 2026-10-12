@@ -5,9 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Hands the pinned libplacebo's directory to dependents (DEP_CINEFIT_PLACEBO_LIBDIR).
+links = "cinefit_placebo"
 
-# libplacebo (LGPL-2.1+) is linked dynamically from the system: on Ubuntu,
-# libplacebo-dev. The shim requires the API version the rig runs (7.360).
+# libplacebo (LGPL-2.1+) is linked dynamically: the pinned build from
+# scripts/build-libplacebo.sh, found through CINEFIT_LIBPLACEBO.
 [build-dependencies]
 cc = "1.2"
 pkg-config = "0.3"

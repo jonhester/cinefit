@@ -1,0 +1,4 @@
+[env]
+# Where scripts/build-libplacebo.sh installs the pinned libplacebo, relative to
+# the repository. Override to use another prefix.
+CINEFIT_LIBPLACEBO = { value = ".deps/libplacebo", relative = true }

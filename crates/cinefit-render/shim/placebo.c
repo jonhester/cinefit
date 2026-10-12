@@ -11,7 +11,7 @@
 
 /* The API the shim is written against. A different libplacebo fails the build
  * here rather than misbehaving at run time: update the shim, then this. */
-_Static_assert(PL_API_VER == 360, "shim written for libplacebo API 360");
+_Static_assert(PL_API_VER == 375, "shim written for libplacebo API 375 (scripts/build-libplacebo.sh)");
 
 struct cf_pl {
     pl_log log;

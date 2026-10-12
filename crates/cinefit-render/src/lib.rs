@@ -1,8 +1,8 @@
 //! Rendering with libplacebo on Vulkan, through a small C shim.
 //!
-//! libplacebo comes from the system (`libplacebo-dev`, API 360 or the shim
-//! fails to build) and rendering is Linux only; elsewhere [`Placebo::new`]
-//! reports that.
+//! libplacebo is the pinned build from `scripts/build-libplacebo.sh` (API 375,
+//! or the shim fails to build), and rendering is Linux only; elsewhere
+//! [`Placebo::new`] reports that.
 
 mod ffi;
 #[cfg(target_os = "linux")]

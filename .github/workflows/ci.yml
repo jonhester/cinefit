@@ -12,11 +12,23 @@ jobs:
   check:
     # Linux, the only platform cinefit runs on. The DeckLink shim builds
     # against the vendored SDK headers; no driver is needed to build or to run
-    # the tests. 26.04 because its libplacebo (7.360) is the one the rig runs.
+    # the tests. 26.04 to match the rig's Ubuntu.
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libplacebo-dev libvulkan-dev libdrm-dev libgbm-dev
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          meson ninja-build glslang-dev glslang-tools python3-jinja2
+          libvulkan-dev liblcms2-dev libdrm-dev libgbm-dev
+      # The pinned libplacebo, rebuilt only when the script (and so the pinned
+      # commit) changes.
+      - id: libplacebo
+        uses: actions/cache@v6
+        with:
+          path: .deps/libplacebo
+          key: libplacebo-${{ runner.os }}-${{ hashFiles('scripts/build-libplacebo.sh') }}
+      - if: steps.libplacebo.outputs.cache-hit != 'true'
+        run: scripts/build-libplacebo.sh
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
