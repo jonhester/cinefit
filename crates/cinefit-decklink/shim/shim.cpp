@@ -11,7 +11,7 @@
 
 // The Rust side declares this struct by hand and asserts the same numbers. Every
 // field is checked, so a reorder fails the build as well as a resize.
-static_assert(sizeof(cf_dl_device_info) == 296, "layout must match src/ffi.rs");
+static_assert(sizeof(cf_dl_device_info) == 288, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_device_info, display_name) == 0, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_device_info, model_name) == 128, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_device_info, persistent_id) == 256, "layout must match src/ffi.rs");
@@ -19,7 +19,6 @@ static_assert(offsetof(cf_dl_device_info, video_io_support) == 264, "layout must
 static_assert(offsetof(cf_dl_device_info, input_connections) == 272, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_device_info, input_format_detection) == 280, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_device_info, hdr_metadata) == 284, "layout must match src/ffi.rs");
-static_assert(offsetof(cf_dl_device_info, edid_dynamic_range) == 288, "layout must match src/ffi.rs");
 // The oldest driver these headers work with. src/ffi.rs repeats it, so an SDK
 // upgrade fails the build until both sides agree.
 static_assert(BLACKMAGIC_DECKLINK_API_VERSION == 0x10000000, "update REQUIRED_API_VERSION in src/ffi.rs");
@@ -112,15 +111,18 @@ extern "C" void cf_dl_device_get_info(cf_dl_device *handle, cf_dl_device_info *o
     out->input_format_detection = flag(attrs, BMDDeckLinkSupportsInputFormatDetection);
     out->hdr_metadata           = flag(attrs, BMDDeckLinkSupportsHDRMetadata);
     if (attrs) attrs->Release();
+    // The input EDID is not read here: see cf_dl_device_read_input_edid.
+}
 
-    // GetInt only. SetInt and WriteToEDID would renegotiate with the source.
+extern "C" int32_t cf_dl_device_read_input_edid(cf_dl_device *handle, int64_t *bits) noexcept {
+    // GetInt only: SetInt and WriteToEDID renegotiate with the source. Even
+    // so, the interface's release may be a hotplug of its own.
     IDeckLinkHDMIInputEDID *edid = nullptr;
-    if (dev->QueryInterface(IID_IDeckLinkHDMIInputEDID, (void **)&edid) == S_OK && edid) {
-        int64_t v = 0;
-        if (edid->GetInt(bmdDeckLinkHDMIInputEDIDDynamicRange, &v) == S_OK)
-            out->edid_dynamic_range = v;
-        edid->Release();
-    }
+    if (unwrap(handle)->QueryInterface(IID_IDeckLinkHDMIInputEDID, (void **)&edid) != S_OK || !edid)
+        return -1;
+    const bool ok = edid->GetInt(bmdDeckLinkHDMIInputEDIDDynamicRange, bits) == S_OK;
+    edid->Release();
+    return ok ? 0 : -1;
 }
 
 extern "C" void cf_dl_device_release(cf_dl_device *dev) noexcept {

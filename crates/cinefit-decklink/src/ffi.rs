@@ -18,13 +18,12 @@ pub struct DeviceInfo {
     pub input_connections: i64,
     pub input_format_detection: i32,
     pub hdr_metadata: i32,
-    pub edid_dynamic_range: i64,
 }
 
 // shim.cpp asserts the same numbers, so a field changed on one side only fails
 // the build instead of corrupting memory. Every field is checked: two fields of
 // the same type swapped on one side keep the size but read each other's values.
-const _: () = assert!(size_of::<DeviceInfo>() == 296);
+const _: () = assert!(size_of::<DeviceInfo>() == 288);
 const _: () = assert!(offset_of!(DeviceInfo, display_name) == 0);
 const _: () = assert!(offset_of!(DeviceInfo, model_name) == 128);
 const _: () = assert!(offset_of!(DeviceInfo, persistent_id) == 256);
@@ -32,7 +31,6 @@ const _: () = assert!(offset_of!(DeviceInfo, video_io_support) == 264);
 const _: () = assert!(offset_of!(DeviceInfo, input_connections) == 272);
 const _: () = assert!(offset_of!(DeviceInfo, input_format_detection) == 280);
 const _: () = assert!(offset_of!(DeviceInfo, hdr_metadata) == 284);
-const _: () = assert!(offset_of!(DeviceInfo, edid_dynamic_range) == 288);
 
 impl DeviceInfo {
     /// Nothing reported: a safe starting value for the shim to fill. If the
@@ -45,7 +43,6 @@ impl DeviceInfo {
         input_connections: UNKNOWN,
         input_format_detection: UNKNOWN as i32,
         hdr_metadata: UNKNOWN as i32,
-        edid_dynamic_range: UNKNOWN,
     };
 }
 
@@ -164,6 +161,7 @@ unsafe extern "C" {
     pub fn cf_dl_iterator_release(it: *mut IteratorHandle);
     pub fn cf_dl_device_get_info(dev: *mut DeviceHandle, out: *mut DeviceInfo);
     pub fn cf_dl_device_release(dev: *mut DeviceHandle);
+    pub fn cf_dl_device_read_input_edid(dev: *mut DeviceHandle, bits: *mut i64) -> i32;
 
     pub fn cf_dl_input_open(dev: *mut DeviceHandle) -> *mut InputHandle;
     pub fn cf_dl_input_start(

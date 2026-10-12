@@ -33,6 +33,15 @@ pub struct EdidDynamicRange {
     pub hlg: bool,
 }
 
+impl EdidDynamicRange {
+    fn from_bits(bits: i64) -> Self {
+        Self {
+            pq: bits & DYNAMIC_RANGE_PQ != 0,
+            hlg: bits & DYNAMIC_RANGE_HLG != 0,
+        }
+    }
+}
+
 impl fmt::Display for EdidDynamicRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SDR")?;
@@ -137,7 +146,6 @@ pub struct DeviceInfo {
     pub hdmi_input: Option<bool>,
     pub input_format_detection: Option<bool>,
     pub hdr_metadata: Option<bool>,
-    pub input_edid: Option<EdidDynamicRange>,
 }
 
 impl From<&ffi::DeviceInfo> for DeviceInfo {
@@ -152,10 +160,6 @@ impl From<&ffi::DeviceInfo> for DeviceInfo {
             hdmi_input: int(raw.input_connections).map(|b| b & VIDEO_CONNECTION_HDMI != 0),
             input_format_detection: flag(raw.input_format_detection),
             hdr_metadata: flag(raw.hdr_metadata),
-            input_edid: int(raw.edid_dynamic_range).map(|b| EdidDynamicRange {
-                pq: b & DYNAMIC_RANGE_PQ != 0,
-                hlg: b & DYNAMIC_RANGE_HLG != 0,
-            }),
         }
     }
 }
@@ -250,6 +254,20 @@ impl Device {
         unsafe { ffi::cf_dl_device_get_info(self.0.as_ptr(), &mut raw) };
         DeviceInfo::from(&raw)
     }
+
+    /// What the card's HDMI input EDID advertises, or `None` if the device
+    /// does not say. Not part of [`Self::info`] on purpose: taking and
+    /// releasing the card's EDID interface may be a hotplug upstream (the card
+    /// restores its default EDID when the interface is released), and the
+    /// Denon in this chain does not reliably recover from one: it keeps
+    /// sending the signal with a black picture until its input is cycled.
+    /// Read it only when asked to.
+    pub fn read_input_edid(&self) -> Option<EdidDynamicRange> {
+        let mut bits = 0i64;
+        // SAFETY: the device is live and `bits` is writable.
+        let rc = unsafe { ffi::cf_dl_device_read_input_edid(self.0.as_ptr(), &mut bits) };
+        (rc == 0).then(|| EdidDynamicRange::from_bits(bits))
+    }
 }
 
 impl Drop for Device {
@@ -281,7 +299,6 @@ mod tests {
         assert_eq!(info.hdmi_input, None);
         assert_eq!(info.input_format_detection, None);
         assert_eq!(info.hdr_metadata, None);
-        assert_eq!(info.input_edid, None);
     }
 
     #[test]
@@ -340,9 +357,7 @@ mod tests {
 
     #[test]
     fn edid_dynamic_range_decodes() {
-        let mut r = raw("card");
-        r.edid_dynamic_range = DYNAMIC_RANGE_PQ;
-        let e = DeviceInfo::from(&r).input_edid.expect("reported");
+        let e = EdidDynamicRange::from_bits(DYNAMIC_RANGE_PQ);
         assert_eq!(
             e,
             EdidDynamicRange {
@@ -351,20 +366,9 @@ mod tests {
             }
         );
         assert_eq!(e.to_string(), "SDR, PQ");
-        r.edid_dynamic_range = 0;
+        assert_eq!(EdidDynamicRange::from_bits(0).to_string(), "SDR");
         assert_eq!(
-            DeviceInfo::from(&r)
-                .input_edid
-                .expect("reported")
-                .to_string(),
-            "SDR"
-        );
-        r.edid_dynamic_range = DYNAMIC_RANGE_PQ | DYNAMIC_RANGE_HLG;
-        assert_eq!(
-            DeviceInfo::from(&r)
-                .input_edid
-                .expect("reported")
-                .to_string(),
+            EdidDynamicRange::from_bits(DYNAMIC_RANGE_PQ | DYNAMIC_RANGE_HLG).to_string(),
             "SDR, PQ, HLG"
         );
     }
