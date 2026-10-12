@@ -4,7 +4,10 @@
 //! at run time, so everything builds and tests on any machine; without the
 //! driver, calls fail with [`Error::DriverNotLoaded`].
 
+mod capture;
 mod ffi;
+
+pub use capture::{Capture, Frame, FrameInfo, Handler, InputFormat, PixelFormat, Sampling};
 
 use std::ffi::CStr;
 use std::fmt;
@@ -25,6 +28,12 @@ pub enum Error {
     /// The driver is older than the SDK headers this crate is built with, and
     /// lacks the entry points they call.
     DriverTooOld { found: ApiVersion },
+    /// The device has no capture input.
+    NoInput,
+    /// Another program holds the capture input.
+    InputBusy,
+    /// An SDK call failed; `hresult` is its result code.
+    Sdk { call: String, hresult: i32 },
 }
 
 impl fmt::Display for Error {
@@ -39,6 +48,15 @@ impl fmt::Display for Error {
                 "DeckLink driver {found} is too old: Desktop Video {} or newer is required",
                 ApiVersion::REQUIRED
             ),
+            Error::NoInput => f.write_str("DeckLink device has no capture input"),
+            Error::InputBusy => f.write_str("capture input is in use by another program"),
+            Error::Sdk { call, hresult } => {
+                write!(
+                    f,
+                    "DeckLink {call} failed (HRESULT {:#010x})",
+                    *hresult as u32
+                )
+            }
         }
     }
 }

@@ -1,38 +1,55 @@
 // Unsafe code lives in the wrapper crates (cinefit-decklink), behind safe APIs.
 #![forbid(unsafe_code)]
 
+mod capture;
+
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(version, about = "Constant image height video processing")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List DeckLink devices and what they report. Opens no input, so it is
+    /// safe while another program is capturing.
+    Probe,
+    /// Capture from a device's input for a while and summarise what arrived.
+    Capture {
+        /// How long to capture, in seconds.
+        #[arg(short = 't', long, default_value_t = 10.0)]
+        seconds: f64,
+        /// Which device, by its index in `cinefit probe`.
+        #[arg(short, long, default_value_t = 0)]
+        device: usize,
+    },
+}
 
 fn main() -> ExitCode {
-    let cmd = std::env::args().nth(1);
-    match cmd.as_deref() {
-        Some("probe") => probe(),
-        _ => {
-            eprintln!("usage: cinefit probe");
+    let result = match Cli::parse().command {
+        Command::Probe => probe(),
+        Command::Capture { seconds, device } => capture(seconds, device),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Lists DeckLink devices and what they report. Discovery only: it opens no
-/// input, so it is safe while another program is capturing.
-fn probe() -> ExitCode {
-    let version = match cinefit_decklink::api_version() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    println!("DeckLink API {version}");
+fn probe() -> Result<(), Box<dyn std::error::Error>> {
+    println!("DeckLink API {}", cinefit_decklink::api_version()?);
 
-    let devices = match cinefit_decklink::devices() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let devices = cinefit_decklink::devices()?;
     if devices.is_empty() {
         println!("no devices");
     }
@@ -53,5 +70,32 @@ fn probe() -> ExitCode {
             None => println!("  persistent ID:    unreported"),
         }
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+fn capture(seconds: f64, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let run_for = Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|d| !d.is_zero())
+        .ok_or("--seconds must be a positive number")?;
+
+    let devices = cinefit_decklink::devices()?;
+    let device = devices
+        .get(index)
+        .ok_or_else(|| format!("no device {index}: {} found", devices.len()))?;
+    println!("device {index}: {}", device.info().display_name);
+
+    let stats = Arc::new(Mutex::new(capture::Stats::default()));
+    let started = Instant::now();
+    let running = device.start_capture(capture::Recorder::new(Arc::clone(&stats)))?;
+    std::thread::sleep(run_for);
+    // Measured before stopping: frames stop counting here, not after the stop
+    // has finished.
+    let ran = started.elapsed();
+    let failed_restarts = running.failed_restarts();
+    // Stops the input; no callback runs after this.
+    drop(running);
+
+    print!("{}", capture::lock(&stats).summary(ran, failed_restarts));
+    Ok(())
 }

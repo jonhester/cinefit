@@ -55,8 +55,71 @@ cf_dl_iterator *cf_dl_iterator_create(void) CF_DL_NOEXCEPT;
 cf_dl_device *cf_dl_iterator_next(cf_dl_iterator *it) CF_DL_NOEXCEPT;
 void cf_dl_iterator_release(cf_dl_iterator *it) CF_DL_NOEXCEPT;
 
+/* Fills the fields of *out that the device reports. The caller initialises
+ * *out first (every field CF_DL_UNKNOWN, names empty): fields left untouched
+ * keep that value. */
 void cf_dl_device_get_info(cf_dl_device *dev, cf_dl_device_info *out) CF_DL_NOEXCEPT;
 void cf_dl_device_release(cf_dl_device *dev) CF_DL_NOEXCEPT;
+
+/* ---- Capture (input.cpp) ---- */
+
+typedef struct cf_dl_input cf_dl_input;
+/* One captured frame. Holds one SDK reference, dropped by cf_dl_frame_release;
+ * the card's buffer is not reused until it is. */
+typedef struct cf_dl_frame cf_dl_frame;
+
+/* The input's format, as detected when the signal changes. */
+typedef struct {
+    int64_t  frame_duration;        /* rate = time_scale / frame_duration fps, */
+    int64_t  time_scale;            /* e.g. 24000 / 1001; 0 if unreported */
+    int32_t  width;
+    int32_t  height;
+    uint32_t display_mode;          /* BMDDisplayMode detected */
+    uint32_t detected_flags;        /* BMDDetectedVideoInputFormatFlags */
+    uint32_t enabled_mode;          /* BMDDisplayMode the input runs in now */
+    uint32_t enabled_pixel_format;  /* BMDPixelFormat the input runs in now */
+} cf_dl_format;
+
+typedef struct {
+    int64_t  stream_time;           /* in the format's time_scale, or CF_DL_UNKNOWN */
+    int64_t  stream_duration;       /* likewise */
+    int64_t  row_bytes;             /* the SDK's stride; never compute it */
+    int32_t  width;
+    int32_t  height;
+    uint32_t pixel_format;          /* BMDPixelFormat */
+    uint32_t flags;                 /* BMDFrameFlags */
+} cf_dl_frame_info;
+
+/* Both callbacks run on the SDK's thread and must return quickly: stalling
+ * them makes the card drop frames. */
+
+/* Returns the BMDPixelFormat to re-enable the input with on the detected mode,
+ * or 0 to leave it running as it is. */
+typedef uint32_t (*cf_dl_format_cb)(void *ctx, const cf_dl_format *format);
+/* Hands over one reference to frame; the callee releases it. */
+typedef void (*cf_dl_frame_cb)(void *ctx, cf_dl_frame *frame, const cf_dl_frame_info *info);
+
+/* Null if the device has no capture input. */
+cf_dl_input *cf_dl_input_open(cf_dl_device *dev) CF_DL_NOEXCEPT;
+
+/* Enables the input with format detection and starts it. Returns 0, or the
+ * failing call's HRESULT with its name in *failed_call. E_ACCESSDENIED from
+ * EnableVideoInput means another program holds the input. Callbacks may run
+ * from here until cf_dl_input_stop returns, with ctx passed through. */
+int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
+                          cf_dl_frame_cb on_frame, void *ctx,
+                          const char **failed_call) CF_DL_NOEXCEPT;
+
+/* Stops the input. When it returns, no callback is running or will run. */
+void cf_dl_input_stop(cf_dl_input *in) CF_DL_NOEXCEPT;
+
+/* How many format-change restarts failed to enable the new mode. */
+uint64_t cf_dl_input_failed_restarts(cf_dl_input *in) CF_DL_NOEXCEPT;
+
+/* Stops the input if it is running, then frees it. */
+void cf_dl_input_release(cf_dl_input *in) CF_DL_NOEXCEPT;
+
+void cf_dl_frame_release(cf_dl_frame *frame) CF_DL_NOEXCEPT;
 
 #ifdef __cplusplus
 }

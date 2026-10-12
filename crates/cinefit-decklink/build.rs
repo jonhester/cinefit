@@ -19,6 +19,7 @@ fn main() {
         .std("c++17")
         .include("vendor/decklink-sdk/include")
         .file("shim/shim.cpp")
+        .file("shim/input.cpp")
         .warnings(true)
         .extra_warnings(true)
         .warnings_into_errors(true)
