@@ -31,6 +31,22 @@ pub struct YcbcrColor {
     pub transfer: Transfer,
 }
 
+/// The range of RGB codes. HDMI RGB is limited for video formats unless the
+/// source signals full, and the capture card does not report which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Levels {
+    Full,
+    Limited,
+}
+
+/// Captured RGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RgbSourceColor {
+    pub levels: Levels,
+    pub primaries: Primaries,
+    pub transfer: Transfer,
+}
+
 /// An RGB target: always full range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbColor {
@@ -64,6 +80,17 @@ pub fn ycbcr10_to_rgb(y: f64, cb: f64, cr: f64, matrix: Matrix) -> [f64; 3] {
     [r, g, b]
 }
 
+/// An RGB code of `depth` bits to 0-1 (outside it for limited-range codes
+/// past black or white). Limited range puts black at 16 and white at 235,
+/// scaled to the depth.
+pub fn rgb_code_to_unit(code: u16, depth: u8, levels: Levels) -> f64 {
+    let scale = f64::from(1u32 << (depth - 8));
+    match levels {
+        Levels::Full => f64::from(code) / f64::from((1u32 << depth) - 1),
+        Levels::Limited => (f64::from(code) - 16.0 * scale) / (219.0 * scale),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +117,14 @@ mod tests {
         // BT.2020 100% blue: Y 116, Cb 960, Cr 476.
         let b = ycbcr10_to_rgb(116.0, 960.0, 476.0, Matrix::Bt2020Nc);
         assert!(near(b, [0.0, 0.0, 1.0]), "{b:?}");
+    }
+
+    #[test]
+    fn rgb_codes_scale_by_depth_and_range() {
+        assert_eq!(rgb_code_to_unit(1023, 10, Levels::Full), 1.0);
+        assert_eq!(rgb_code_to_unit(255, 8, Levels::Full), 1.0);
+        assert_eq!(rgb_code_to_unit(64, 10, Levels::Limited), 0.0);
+        assert_eq!(rgb_code_to_unit(940, 10, Levels::Limited), 1.0);
+        assert_eq!(rgb_code_to_unit(235, 8, Levels::Limited), 1.0);
     }
 }

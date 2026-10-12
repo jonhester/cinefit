@@ -8,9 +8,10 @@ pub mod color;
 mod ffi;
 #[cfg(target_os = "linux")]
 pub mod power;
+pub mod rgb;
 pub mod v210;
 
-pub use color::{Matrix, Primaries, RgbColor, Transfer, YcbcrColor};
+pub use color::{Levels, Matrix, Primaries, RgbColor, RgbSourceColor, Transfer, YcbcrColor};
 
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
@@ -335,6 +336,63 @@ impl GpuPlanes<'_> {
     }
 }
 
+/// Captured RGB on the GPU, one 16-bit texture with each code shifted to the
+/// top bits. Destroyed on drop; the borrow keeps it from outliving its device.
+#[cfg(target_os = "linux")]
+pub struct GpuRgb<'p> {
+    pl: &'p Placebo,
+    raw: std::ptr::NonNull<ffi::Rgb>,
+    width: usize,
+    height: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GpuRgb<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the texture belongs to this live device and is freed once.
+        unsafe { ffi::cf_pl_rgb_destroy(self.pl.handle.as_ptr(), self.raw.as_ptr()) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl GpuRgb<'_> {
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Reads it back as stored (`code << (16 - depth)`), R, G, B a pixel,
+    /// for checks.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo fails.
+    pub fn download(&self) -> Result<Vec<u16>, Error> {
+        let mut rgba = vec![0u16; self.width * self.height * 4];
+        // SAFETY: `rgba` holds the w * h * 4 values the shim writes; the
+        // texture belongs to this live device.
+        let rc = unsafe {
+            ffi::cf_pl_rgb_download(
+                self.pl.handle.as_ptr(),
+                self.raw.as_ptr(),
+                rgba.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Render);
+        }
+        Ok(rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect())
+    }
+}
+
 /// An RGBA 16-bit texture to render into and read back, for checks.
 #[cfg(target_os = "linux")]
 pub struct Rgba16Target<'p> {
@@ -472,6 +530,105 @@ impl Placebo {
                 self.handle.as_ptr(),
                 src.raw.as_ptr(),
                 matrix,
+                primaries_raw(color.primaries),
+                transfer_raw(color.transfer),
+                dst.tex.as_ptr(),
+                primaries_raw(dst_color.primaries),
+                transfer_raw(dst_color.transfer),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// A texture for `width` x `height` captured RGB.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] for an empty or oversized picture, [`Error::Render`]
+    /// if libplacebo cannot create it (see its log).
+    pub fn rgb(&self, width: usize, height: usize) -> Result<GpuRgb<'_>, Error> {
+        let dim = |v: usize| {
+            c_int::try_from(v)
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or(Error::BadInput)
+        };
+        // SAFETY: the handle is live.
+        let raw = unsafe { ffi::cf_pl_rgb_create(self.handle.as_ptr(), dim(width)?, dim(height)?) };
+        std::ptr::NonNull::new(raw)
+            .map(|raw| GpuRgb {
+                pl: self,
+                raw,
+                width,
+                height,
+            })
+            .ok_or(Error::Render)
+    }
+
+    /// Uploads an RGB frame the size of `rgb` and unpacks it on the GPU.
+    /// `row_bytes` is the card's stride.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] if the stride is not whole words covering the
+    /// width or `data` is short, [`Error::Render`] if libplacebo fails.
+    pub fn unpack_rgb(
+        &self,
+        rgb: &mut GpuRgb<'_>,
+        data: &[u8],
+        row_bytes: usize,
+        format: rgb::Format,
+    ) -> Result<(), Error> {
+        if !row_bytes.is_multiple_of(4)
+            || row_bytes < rgb.width * 4
+            || data.len() < row_bytes.saturating_mul(rgb.height)
+        {
+            return Err(Error::BadInput);
+        }
+        let format = match format {
+            rgb::Format::R210 => ffi::R210,
+            rgb::Format::Argb8 => ffi::ARGB8,
+        };
+        // SAFETY: `data` holds row_bytes * height bytes, which the shim
+        // uploads; the texture belongs to this live device, and `&mut` keeps
+        // anything else from using it meanwhile.
+        let rc = unsafe {
+            ffi::cf_pl_unpack_rgb(
+                self.handle.as_ptr(),
+                rgb.raw.as_ptr(),
+                data.as_ptr(),
+                row_bytes,
+                format,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// Renders captured RGB over the whole of `dst`, as [`render_ycbcr`]
+    /// does YCbCr, at the bit depth of its last unpack.
+    ///
+    /// [`render_ycbcr`]: Self::render_ycbcr
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo fails (see its log).
+    pub fn render_rgb(
+        &self,
+        src: &GpuRgb<'_>,
+        color: RgbSourceColor,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+    ) -> Result<(), Error> {
+        let levels = match color.levels {
+            Levels::Full => ffi::LEVELS_FULL,
+            Levels::Limited => ffi::LEVELS_LIMITED,
+        };
+        // SAFETY: the source and the texture belong to this live device.
+        let rc = unsafe {
+            ffi::cf_pl_render_rgb(
+                self.handle.as_ptr(),
+                src.raw.as_ptr(),
+                levels,
                 primaries_raw(color.primaries),
                 transfer_raw(color.transfer),
                 dst.tex.as_ptr(),

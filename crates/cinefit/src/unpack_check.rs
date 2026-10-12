@@ -1,16 +1,20 @@
-//! `cinefit gpu`'s checks of captured YCbCr: the GPU's `v210` unpack against
-//! the CPU's, bit for bit, and the render from its planes against the CPU's
-//! colour conversion.
+//! `cinefit gpu`'s checks of captured frames: for `v210`, `r210` and 8-bit
+//! ARGB, the GPU's unpack against the CPU's, bit for bit, and the render
+//! from it against the CPU's colour conversion.
 
 use std::error::Error;
 use std::time::Instant;
 
-use cinefit_render::color::ycbcr10_to_rgb;
-use cinefit_render::{Matrix, Placebo, Primaries, RgbColor, Transfer, YcbcrColor, v210};
+use cinefit_render::color::{rgb_code_to_unit, ycbcr10_to_rgb};
+use cinefit_render::{
+    Levels, Matrix, Placebo, Primaries, RgbColor, RgbSourceColor, Transfer, YcbcrColor, rgb, v210,
+};
 
 pub fn run(pl: &Placebo) -> Result<(), Box<dyn Error>> {
     unpack(pl)?;
-    render(pl)
+    render(pl)?;
+    unpack_rgb(pl)?;
+    render_rgb(pl)
 }
 
 /// xorshift64: reproducible noise, no dependency.
@@ -198,6 +202,153 @@ fn render(pl: &Placebo) -> Result<(), Box<dyn Error>> {
     }
     if failed {
         return Err("the YCbCr render differs from the CPU's conversion".into());
+    }
+    Ok(())
+}
+
+fn unpack_rgb(pl: &Placebo) -> Result<(), Box<dyn Error>> {
+    let mut noise = Noise(0x2545_F491_4F6C_DD1D);
+    // (width, height, stride beyond four bytes a pixel)
+    let sizes = [
+        (3840, 2160, 0),
+        (4096, 2160, 0),
+        (1920, 1080, 128),
+        (7, 3, 0),
+        (1, 1, 0),
+    ];
+    let mut failed = false;
+    for format in [rgb::Format::R210, rgb::Format::Argb8] {
+        let shift = 16 - format.depth();
+        for (w, h, pad) in sizes {
+            let want = rgb::Rgb {
+                width: w,
+                height: h,
+                format,
+                rgb: (0..w * h * 3)
+                    .map(|_| noise.code() >> (10 - format.depth()))
+                    .collect(),
+            };
+            let row_bytes = w * 4 + pad;
+            let mut bytes = rgb::pack(&want, row_bytes).ok_or("rgb pack")?;
+            // Noise where the unpack must not look: r210's two unused bits,
+            // ARGB8's alpha, and the padding.
+            for b in bytes.as_chunks_mut::<4>().0 {
+                b[0] |= match format {
+                    rgb::Format::R210 => (noise.code() as u8) & 0xC0,
+                    rgb::Format::Argb8 => noise.code() as u8,
+                };
+            }
+            let mut gpu = pl.rgb(w, h)?;
+            let started = Instant::now();
+            pl.unpack_rgb(&mut gpu, &bytes, row_bytes, format)?;
+            let got = gpu.download()?;
+            let took = started.elapsed();
+            let wrong = want
+                .rgb
+                .iter()
+                .zip(&got)
+                .filter(|&(&w, &g)| w << shift != g)
+                .count()
+                + want.rgb.len().abs_diff(got.len());
+            let first = want
+                .rgb
+                .iter()
+                .zip(&got)
+                .position(|(&w, &g)| w << shift != g);
+            print!(
+                "{format:?} unpack {w}x{h} (stride {row_bytes}): {wrong} components differ, {:.1} ms with upload and readback",
+                took.as_secs_f64() * 1000.0
+            );
+            match first {
+                Some(i) => {
+                    println!(
+                        "; first: component {i}, want {:#06x}, got {:#06x}",
+                        want.rgb[i] << shift,
+                        got[i]
+                    );
+                    failed = true;
+                }
+                None if wrong > 0 => {
+                    println!();
+                    failed = true;
+                }
+                None => println!(),
+            }
+        }
+    }
+    if failed {
+        return Err("the GPU's RGB unpack differs from the CPU's".into());
+    }
+    Ok(())
+}
+
+/// Renders ramps over every code of each depth, at both ranges, colour space
+/// unchanged, and compares every pixel with the CPU's scaling. The error
+/// against the other range is reported too, so a pass shows the check could
+/// tell them apart.
+fn render_rgb(pl: &Placebo) -> Result<(), Box<dyn Error>> {
+    const TOLERANCE: f64 = 3e-4;
+    let (w, h) = (1024, 64);
+    let mut failed = false;
+    for format in [rgb::Format::R210, rgb::Format::Argb8] {
+        let depth = format.depth();
+        let codes = 1usize << depth;
+        let p = rgb::Rgb {
+            width: w,
+            height: h,
+            format,
+            rgb: (0..h)
+                .flat_map(|y| (0..w).flat_map(move |x| [x, y * 16, x * 7 + y * 3]))
+                .map(|c| (c % codes) as u16)
+                .collect(),
+        };
+        let row_bytes = w * 4;
+        let bytes = rgb::pack(&p, row_bytes).ok_or("rgb pack")?;
+        let mut gpu = pl.rgb(w, h)?;
+        pl.unpack_rgb(&mut gpu, &bytes, row_bytes, format)?;
+        for (levels, other) in [
+            (Levels::Full, Levels::Limited),
+            (Levels::Limited, Levels::Full),
+        ] {
+            let (primaries, transfer) = (Primaries::Bt2020, Transfer::Pq);
+            let target = pl.target_rgba16(w, h)?;
+            pl.render_rgb(
+                &gpu,
+                RgbSourceColor {
+                    levels,
+                    primaries,
+                    transfer,
+                },
+                target.texture(),
+                RgbColor {
+                    primaries,
+                    transfer,
+                },
+            )?;
+            let out = target.download()?;
+            let (mut err, mut err_other, mut compared) = (0f64, 0f64, 0usize);
+            for (i, &code) in p.rgb.iter().enumerate() {
+                let want = rgb_code_to_unit(code, depth, levels);
+                // Limited-range codes past black or white clip; they say
+                // nothing.
+                if !(0.0..=1.0).contains(&want) {
+                    continue;
+                }
+                let got = f64::from(out[i / 3 * 4 + i % 3]) / 65535.0;
+                err = err.max((want - got).abs());
+                err_other = err_other.max((rgb_code_to_unit(code, depth, other) - got).abs());
+                compared += 1;
+            }
+            println!(
+                "{format:?} render, {levels:?} range: {compared} components, largest difference {err:.1e}, {err_other:.1e} as {other:?} (tolerance {TOLERANCE:.0e})"
+            );
+            if compared < p.rgb.len() / 2 || err > TOLERANCE || err_other <= TOLERANCE {
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        return Err("the RGB render differs from the CPU's scaling".into());
     }
     Ok(())
 }

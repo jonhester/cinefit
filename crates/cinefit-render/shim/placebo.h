@@ -95,6 +95,39 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int primaries, int trc,
                        cf_pl_tex *dst, int dst_primaries, int dst_trc);
 
+/* Captured RGB on the GPU: one rgba16 texture, w x h, each component stored
+ * as its code shifted to the top of 16 bits (10-bit << 6, 8-bit << 8), plus
+ * the texture the packed frame is uploaded into. Destroy with
+ * cf_pl_rgb_destroy before cf_pl_destroy. */
+typedef struct cf_pl_rgb cf_pl_rgb;
+
+/* Null on failure, logged. */
+cf_pl_rgb *cf_pl_rgb_create(cf_pl *pl, int w, int h);
+void cf_pl_rgb_destroy(cf_pl *pl, cf_pl_rgb *rgb);
+
+/* Capture formats cf_pl_unpack_rgb reads. */
+#define CF_PL_R210 0  /* big-endian words: 2 unused bits, 10-bit R, G, B */
+#define CF_PL_ARGB8 1 /* bytes A, R, G, B */
+
+/* Uploads a frame of the texture's size in `format` and unpacks it on the
+ * GPU. row_bytes is the capture card's stride, a multiple of 4 covering the
+ * width; data holds row_bytes * h bytes. Returns 0, or -1, logged. */
+int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *rgb, const uint8_t *data, size_t row_bytes, int format);
+
+/* Reads the texture back as stored: w * h * 4 values (R, G, B, and an opaque
+ * alpha), rows packed. For checks. Returns 0, or -1, logged. */
+int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *rgb, uint16_t *out);
+
+#define CF_PL_LEVELS_FULL 0
+#define CF_PL_LEVELS_LIMITED 1
+
+/* Renders the RGB over the whole of dst: the given range, primaries and
+ * transfer, into full-range RGB with dst_primaries and dst_trc. Uses the bit
+ * depth of the last unpack. No dithering; waits for the GPU. Returns 0, or
+ * -1, logged. */
+int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int primaries, int trc,
+                     cf_pl_tex *dst, int dst_primaries, int dst_trc);
+
 /* A w x h RGBA 16-bit texture to render into and read back, for checks. Null
  * on failure, logged. */
 cf_pl_tex *cf_pl_target_rgba16(cf_pl *pl, int w, int h);

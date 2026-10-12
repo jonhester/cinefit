@@ -47,9 +47,11 @@ On the machine with the hardware:
     cinefit pattern -t 30 [--gpu] [--hdr]   # puts a picture on the display
 
 `CINEFIT_DOVI_DUMPS=DIR cargo test -p cinefit-dovi --test dumps` decodes saved
-frames, and `CINEFIT_V210_STILLS=DIR cargo test -p cinefit-render --test
-v210_stills` unpacks saved `v210` frames on the GPU against the CPU; each is
-skipped when its variable is unset.
+frames. On the GPU against the CPU, `CINEFIT_RENDER_DUMPS=DIR cargo test -p
+cinefit-render --test dumps` unpacks a dump directory in any capture format,
+and `CINEFIT_V210_STILLS=DIR cargo test -p cinefit-render --test v210_stills`
+a directory of compressed `v210` stills. Each is skipped when its variable is
+unset.
 
 ## Hard rules
 

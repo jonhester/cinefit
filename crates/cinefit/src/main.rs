@@ -3,7 +3,7 @@
 
 mod capture;
 #[cfg(target_os = "linux")]
-mod v210_check;
+mod unpack_check;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -487,7 +487,7 @@ fn gpu() -> Result<(), Box<dyn std::error::Error>> {
         return Err("identity render changed the image".into());
     }
     #[cfg(target_os = "linux")]
-    v210_check::run(&pl)?;
+    unpack_check::run(&pl)?;
     scanout_check(&pl, w, h, &rgba)?;
 
     // The hold must end with the program: check the level goes back.
