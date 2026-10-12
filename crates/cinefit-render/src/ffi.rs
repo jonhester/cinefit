@@ -17,6 +17,18 @@ const _: () = assert!(offset_of!(Info, vulkan_api_version) == 256);
 const _: () = assert!(offset_of!(Info, max_tex_2d_dim) == 260);
 const _: () = assert!(offset_of!(Info, dma_buf_import) == 264);
 
+/// `cf_pl_dovi`.
+#[repr(C)]
+pub struct Dovi {
+    pub ycc_to_lms: [f32; 9],
+    pub offset: [f32; 3],
+    pub linear: [f32; 9],
+}
+
+const _: () = assert!(size_of::<Dovi>() == 84);
+const _: () = assert!(offset_of!(Dovi, offset) == 36);
+const _: () = assert!(offset_of!(Dovi, linear) == 48);
+
 /// Opaque `cf_pl`.
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -99,6 +111,20 @@ unsafe extern "C" {
         matrix: c_int,
         primaries: c_int,
         trc: c_int,
+        dst: *mut Tex,
+        dst_primaries: c_int,
+        dst_trc: c_int,
+    ) -> c_int;
+    pub fn cf_pl_unpack_tunnel(
+        pl: *mut Handle,
+        planes: *mut Planes,
+        data: *const u8,
+        row_bytes: usize,
+    ) -> c_int;
+    pub fn cf_pl_render_dovi(
+        pl: *mut Handle,
+        src: *mut Planes,
+        dovi: *const Dovi,
         dst: *mut Tex,
         dst_primaries: c_int,
         dst_trc: c_int,

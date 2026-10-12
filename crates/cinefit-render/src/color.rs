@@ -91,6 +91,75 @@ pub fn rgb_code_to_unit(code: u16, depth: u8, levels: Levels) -> f64 {
     }
 }
 
+/// A tunnel frame's colour conversion, from its metadata: see
+/// `cinefit_dovi::Conversion`, which this mirrors so the renderer needs no
+/// dependency on the metadata crate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DoviColor {
+    /// ICtCp to non-linear LMS; rows are outputs.
+    pub ycc_to_lms: [[f64; 3]; 3],
+    /// Subtracted from the normalised signal first.
+    pub offset: [f64; 3],
+    /// The metadata's RGB-to-LMS matrix (libplacebo's `linear`).
+    pub linear: [[f64; 3]; 3],
+}
+
+/// SMPTE ST 2084, signal 0-1 to linear 0-1 (of 10 000 nits).
+pub fn pq_eotf(e: f64) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = 2523.0 / 4096.0 * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = 2413.0 / 4096.0 * 32.0;
+    const C3: f64 = 2392.0 / 4096.0 * 32.0;
+    let p = e.max(0.0).powf(1.0 / M2);
+    ((p - C1).max(0.0) / (C2 - C3 * p)).powf(1.0 / M1)
+}
+
+/// The inverse of [`pq_eotf`].
+pub fn pq_oetf(y: f64) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = 2523.0 / 4096.0 * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = 2413.0 / 4096.0 * 32.0;
+    const C3: f64 = 2392.0 / 4096.0 * 32.0;
+    let p = y.max(0.0).powf(M1);
+    ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2)
+}
+
+/// Hunt-Pointer-Estevez LMS to BT.2020 RGB, the fixed step Dolby Vision's
+/// metadata does not carry. Taken from libplacebo (`shaders/colorspace.c`),
+/// so this reference checks how the conversion is wired, not the constant.
+const HPE_LMS_TO_BT2020: [[f64; 3]; 3] = [
+    [3.06441879, -2.16597676, 0.10155818],
+    [-0.65612108, 1.78554118, -0.12943749],
+    [0.01736321, -0.04725154, 1.03004253],
+];
+
+fn mul(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    m.map(|row| row[0] * v[0] + row[1] * v[1] + row[2] * v[2])
+}
+
+/// 12-bit tunnel codes to BT.2020 PQ RGB, 0-1: offset and ICtCp to L'M'S',
+/// PQ to linear, LMS to RGB, back to PQ. Codes may be fractional.
+///
+/// The planes hold each code as `code << 4` of 16 bits, so code `c` is the
+/// signal `16c / 65535` (within 2e-5 of `c / 4096`), and libplacebo scales
+/// the offsets by `65536 / 65535` to match: chroma code 2048 is exactly
+/// centred.
+pub fn dovi12_to_pq_rgb(y: f64, cb: f64, cr: f64, c: &DoviColor) -> [f64; 3] {
+    let x = [y, cb, cr].map(|v| v * 16.0 / 65535.0);
+    let d: [f64; 3] = std::array::from_fn(|i| x[i] - c.offset[i] * 65536.0 / 65535.0);
+    let lms = mul(&c.ycc_to_lms, d).map(pq_eotf);
+    let to_rgb: [[f64; 3]; 3] = std::array::from_fn(|r| {
+        std::array::from_fn(|k| {
+            (0..3)
+                .map(|j| HPE_LMS_TO_BT2020[r][j] * c.linear[j][k])
+                .sum()
+        })
+    });
+    mul(&to_rgb, lms).map(pq_oetf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +195,42 @@ mod tests {
         assert_eq!(rgb_code_to_unit(64, 10, Levels::Limited), 0.0);
         assert_eq!(rgb_code_to_unit(940, 10, Levels::Limited), 1.0);
         assert_eq!(rgb_code_to_unit(235, 8, Levels::Limited), 1.0);
+    }
+
+    #[test]
+    fn pq_round_trips() {
+        // Not exact at 0: the curve's foot puts 0 nits at 7e-7.
+        for e in [0.0, 0.1, 0.5, 0.75, 1.0] {
+            assert!((pq_oetf(pq_eotf(e)) - e).abs() < 1e-6);
+        }
+        // 1000 nits.
+        assert!((pq_eotf(0.751_827) - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn neutral_ictcp_is_grey_and_keeps_its_level() {
+        // A UB820's conversion (luma 1.0, offset 0, chroma centred).
+        let c = DoviColor {
+            ycc_to_lms: [
+                [1.0, 799.0 / 8192.0, 1681.0 / 8192.0],
+                [1.0, -933.0 / 8192.0, 1091.0 / 8192.0],
+                [1.0, 267.0 / 8192.0, -5545.0 / 8192.0],
+            ],
+            offset: [0.0, 0.5, 0.5],
+            linear: [
+                [17081.0 / 16384.0, -349.0 / 16384.0, -349.0 / 16384.0],
+                [-349.0 / 16384.0, 17081.0 / 16384.0, -349.0 / 16384.0],
+                [-349.0 / 16384.0, -349.0 / 16384.0, 17081.0 / 16384.0],
+            ],
+        };
+        for i in [64.0, 1024.0, 2048.0, 3079.0, 4000.0] {
+            let rgb = dovi12_to_pq_rgb(i, 2048.0, 2048.0, &c);
+            assert!(
+                (rgb[0] - rgb[1]).abs() < 1e-4 && (rgb[1] - rgb[2]).abs() < 1e-4,
+                "{i}: {rgb:?}"
+            );
+            // Grey I stays I: the matrices' rows each sum to about 1.
+            assert!((rgb[1] - i * 16.0 / 65535.0).abs() < 1e-3, "{i}: {rgb:?}");
+        }
     }
 }

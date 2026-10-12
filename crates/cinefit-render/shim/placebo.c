@@ -230,6 +230,7 @@ struct cf_pl_planes {
     pl_tex luma, chroma;
     pl_tex packed;      /* the frame as uploaded; sized on first use */
     int w, h;
+    int depth;          /* of the last unpack: 10 (v210) or 12 (tunnel) */
     bool filled;        /* an unpack has written the planes */
 };
 
@@ -380,6 +381,7 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
             .shader = &sh,
             .dispatch_size = {(groups + V210_LOCAL - 1) / V210_LOCAL, p->h, 1})))
         return -1;
+    p->depth = 10;
     p->filled = true;
     return 0;
 }
@@ -417,6 +419,10 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
                        cf_pl_tex *dst, int dst_prim, int dst_trc) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
+        return -1;
+    }
+    if (src->depth != 10) {
+        log_err(pl, "YCbCr render of planes that do not hold v210");
         return -1;
     }
     struct pl_frame image = {
@@ -631,6 +637,168 @@ int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
     struct pl_frame target = {
         .num_planes = 1,
         .planes = {{ .texture = d, .components = 3, .component_mapping = {0, 1, 2} }},
+        .repr = pl_color_repr_rgb,
+        .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
+    };
+
+    struct pl_render_params params = pl_render_default_params;
+    params.dither_params = NULL;
+    // As in cf_pl_render_ycbcr: no tone mapping between identical spaces.
+    params.peak_detect_params = NULL;
+    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    pl_gpu_finish(pl->vk->gpu);
+    return 0;
+}
+
+/* One invocation per pair of pixels: two big-endian r210 words, each 8-bit
+ * code in the top of its 10 bits. Per pixel, as HDMI packs 12-bit 4:2:2:
+ * G = Y[11:4], R = C[11:4], B = C[3:0] << 4 | Y[3:0]; C is Cb on the even
+ * pixel and Cr on the odd one (ETSI GS CCM 001 clause 6.4.1). Codes are
+ * stored shifted left by 4. */
+static const char TUNNEL_HEADER[] =
+    "uvec3 cf_rgb8(uint w) {\n"
+    "    w = (w >> 24) | ((w >> 8) & 0xFF00u) | ((w << 8) & 0xFF0000u) | (w << 24);\n"
+    "    return uvec3(w >> 22, w >> 12, w >> 2) & 0xFFu;\n"
+    "}\n"
+    "float cf_unorm12(uint code) { return float(code << 4) / 65535.0; }\n";
+
+static const char TUNNEL_BODY[] =
+    "ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (id.x < cf_pairs && id.y < cf_height) {\n"
+    "    uvec3 a = cf_rgb8(texelFetch(cf_packed, ivec2(2 * id.x, id.y), 0).r);\n"
+    "    uvec3 b = cf_rgb8(texelFetch(cf_packed, ivec2(2 * id.x + 1, id.y), 0).r);\n"
+    "    uint ya = a.g << 4 | (a.b & 0xFu), yb = b.g << 4 | (b.b & 0xFu);\n"
+    "    uint cb = a.r << 4 | a.b >> 4, cr = b.r << 4 | b.b >> 4;\n"
+    "    imageStore(cf_luma, ivec2(2 * id.x, id.y), vec4(cf_unorm12(ya), 0.0, 0.0, 1.0));\n"
+    "    imageStore(cf_luma, ivec2(2 * id.x + 1, id.y), vec4(cf_unorm12(yb), 0.0, 0.0, 1.0));\n"
+    "    imageStore(cf_chroma, ivec2(id.x, id.y), vec4(cf_unorm12(cb), cf_unorm12(cr), 0.0, 1.0));\n"
+    "}\n";
+
+int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t row_bytes) {
+    pl_gpu gpu = pl->vk->gpu;
+    if (p->w % 2) {
+        log_err(pl, "a tunnel frame has an even width");
+        return -1;
+    }
+    if (row_bytes % 4 || row_bytes < (size_t)p->w * 4) {
+        log_err(pl, "r210 stride is not whole words covering the width");
+        return -1;
+    }
+    pl_fmt f_packed = pl_find_named_fmt(gpu, "r32u");
+    if (!f_packed) {
+        log_err(pl, "no r32u texture format");
+        return -1;
+    }
+    if (!pl_tex_recreate(gpu, &p->packed, pl_tex_params(
+            .w = (int)(row_bytes / 4), .h = p->h, .format = f_packed,
+            .sampleable = true, .host_writable = true)))
+        return -1;
+    if (!pl_tex_upload(gpu, pl_tex_transfer_params(
+            .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes)))
+        return -1;
+
+    int pairs = p->w / 2;
+    pl_shader sh = pl_dispatch_begin(pl->dispatch);
+    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = "Dolby Vision tunnel unpack",
+        .header = TUNNEL_HEADER,
+        .body = TUNNEL_BODY,
+        .input = PL_SHADER_SIG_NONE,
+        .output = PL_SHADER_SIG_NONE,
+        .compute = true,
+        .compute_group_size = {RGB_LOCAL_X, RGB_LOCAL_Y},
+        .descriptors = (struct pl_shader_desc[]) {
+            {
+                .desc = { .name = "cf_packed", .type = PL_DESC_SAMPLED_TEX },
+                .binding = { .object = p->packed, .sample_mode = PL_TEX_SAMPLE_NEAREST },
+            },
+            {
+                .desc = { .name = "cf_luma", .type = PL_DESC_STORAGE_IMG,
+                          .access = PL_DESC_ACCESS_WRITEONLY },
+                .binding.object = p->luma,
+            },
+            {
+                .desc = { .name = "cf_chroma", .type = PL_DESC_STORAGE_IMG,
+                          .access = PL_DESC_ACCESS_WRITEONLY },
+                .binding.object = p->chroma,
+            },
+        },
+        .num_descriptors = 3,
+        .variables = (struct pl_shader_var[]) {
+            { .var = pl_var_int("cf_pairs"),  .data = &pairs },
+            { .var = pl_var_int("cf_height"), .data = &p->h },
+        },
+        .num_variables = 2,
+    });
+    if (!ok) {
+        pl_dispatch_abort(pl->dispatch, &sh);
+        log_err(pl, "tunnel unpack shader rejected");
+        return -1;
+    }
+    if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
+            .shader = &sh,
+            .dispatch_size = {(pairs + RGB_LOCAL_X - 1) / RGB_LOCAL_X,
+                              (p->h + RGB_LOCAL_Y - 1) / RGB_LOCAL_Y, 1})))
+        return -1;
+    p->depth = 12;
+    p->filled = true;
+    return 0;
+}
+
+int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
+                      cf_pl_tex *dst, int dst_prim, int dst_trc) {
+    if (!src->filled) {
+        log_err(pl, "planes read before any frame was unpacked into them");
+        return -1;
+    }
+    if (src->depth != 12) {
+        log_err(pl, "Dolby Vision render of planes that do not hold a tunnel");
+        return -1;
+    }
+    struct pl_dovi_metadata meta = {0};
+    for (int i = 0; i < 3; i++) {
+        meta.nonlinear_offset[i] = d->offset[i];
+        for (int j = 0; j < 3; j++) {
+            meta.nonlinear.m[i][j] = d->ycc_to_lms[3 * i + j];
+            meta.linear.m[i][j] = d->linear[3 * i + j];
+        }
+        // The player has composed the picture already: reshaping is the
+        // identity, one polynomial piece y = x over the whole range.
+        meta.comp[i].num_pivots = 2;
+        meta.comp[i].pivots[0] = 0.0f;
+        meta.comp[i].pivots[1] = 1.0f;
+        meta.comp[i].method[0] = 0;
+        meta.comp[i].poly_coeffs[0][1] = 1.0f;
+    }
+
+    struct pl_frame image = {
+        .num_planes = 2,
+        .planes = {
+            { .texture = src->luma, .components = 1, .component_mapping = {PL_CHANNEL_Y} },
+            { .texture = src->chroma, .components = 2,
+              .component_mapping = {PL_CHANNEL_CB, PL_CHANNEL_CR} },
+        },
+        .repr = {
+            .sys = PL_COLOR_SYSTEM_DOLBYVISION,
+            .levels = PL_COLOR_LEVELS_FULL,
+            // Described as 16-bit, not 12 shifted by 4: libplacebo scales
+            // the offsets by 2^n / (2^n - 1) for the texture's n bits, and
+            // only with n the texture's own 16 does chroma code 2048 land
+            // exactly on the 0.5 centre. The range is in the matrix.
+            .bits = { .sample_depth = 16, .color_depth = 16, .bit_shift = 0 },
+            .dovi = &meta,
+        },
+        // Dolby Vision's output is BT.2020 PQ, whatever the card reports
+        // (a tunnel arrives labelled SDR).
+        .color = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ },
+    };
+    // Co-sited, as clause 6.4.1 pairs Cb[0] and Cr[0] with Y[0].
+    pl_frame_set_chroma_location(&image, PL_CHROMA_LEFT);
+
+    pl_tex t = unwrap_tex(dst);
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes = {{ .texture = t, .components = 3, .component_mapping = {0, 1, 2} }},
         .repr = pl_color_repr_rgb,
         .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
     };

@@ -3,6 +3,8 @@
 
 mod capture;
 #[cfg(target_os = "linux")]
+mod tunnel_check;
+#[cfg(target_os = "linux")]
 mod unpack_check;
 
 use std::path::PathBuf;
@@ -488,6 +490,8 @@ fn gpu() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(target_os = "linux")]
     unpack_check::run(&pl)?;
+    #[cfg(target_os = "linux")]
+    tunnel_check::run(&pl)?;
     scanout_check(&pl, w, h, &rgba)?;
 
     // The hold must end with the program: check the level goes back.
