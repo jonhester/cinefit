@@ -16,11 +16,15 @@ fn main() {
         std::env::var("CINEFIT_LIBPLACEBO")
             .expect("CINEFIT_LIBPLACEBO: the prefix scripts/build-libplacebo.sh installed into"),
     );
-    let mut pc_path: Vec<PathBuf> = ["lib/x86_64-linux-gnu/pkgconfig", "lib/aarch64-linux-gnu/pkgconfig", "lib/pkgconfig"]
-        .iter()
-        .map(|d| prefix.join(d))
-        .filter(|d| d.is_dir())
-        .collect();
+    let mut pc_path: Vec<PathBuf> = [
+        "lib/x86_64-linux-gnu/pkgconfig",
+        "lib/aarch64-linux-gnu/pkgconfig",
+        "lib/pkgconfig",
+    ]
+    .iter()
+    .map(|d| prefix.join(d))
+    .filter(|d| d.is_dir())
+    .collect();
     if let Some(existing) = std::env::var_os("PKG_CONFIG_PATH") {
         pc_path.extend(std::env::split_paths(&existing));
     }
