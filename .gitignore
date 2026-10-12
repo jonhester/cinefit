@@ -8,3 +8,6 @@ rustc-ice-*.txt
 
 # libplacebo built by scripts/build-libplacebo.sh.
 /.deps/
+
+# Per-machine notes for agents; may hold private details.
+CLAUDE.local.md
