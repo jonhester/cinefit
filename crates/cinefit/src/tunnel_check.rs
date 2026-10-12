@@ -103,7 +103,7 @@ fn render(pl: &Placebo, p: &v210::Planes) -> Result<Vec<f64>, Box<dyn Error>> {
     let mut planes = pl.planes(p.width, p.height)?;
     pl.unpack_tunnel(&mut planes, &bytes, row_bytes)?;
     let target = pl.target_rgba16(p.width, p.height)?;
-    pl.render_dovi(&planes, &UB820, target.texture(), OUT)?;
+    pl.render_dovi(&planes, &UB820, target.texture(), OUT, None)?;
     Ok(target
         .download()?
         .iter()

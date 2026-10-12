@@ -47,6 +47,8 @@ On the machine with the hardware:
     cinefit capture -t 20 [--dump DIR] # what arrives on the input
     cinefit capture -t 180 --record DIR # every frame, through zstd (needs zstd)
     cinefit pattern -t 30 [--gpu] [--hdr]   # puts a picture on the display
+    cinefit play --dry-run             # capture, mode, signalling, first render; display untouched
+    cinefit play -t 30                 # capture to screen: puts the input on the display
 
 `CINEFIT_DOVI_DUMPS=DIR cargo test -p cinefit-dovi --test dumps` decodes saved
 frames. On the GPU against the CPU, `CINEFIT_RENDER_DUMPS=DIR cargo test -p

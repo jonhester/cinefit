@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 mod capture;
+#[cfg(target_os = "linux")]
+mod play;
 mod record;
 #[cfg(target_os = "linux")]
 mod tunnel_check;
@@ -96,6 +98,34 @@ enum Command {
         #[arg(long, requires = "gpu")]
         no_pstate: bool,
     },
+    /// Capture to screen: show the input on the display, at the source's
+    /// frame rate, with its HDR signalling, and measure what arrived and what
+    /// was shown. Needs the input and the display to itself.
+    Play {
+        /// How long to run, in seconds.
+        #[arg(short = 't', long, default_value_t = 30.0)]
+        seconds: f64,
+        /// Which capture device, by its index in `cinefit probe`.
+        #[arg(short, long, default_value_t = 0)]
+        device: usize,
+        /// The DRM device; by default the first with a connected display.
+        #[arg(long)]
+        card: Option<PathBuf>,
+        /// The panel's width and height: the output's size. The default is a
+        /// 17:9 4K panel.
+        #[arg(long, default_value_t = 4096)]
+        width: u16,
+        #[arg(long, default_value_t = 2160)]
+        height: u16,
+        /// Leave the GPU's clocks to the driver's default policy instead of
+        /// holding the standard stable power state.
+        #[arg(long)]
+        no_pstate: bool,
+        /// Stop before the modeset: pre-roll, mode, signalling and the first
+        /// render, with the display untouched.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -129,6 +159,17 @@ fn main() -> ExitCode {
             });
             pattern(seconds, mode, card, hdr, change_max_cll, gpu, !no_pstate)
         }
+        Command::Play {
+            seconds,
+            device,
+            card,
+            width,
+            height,
+            no_pstate,
+            dry_run,
+        } => play(play_options(
+            seconds, device, card, width, height, !no_pstate, dry_run,
+        )),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -473,6 +514,49 @@ fn pattern(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn play_options(
+    seconds: f64,
+    device: usize,
+    card: Option<PathBuf>,
+    width: u16,
+    height: u16,
+    pstate: bool,
+    dry_run: bool,
+) -> play::Options {
+    play::Options {
+        seconds,
+        device,
+        card,
+        width,
+        height,
+        pstate,
+        dry_run,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn play(opts: play::Options) -> Result<(), Box<dyn std::error::Error>> {
+    play::run(opts)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn play_options(
+    _seconds: f64,
+    _device: usize,
+    _card: Option<PathBuf>,
+    _width: u16,
+    _height: u16,
+    _pstate: bool,
+    _dry_run: bool,
+) {
+}
+
+#[cfg(not(target_os = "linux"))]
+fn play(_opts: ()) -> Result<(), Box<dyn std::error::Error>> {
+    Err("playing is only supported on Linux".into())
+}
+
 fn gpu() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     let clocks = {
@@ -576,7 +660,8 @@ fn scanout_check(
     pl.render(&src, &target, 0.0)?;
     let took = started.elapsed();
 
-    // XRGB8888 is B, G, R, X in memory.
+    // Whatever the scanout format, read back as 8-bit RGB to compare.
+    let fourcc = buf.fourcc;
     let (max_diff, first_bad, samples) = out.read_scanout(frame, |px, stride| {
         let mut worst = 0u8;
         let mut first_bad = None;
@@ -584,15 +669,13 @@ fn scanout_check(
             for x in 0..w {
                 let o = y * stride + x * 4;
                 let i = (y * w + x) * 4;
-                let d = [
-                    (px[o + 2], rgba[i]),
-                    (px[o + 1], rgba[i + 1]),
-                    (px[o], rgba[i + 2]),
-                ]
-                .iter()
-                .map(|(got, want)| got.abs_diff(*want))
-                .max()
-                .unwrap_or(0);
+                let word = [px[o], px[o + 1], px[o + 2], px[o + 3]];
+                let got = cinefit_kms::scanout::decode(fourcc, word)
+                    .map_or([0; 3], |c| c.map(|v| (v * 255.0).round() as u8));
+                let d = (0..3)
+                    .map(|c| got[c].abs_diff(rgba[i + c]))
+                    .max()
+                    .unwrap_or(0);
                 if d > 1 && first_bad.is_none() {
                     first_bad = Some((x, y, px[o..o + 4].to_vec(), rgba[i..i + 4].to_vec()));
                 }
@@ -623,7 +706,8 @@ fn scanout_check(
         }
     }
     println!(
-        "scanout render {w}x{h} (GBM, modifier {:#x}, stride {}): largest difference {max_diff} (of 255), {:.1} ms",
+        "scanout render {w}x{h} (GBM, {}, modifier {:#x}, stride {}): largest difference {max_diff} (of 255), {:.1} ms",
+        String::from_utf8_lossy(&fourcc.to_le_bytes()),
         buf.modifier,
         buf.stride,
         took.as_secs_f64() * 1000.0

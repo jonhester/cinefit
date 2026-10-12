@@ -29,6 +29,19 @@ impl ModeTiming {
         f64::from(self.clock_khz) * 1000.0 / pixels
     }
 
+    /// The deepest colour HDMI 2.0 carries at this mode, for `max bpc`: its
+    /// TMDS character rate is the pixel clock times bpc / 8, at most 600 MHz.
+    /// 4096x2160 at 23.976 (297 MHz) takes 10 bits; at 59.94 (593 MHz), 10
+    /// bits would need 742, so 8. Asked for more than fits, amdgpu silently
+    /// falls back to 4:2:0 rather than failing (the C++ version's finding).
+    pub fn hdmi_bpc(&self) -> u8 {
+        if u64::from(self.clock_khz) * 10 / 8 <= 600_000 {
+            10
+        } else {
+            8
+        }
+    }
+
     /// One refresh period.
     pub fn period(&self) -> Duration {
         let hz = self.refresh_hz();
@@ -245,5 +258,14 @@ mod tests {
         p.on_flip(u32::MAX, Duration::ZERO);
         p.on_flip(0, Duration::from_millis(42));
         assert_eq!(p.missed, 0);
+    }
+
+    #[test]
+    fn deep_colour_only_where_the_link_carries_it() {
+        // 4096x2160: 23.976 and 59.94 Hz, as the JVC offers them.
+        assert_eq!(mode(4096, 2160, 296_703, 5500, 2250).hdmi_bpc(), 10);
+        assert_eq!(mode(4096, 2160, 593_407, 4400, 2250).hdmi_bpc(), 8);
+        // 600 MHz exactly fits.
+        assert_eq!(mode(4096, 2160, 480_000, 4400, 2250).hdmi_bpc(), 10);
     }
 }
