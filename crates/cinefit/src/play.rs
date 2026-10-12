@@ -40,9 +40,9 @@ pub struct Options {
     pub seconds: f64,
     pub device: usize,
     pub card: Option<PathBuf>,
-    /// The panel's size; the output runs at this size and the source's rate.
-    pub width: u16,
-    pub height: u16,
+    /// The settings: the panel's size (the output runs at it, at the
+    /// source's rate) and the RGB input range.
+    pub config: crate::config::Config,
     pub pstate: bool,
     /// Everything up to the modeset (pre-roll, mode, signalling, the first
     /// render into a scanout buffer), then stop: the display is not touched.
@@ -338,6 +338,8 @@ struct Target<'a, 'p> {
     tex: &'a Texture<'p>,
     size: (u32, u32),
     color: RgbColor,
+    /// What plain RGB input's codes mean (the `input.rgb_range` setting).
+    rgb_range: Levels,
 }
 
 /// Unpacks `frame` and renders it, its shape kept, into `dst`. Returns false
@@ -403,10 +405,9 @@ fn render<'p>(
             pl.unpack_rgb(r, pixels.bytes(), info.row_bytes, format)?;
             stages.unpack.push(ms(t));
             let t = Instant::now();
-            // Limited until the range is a setting (#23): HDMI's default for
-            // video formats, and the card does not report it.
+            // The card does not report RGB's range: the setting says (#23).
             let color = RgbSourceColor {
-                levels: Levels::Limited,
+                levels: dst.rgb_range,
                 primaries: ycbcr_color(info).primaries,
                 transfer: ycbcr_color(info).transfer,
             };
@@ -495,8 +496,8 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     println!("output: {}", out.describe());
     let modes = out.modes();
     let want = cinefit_kms::ModeRequest {
-        width: opts.width,
-        height: opts.height,
+        width: opts.config.width,
+        height: opts.config.height,
         refresh_hz: input.frames_per_second(),
     };
     let Some(index) = cinefit_kms::choose_mode(&modes, &want) else {
@@ -568,6 +569,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         tex: &targets[b],
         size,
         color,
+        rgb_range: opts.config.rgb_range,
     };
     if !render(
         &pl,
@@ -692,8 +694,8 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         match latest_want.take().and_then(|w| policy.next(&w, now)) {
             Some(a @ follow::Action::Modeset(w)) => {
                 let request = cinefit_kms::ModeRequest {
-                    width: opts.width,
-                    height: opts.height,
+                    width: opts.config.width,
+                    height: opts.config.height,
                     refresh_hz: f64::from(w.rate_mhz) / 1000.0,
                 };
                 let hdr = match w.signal {
@@ -873,7 +875,7 @@ struct Counts {
 fn describe(kind: Kind) -> String {
     match kind {
         Kind::Ycbcr(c) => format!("YCbCr {:?} {:?} {:?}", c.matrix, c.primaries, c.transfer),
-        Kind::Rgb(f) => format!("RGB {f:?}, limited range assumed"),
+        Kind::Rgb(f) => format!("RGB {f:?}, range from input.rgb_range"),
         Kind::Tunnel => "Dolby Vision tunnel".into(),
         Kind::Unsupported(f) => format!("{f}, unsupported"),
     }
