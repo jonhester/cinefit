@@ -39,6 +39,10 @@ typedef struct {
     int64_t input_connections;       /* BMDVideoConnection bits, or CF_DL_UNKNOWN */
     int32_t input_format_detection;  /* 1, 0, or CF_DL_UNKNOWN */
     int32_t hdr_metadata;            /* 1, 0, or CF_DL_UNKNOWN */
+    int64_t edid_dynamic_range;      /* BMDDynamicRange bits the input EDID
+                                        advertises, or CF_DL_UNKNOWN. Read
+                                        only: writing it is an upstream
+                                        hotplug. */
 } cf_dl_device_info;
 
 /* Writes the driver's API version into *version, encoded like the SDK's

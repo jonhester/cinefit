@@ -79,6 +79,10 @@ fn probe() -> Result<(), Box<dyn std::error::Error>> {
         println!("  HDMI input:       {}", yn(d.hdmi_input));
         println!("  format detection: {}", yn(d.input_format_detection));
         println!("  HDR metadata:     {}", yn(d.hdr_metadata));
+        match d.input_edid {
+            Some(e) => println!("  input EDID:       {e}"),
+            None => println!("  input EDID:       unreported"),
+        }
         match d.persistent_id {
             Some(id) => println!("  persistent ID:    {id:#x}"),
             None => println!("  persistent ID:    unreported"),
@@ -134,7 +138,18 @@ fn capture(
     let stats = Arc::new(Mutex::new(capture::Stats::default()));
     let started = Instant::now();
     let running = device.start_capture(capture::Recorder::new(Arc::clone(&stats), dumper))?;
-    std::thread::sleep(run_for);
+    // Ctrl-C ends the run early and still prints the summary; a second one
+    // exits at once, in case stopping itself hangs.
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let mut presses = 0;
+    ctrlc::set_handler(move || {
+        presses += 1;
+        if presses > 1 {
+            std::process::exit(130);
+        }
+        let _ = stop_tx.send(());
+    })?;
+    let interrupted = stop_rx.recv_timeout(run_for).is_ok();
     // Measured before stopping: frames stop counting here, not after the stop
     // has finished.
     let ran = started.elapsed();
@@ -142,6 +157,9 @@ fn capture(
     // Stops the input; no callback runs after this.
     drop(running);
 
+    if interrupted {
+        println!("stopped early by Ctrl-C");
+    }
     print!("{}", capture::lock(&stats).summary(ran, failed_restarts));
     // Dropping the capture dropped the handler and its sender, so the writer
     // finishes once the queue is written.

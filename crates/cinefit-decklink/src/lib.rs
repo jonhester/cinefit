@@ -15,9 +15,34 @@ use std::ffi::CStr;
 use std::fmt;
 use std::ptr::NonNull;
 
-// Bits from the SDK's BMDVideoIOSupport and BMDVideoConnection.
+// Bits from the SDK's BMDVideoIOSupport, BMDVideoConnection and
+// BMDDynamicRange (where SDR is 0: always implied).
 const DEVICE_SUPPORTS_CAPTURE: i64 = 1 << 0;
 const VIDEO_CONNECTION_HDMI: i64 = 1 << 1;
+const DYNAMIC_RANGE_PQ: i64 = 1 << 29;
+const DYNAMIC_RANGE_HLG: i64 = 1 << 30;
+
+/// What the card's HDMI input EDID tells sources it accepts. SDR is always
+/// accepted. Sources only send what the EDID they see allows, though a
+/// splitter in between may present its own EDID instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdidDynamicRange {
+    pub pq: bool,
+    pub hlg: bool,
+}
+
+impl fmt::Display for EdidDynamicRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SDR")?;
+        if self.pq {
+            f.write_str(", PQ")?;
+        }
+        if self.hlg {
+            f.write_str(", HLG")?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -110,6 +135,7 @@ pub struct DeviceInfo {
     pub hdmi_input: Option<bool>,
     pub input_format_detection: Option<bool>,
     pub hdr_metadata: Option<bool>,
+    pub input_edid: Option<EdidDynamicRange>,
 }
 
 impl From<&ffi::DeviceInfo> for DeviceInfo {
@@ -124,6 +150,10 @@ impl From<&ffi::DeviceInfo> for DeviceInfo {
             hdmi_input: int(raw.input_connections).map(|b| b & VIDEO_CONNECTION_HDMI != 0),
             input_format_detection: flag(raw.input_format_detection),
             hdr_metadata: flag(raw.hdr_metadata),
+            input_edid: int(raw.edid_dynamic_range).map(|b| EdidDynamicRange {
+                pq: b & DYNAMIC_RANGE_PQ != 0,
+                hlg: b & DYNAMIC_RANGE_HLG != 0,
+            }),
         }
     }
 }
@@ -249,6 +279,7 @@ mod tests {
         assert_eq!(info.hdmi_input, None);
         assert_eq!(info.input_format_detection, None);
         assert_eq!(info.hdr_metadata, None);
+        assert_eq!(info.input_edid, None);
     }
 
     #[test]
@@ -303,5 +334,36 @@ mod tests {
     #[test]
     fn unterminated_string_reads_as_empty() {
         assert_eq!(c_string(&[b'x'; 4]), "");
+    }
+
+    #[test]
+    fn edid_dynamic_range_decodes() {
+        let mut r = raw("card");
+        r.edid_dynamic_range = DYNAMIC_RANGE_PQ;
+        let e = DeviceInfo::from(&r).input_edid.expect("reported");
+        assert_eq!(
+            e,
+            EdidDynamicRange {
+                pq: true,
+                hlg: false
+            }
+        );
+        assert_eq!(e.to_string(), "SDR, PQ");
+        r.edid_dynamic_range = 0;
+        assert_eq!(
+            DeviceInfo::from(&r)
+                .input_edid
+                .expect("reported")
+                .to_string(),
+            "SDR"
+        );
+        r.edid_dynamic_range = DYNAMIC_RANGE_PQ | DYNAMIC_RANGE_HLG;
+        assert_eq!(
+            DeviceInfo::from(&r)
+                .input_edid
+                .expect("reported")
+                .to_string(),
+            "SDR, PQ, HLG"
+        );
     }
 }
