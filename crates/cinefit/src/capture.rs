@@ -324,14 +324,20 @@ pub struct Recorder {
     started: Instant,
     stats: Arc<Mutex<Stats>>,
     dump: Option<Dumper>,
+    clip: Option<Arc<crate::record::ClipWriter>>,
 }
 
 impl Recorder {
-    pub fn new(stats: Arc<Mutex<Stats>>, dump: Option<Dumper>) -> Self {
+    pub fn new(
+        stats: Arc<Mutex<Stats>>,
+        dump: Option<Dumper>,
+        clip: Option<Arc<crate::record::ClipWriter>>,
+    ) -> Self {
         Self {
             started: Instant::now(),
             stats,
             dump,
+            clip,
         }
     }
 }
@@ -415,6 +421,9 @@ impl Handler for Recorder {
         }
         let rows =
             frame.pixels().and_then(|p| {
+                if let Some(clip) = &self.clip {
+                    clip.offer(at, &info, p.bytes());
+                }
                 if let Some(dump) = &self.dump {
                     dump.offer(at, &info, p.bytes());
                 }

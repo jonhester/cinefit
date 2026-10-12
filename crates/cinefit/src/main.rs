@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod capture;
+mod record;
 #[cfg(target_os = "linux")]
 mod unpack_check;
 
@@ -47,6 +48,11 @@ enum Command {
         /// Seconds between saved frames.
         #[arg(long, default_value_t = 1.0, requires = "dump")]
         dump_every: f64,
+        /// Record every frame, losslessly through zstd, into this directory
+        /// (frames.zst, frames.csv), as the C++ version records clips.
+        /// Captured content: keep it outside any repository.
+        #[arg(long, conflicts_with = "dump")]
+        record: Option<PathBuf>,
     },
     /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
     /// an identity render read back and compared. Touches no display.
@@ -99,7 +105,8 @@ fn main() -> ExitCode {
             device,
             dump,
             dump_every,
-        } => capture(seconds, device, dump, dump_every),
+            record,
+        } => capture(seconds, device, dump, dump_every, record),
         Command::Pattern {
             seconds,
             mode,
@@ -168,6 +175,7 @@ fn capture(
     index: usize,
     dump_dir: Option<PathBuf>,
     dump_every: f64,
+    record_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let run_for = Duration::try_from_secs_f64(seconds)
         .ok()
@@ -209,7 +217,15 @@ fn capture(
 
     let stats = Arc::new(Mutex::new(capture::Stats::default()));
     let started = Instant::now();
-    let running = device.start_capture(capture::Recorder::new(Arc::clone(&stats), dumper))?;
+    let clip = match &record_dir {
+        Some(dir) => Some(Arc::new(record::ClipWriter::create(dir)?)),
+        None => None,
+    };
+    let running = device.start_capture(capture::Recorder::new(
+        Arc::clone(&stats),
+        dumper,
+        clip.clone(),
+    ))?;
     // Ctrl-C ends the run early and still prints the summary; a second one
     // exits at once, in case stopping itself hangs.
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -233,6 +249,15 @@ fn capture(
         println!("stopped early by Ctrl-C");
     }
     print!("{}", capture::lock(&stats).summary(ran, failed_restarts));
+    if let Some(clip) = &clip {
+        let r = clip.finish()?;
+        println!(
+            "recorded {} frames to {} ({} dropped: no buffer free)",
+            r.written,
+            clip.dir().display(),
+            r.dropped
+        );
+    }
     // Dropping the capture dropped the handler and its sender, so the writer
     // finishes once the queue is written.
     if let (Some(writer), Some(dir)) = (writer, &dump_dir) {
