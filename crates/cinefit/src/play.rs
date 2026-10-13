@@ -26,7 +26,7 @@ use cinefit_render::{
     Curve, DoviColor, GpuPlanes, GpuRgb, Levels, Mapping, Matrix, Placebo, Primaries, Rect,
     RgbColor, RgbSourceColor, Texture, Transfer, View, YcbcrColor, rgb,
 };
-use tracing::{info, warn};
+use log::{info, warn};
 
 /// Frames of unchanged input before the output is chosen. The first frames
 /// after a change can carry the wrong EOTF (the C++ version's finding), so
@@ -586,17 +586,17 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         Err(e) => eprintln!("log: not written: {e}"),
     }
     let args: Vec<String> = std::env::args().collect();
-    tracing::debug!("{}", args.join(" "));
+    log::debug!("{}", args.join(" "));
     // The settings as this run read them: a question about a run is often
     // which setting was on.
-    tracing::debug!(
+    log::debug!(
         "settings:\n{}",
         crate::config::render(&opts.config).trim_end()
     );
     let result = play(opts);
     if let Err(e) = &result {
         // main prints it to the terminal.
-        tracing::error!(target: runlog::FILE_ONLY, "{e}");
+        log::error!(target: runlog::FILE_ONLY, "{e}");
     }
     result
 }

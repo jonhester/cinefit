@@ -18,9 +18,9 @@ clap = { version = "4.5", features = ["derive"] }
 # capture input is stopped rather than left enabled in the driver.
 ctrlc = { version = "3.4", features = ["termination"] }
 # Logging (runlog.rs): play's lines to the terminal and to a file per run.
+fern = "0.7"
+log = "0.4"
 time = { version = "0.3", features = ["formatting", "macros"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "time"] }
 # The settings file (config.rs): parsed into a table, no derive needed.
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
