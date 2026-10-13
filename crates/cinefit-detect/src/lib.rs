@@ -13,6 +13,7 @@
 //! samples, and a frame with no bars costs a handful of rows.
 
 pub mod bars;
+pub mod cuts;
 #[cfg(test)]
 mod synth;
 
@@ -54,6 +55,11 @@ impl<'a> V210<'a> {
                 height,
                 row_bytes,
             })
+    }
+
+    /// The frame's bytes, as given.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     /// Row `y`'s groups, each as its four words, read once.
