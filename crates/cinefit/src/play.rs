@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::follow;
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
@@ -118,6 +119,9 @@ struct Tunnel {
     color: DoviColor,
     source_min_pq: u16,
     source_max_pq: u16,
+    /// This scene's brightest maxRGB, as a 12-bit PQ code (level 1
+    /// `max_PQ`): the same measure as MaxCLL, per scene.
+    scene_max_pq: Option<u16>,
 }
 
 /// Decodes the tunnel in an `r210` frame, if it carries one. `None` when no
@@ -141,6 +145,7 @@ fn decode_tunnel(info: &FrameInfo, bytes: &[u8]) -> Option<Option<Tunnel>> {
         },
         source_min_pq: m.source_min_pq,
         source_max_pq: m.source_max_pq,
+        scene_max_pq: m.level1.map(|l| l.max_pq),
     }))
 }
 
@@ -193,17 +198,34 @@ fn output_for(
         max_fall: 0.0,
     };
     match kind {
-        // The grade's range as mastering. MaxCLL stays 0, "unknown": a
-        // tunnel carries none, and whether the JVC follows a per-scene value
-        // is not measured yet.
-        Kind::Tunnel => (
-            Some(cinefit_kms::HdrStatic {
-                max_mastering: tunnel.map_or(0.0, |t| cinefit_dovi::pq_to_nits(t.source_max_pq)),
-                min_mastering: tunnel.map_or(0.0, |t| cinefit_dovi::pq_to_nits(t.source_min_pq)),
-                ..base
-            }),
-            pq_out,
-        ),
+        // The grade's range as mastering, and this scene's peak as MaxCLL:
+        // the JVC re-derives its curve from a MaxCLL change mid-stream with
+        // no resync (measured 2026-10-12), so the curve follows the film
+        // scene by scene. Capped at the grade's peak; 0, "unknown", when the
+        // scene has no level 1.
+        Kind::Tunnel => {
+            let mastering = tunnel.map_or(0.0, |t| cinefit_dovi::pq_to_nits(t.source_max_pq));
+            let scene = tunnel
+                .and_then(|t| t.scene_max_pq)
+                .map_or(0.0, cinefit_dovi::pq_to_nits);
+            (
+                Some(cinefit_kms::HdrStatic {
+                    max_mastering: mastering,
+                    min_mastering: tunnel
+                        .map_or(0.0, |t| cinefit_dovi::pq_to_nits(t.source_min_pq)),
+                    // Whole nits: the blob carries no finer, and a value that
+                    // rounds the same is no change to send.
+                    max_cll: if mastering > 0.0 {
+                        scene.min(mastering)
+                    } else {
+                        scene
+                    }
+                    .round(),
+                    ..base
+                }),
+                pq_out,
+            )
+        }
         Kind::Ycbcr(c) if c.transfer == Transfer::Pq => {
             // The source's own values; any it does not send stay unknown (0)
             // or default to BT.2020 D65.
@@ -246,6 +268,38 @@ fn output_for(
             },
         ),
     }
+}
+
+/// The policy's view of an output's signalling.
+fn signal_of(hdr: Option<cinefit_kms::HdrStatic>) -> follow::Signal {
+    hdr.map_or(follow::Signal::Sdr, follow::Signal::Hdr)
+}
+
+/// What a frame renders into for a signalling: BT.2020 PQ or HLG for HDR,
+/// BT.709 SDR otherwise.
+fn color_for(signal: follow::Signal) -> RgbColor {
+    match signal {
+        follow::Signal::Hdr(h) if h.eotf == cinefit_kms::Eotf::Hlg => RgbColor {
+            primaries: Primaries::Bt2020,
+            transfer: Transfer::Hlg,
+        },
+        follow::Signal::Hdr(_) => RgbColor {
+            primaries: Primaries::Bt2020,
+            transfer: Transfer::Pq,
+        },
+        follow::Signal::Sdr => RgbColor {
+            primaries: Primaries::Bt709,
+            transfer: Transfer::Bt1886,
+        },
+    }
+}
+
+/// A source's frame rate in millihertz, from its exact fraction.
+fn rate_mhz(f: &InputFormat) -> u32 {
+    if f.frame_duration <= 0 {
+        return 0;
+    }
+    ((f.time_scale as f64 * 1000.0) / f.frame_duration as f64).round() as u32
 }
 
 /// GPU textures for the source, made when its size first appears.
@@ -458,7 +512,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     };
     let mode = modes[index];
     println!("mode: {mode}");
-    let (hdr, out_color) = output_for(
+    let (hdr, mut out_color) = output_for(
         key.kind,
         first.info().color.hdr.as_ref(),
         last_tunnel.as_ref(),
@@ -510,10 +564,10 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     // first frame is the source's.
     let mut sources = Sources::default();
     let mut stages = Stages::default();
-    let target = |b: usize| Target {
+    let target = |b: usize, color: RgbColor| Target {
         tex: &targets[b],
         size,
-        color: out_color,
+        color,
     };
     if !render(
         &pl,
@@ -521,7 +575,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         key.kind,
         last_tunnel.as_ref(),
         &mut sources,
-        &target(0),
+        &target(0, out_color),
         &mut stages,
     )? {
         return Err("the first frame could not be rendered".into());
@@ -547,6 +601,10 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     out.set_hdr(hdr);
     out.modeset(index, buffers[0])?;
     println!("after modeset: {}", out.hdr_state());
+    let mut policy = follow::Policy::new(follow::Want {
+        rate_mhz: rate_mhz(&input),
+        signal: signal_of(hdr),
+    });
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -562,9 +620,13 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     // The loop: with nothing rendered yet, wait a little for a frame and
     // render it into a free buffer; then wait for the vblank and queue
     // whatever is ready, or the same buffer again so the vblanks keep coming.
-    let period = mode.period();
-    let take_timeout = period.mul_f64(0.8).min(Duration::from_millis(35));
+    let mut period = mode.period();
+    let mut take_timeout = period.mul_f64(0.8).min(Duration::from_millis(35));
     let mut pacing = cinefit_kms::Pacing::default();
+    // Pacing per output mode: a modeset changes the period it is judged by.
+    let mut finished: Vec<(String, Duration, cinefit_kms::Pacing)> = Vec::new();
+    let mut mode_name = mode.to_string();
+    let mut latest_want: Option<follow::Want> = None;
     let (mut front, mut pending) = (0usize, 0usize);
     out.flip(buffers[front])?;
     let mut ready: Option<usize> = None;
@@ -582,18 +644,39 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
             if k != key {
                 counts.format_changes += 1;
             }
+            // What the output should be for this frame, for the policy after
+            // the next flip. The rate is the input's, as the card reported it.
+            // A PQ frame without its metadata block is not a change of
+            // metadata: the card attaches it only to frames it flags, and
+            // treating its absence as zeros would flap the output.
+            let pq_without_metadata = matches!(k.kind, Kind::Ycbcr(c) if c.transfer == Transfer::Pq)
+                && frame.info().color.hdr.is_none();
+            if !matches!(k.kind, Kind::Unsupported(_))
+                && !pq_without_metadata
+                && let Some(f) = *format.lock().unwrap_or_else(PoisonError::into_inner)
+            {
+                let (hdr, _) = output_for(
+                    k.kind,
+                    frame.info().color.hdr.as_ref(),
+                    last_tunnel.as_ref(),
+                );
+                latest_want = Some(follow::Want {
+                    rate_mhz: rate_mhz(&f),
+                    signal: signal_of(hdr),
+                });
+            }
             let free = (0..BUFFERS)
                 .find(|&b| b != front && b != pending)
                 .expect("three buffers, two in use");
-            // A changed input is rendered into the output as it stands, which
-            // libplacebo maps to; following it with a new mode is next.
+            // Rendered into the output as it stands, which libplacebo maps
+            // to, until the policy moves the output.
             if render(
                 &pl,
                 &frame,
                 k.kind,
                 last_tunnel.as_ref(),
                 &mut sources,
-                &target(free),
+                &target(free, out_color),
                 &mut stages,
             )? {
                 ready = Some(free);
@@ -604,6 +687,82 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         let flip = out.wait_flip()?;
         pacing.on_flip(flip.sequence, flip.at);
         front = pending;
+        // Nothing is in flight now: the moment for a modeset or new metadata.
+        let now = run_started.elapsed();
+        match latest_want.take().and_then(|w| policy.next(&w, now)) {
+            Some(a @ follow::Action::Modeset(w)) => {
+                let request = cinefit_kms::ModeRequest {
+                    width: opts.width,
+                    height: opts.height,
+                    refresh_hz: f64::from(w.rate_mhz) / 1000.0,
+                };
+                let hdr = match w.signal {
+                    follow::Signal::Hdr(h) => Some(h),
+                    follow::Signal::Sdr => None,
+                };
+                let result = match cinefit_kms::choose_mode(&modes, &request) {
+                    None => Err(format!(
+                        "no {}x{} mode at {:.3} Hz",
+                        request.width, request.height, request.refresh_hz
+                    )),
+                    Some(i) => {
+                        out.set_hdr(hdr);
+                        let show = ready.unwrap_or(front);
+                        out.modeset(i, buffers[show])
+                            .map(|()| (i, show))
+                            .map_err(|e| e.to_string())
+                    }
+                };
+                match result {
+                    Ok((i, show)) => {
+                        policy.done(&a, true, now);
+                        counts.modesets += 1;
+                        if ready.take().is_some() {
+                            counts.shown += 1;
+                        }
+                        println!(
+                            "{:.1} s: followed the source: {} with {}",
+                            now.as_secs_f64(),
+                            modes[i],
+                            match w.signal {
+                                follow::Signal::Sdr => "SDR".to_string(),
+                                follow::Signal::Hdr(h) =>
+                                    format!("{:?}, MaxCLL {}", h.eotf, h.max_cll),
+                            }
+                        );
+                        finished.push((
+                            std::mem::replace(&mut mode_name, modes[i].to_string()),
+                            period,
+                            std::mem::take(&mut pacing),
+                        ));
+                        period = modes[i].period();
+                        take_timeout = period.mul_f64(0.8).min(Duration::from_millis(35));
+                        out_color = color_for(w.signal);
+                        (front, pending) = (show, show);
+                        // A modeset sends no flip event; queue one so the
+                        // vblanks keep coming.
+                        out.flip(buffers[pending])?;
+                        continue;
+                    }
+                    Err(e) => {
+                        policy.done(&a, false, now);
+                        counts.refused += 1;
+                        println!(
+                            "{:.1} s: could not follow the source: {e}",
+                            now.as_secs_f64()
+                        );
+                    }
+                }
+            }
+            Some(a @ follow::Action::Metadata(h)) => {
+                let ok = out.update_hdr(&h).is_ok();
+                policy.done(&a, ok, now);
+                if ok {
+                    counts.metadata += 1;
+                }
+            }
+            None => {}
+        }
         match ready.take() {
             Some(b) => {
                 counts.shown += 1;
@@ -627,7 +786,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         println!("stopped early by Ctrl-C");
     }
     println!(
-        "ran {:.1} s: captured {} frames with a signal ({} without), shown {}, replaced unseen {}, vblanks repeated {}, unrendered {}, format changes not followed {}, failed restarts {failed_restarts}",
+        "ran {:.1} s: captured {} frames with a signal ({} without), shown {}, replaced unseen {}, vblanks repeated {}, unrendered {}, input format changes {}, failed restarts {failed_restarts}",
         ran.as_secs_f64(),
         captured.load(Ordering::Relaxed),
         no_input.load(Ordering::Relaxed),
@@ -648,7 +807,14 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         }
         None => println!("shorter than the {} s settle: no verdict", SETTLE.as_secs()),
     }
-    print!("{}", pacing.summary(period));
+    println!(
+        "followed the source: {} modesets, {} metadata updates without one, {} refused",
+        counts.modesets, counts.metadata, counts.refused
+    );
+    finished.push((mode_name, period, pacing));
+    for (name, period, pacing) in &finished {
+        print!("{name}: {}", pacing.summary(*period));
+    }
     print!(
         "{}",
         Stages::line("unpack, with upload", &mut stages.unpack)
@@ -699,6 +865,9 @@ struct Counts {
     repeats: u64,
     unrendered: u64,
     format_changes: u64,
+    modesets: u64,
+    metadata: u64,
+    refused: u64,
 }
 
 fn describe(kind: Kind) -> String {
@@ -753,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tunnel_signals_pq_with_its_grade_as_mastering() {
+    fn a_tunnel_signals_pq_with_its_grade_as_mastering_and_its_scene_as_maxcll() {
         let t = Tunnel {
             color: DoviColor {
                 ycc_to_lms: [[0.0; 3]; 3],
@@ -762,6 +931,7 @@ mod tests {
             },
             source_min_pq: 62,
             source_max_pq: 3696,
+            scene_max_pq: None,
         };
         let (h, out) = output_for(Kind::Tunnel, None, Some(&t));
         let h = h.expect("HDR");
@@ -772,7 +942,18 @@ mod tests {
             h.max_mastering
         );
         assert!(h.min_mastering < 0.01);
+        // No level 1: MaxCLL unknown.
         assert_eq!(h.max_cll, 0.0);
+        // A scene peaking at PQ 3079 (about 1000 nits) sends that as MaxCLL;
+        // one brighter than the grade is capped at the grade's peak.
+        let scene = |pq| Tunnel {
+            scene_max_pq: Some(pq),
+            ..t
+        };
+        let (h, _) = output_for(Kind::Tunnel, None, Some(&scene(3079)));
+        assert!((h.expect("HDR").max_cll - 1001.0).abs() < 2.0);
+        let (h, _) = output_for(Kind::Tunnel, None, Some(&scene(4000)));
+        assert!((h.expect("HDR").max_cll - 4000.0).abs() < 10.0);
         assert_eq!(
             (out.primaries, out.transfer),
             (Primaries::Bt2020, Transfer::Pq)
