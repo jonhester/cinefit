@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::OutputMode;
 use crate::follow;
+use crate::runlog::{self, say};
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
@@ -42,6 +43,11 @@ const PRE_ROLL_LIMIT: Duration = Duration::from_secs(15);
 /// Startup is excluded from the run's verdict: the first seconds always
 /// include the resync.
 const SETTLE: Duration = Duration::from_secs(5);
+/// A line on how the run is going this often, so a log shows when trouble
+/// started rather than only that it happened.
+const STATUS_EVERY: Duration = Duration::from_secs(60);
+/// Input changes logged one by one; past this many, only counted.
+const LOGGED_CHANGES: u64 = 50;
 /// Three buffers: one on screen, one queued, one to render into, so a render
 /// that runs late still has a target.
 const BUFFERS: usize = 3;
@@ -571,7 +577,31 @@ fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Runs `play`, recorded in `~/cinefit-logs` (see [`runlog`]). A log that
+/// cannot be opened is reported and the run goes on without one.
 pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
+    match runlog::default_dir()
+        .ok_or_else(|| "HOME is not set".into())
+        .and_then(|d| runlog::open(&d, "play").map_err(|e| format!("{}: {e}", d.display())))
+    {
+        Ok(path) => println!("log: {}", path.display()),
+        Err(e) => eprintln!("log: not written: {e}"),
+    }
+    // The settings as this run read them, in the log only: a question about
+    // a run is often which setting was on.
+    runlog::record(&format!(
+        "settings:\n{}",
+        crate::config::render(&opts.config)
+    ));
+    let result = play(opts);
+    if let Err(e) = &result {
+        // main prints it to the terminal.
+        runlog::record(&format!("error: {e}"));
+    }
+    result
+}
+
+fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let run_for = Duration::try_from_secs_f64(opts.seconds)
         .ok()
         .filter(|d| !d.is_zero())
@@ -582,7 +612,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     let device = devices
         .get(opts.device)
         .ok_or_else(|| format!("no device {}: {} found", opts.device, devices.len()))?;
-    println!(
+    say!(
         "capture: device {}: {}",
         opts.device,
         device.info().display_name
@@ -636,7 +666,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .expect("pre-roll waits for the format");
-    println!(
+    say!(
         "input: {input}, as {}; stable after {:.1} s",
         describe(key.kind),
         started.elapsed().as_secs_f64()
@@ -648,7 +678,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     // The output: the panel at the source's own rate, signalling chosen from
     // the source, in one commit.
     let mut out = cinefit_kms::Output::open(opts.card.as_deref())?;
-    println!("output: {}", out.describe());
+    say!("output: {}", out.describe());
     let modes = out.modes();
     let want = cinefit_kms::ModeRequest {
         width: opts.config.width,
@@ -656,9 +686,9 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         refresh_hz: input.frames_per_second(),
     };
     let Some(index) = cinefit_kms::choose_mode(&modes, &want) else {
-        eprintln!("progressive modes offered:");
+        say!("progressive modes offered:");
         for m in modes.iter().filter(|m| !m.interlaced) {
-            eprintln!("  {m}{}", if m.preferred { " (preferred)" } else { "" });
+            say!("  {m}{}", if m.preferred { " (preferred)" } else { "" });
         }
         return Err(format!(
             "no {}x{} mode within 0.01 Hz of the source's {:.3}",
@@ -667,7 +697,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         .into());
     };
     let mode = modes[index];
-    println!("mode: {mode}");
+    say!("mode: {mode}");
     let (hdr, mut out_color) = output_in(
         opts.config.mode,
         opts.config.lldv,
@@ -676,11 +706,15 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         last_tunnel.as_ref(),
     );
     match &hdr {
-        Some(h) => println!(
+        Some(h) => say!(
             "signalling {:?}: MaxCLL {}, MaxFALL {}, mastering {:.4}-{:.0} nits",
-            h.eotf, h.max_cll, h.max_fall, h.min_mastering, h.max_mastering
+            h.eotf,
+            h.max_cll,
+            h.max_fall,
+            h.min_mastering,
+            h.max_mastering
         ),
-        None => println!(
+        None => say!(
             "signalling SDR BT.2020{}",
             match key.kind {
                 k if is_lldv(k, opts.config.lldv) => format!(
@@ -705,16 +739,16 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     let _clocks = if opts.pstate {
         match cinefit_render::power::StablePstate::acquire() {
             Ok(p) => {
-                println!("gpu clocks: {} (stable pstate, held until exit)", p.level());
+                say!("gpu clocks: {} (stable pstate, held until exit)", p.level());
                 Some(p)
             }
             Err(e) => {
-                println!("gpu clocks: not held: {e}");
+                say!("gpu clocks: not held: {e}");
                 None
             }
         }
     } else {
-        println!("gpu clocks: default policy (--no-pstate)");
+        say!("gpu clocks: default policy (--no-pstate)");
         None
     };
 
@@ -757,7 +791,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     // have no adapter yet, keep the last crop.
     let win = geo::screen_window(size.0, size.1, opts.config.screen_ar);
     if opts.config.crop {
-        println!(
+        say!(
             "crop: on; screen {:.2}:1 is rows {}-{} of the raster, fill up to {:.2}:1",
             opts.config.screen_ar,
             win.y,
@@ -780,7 +814,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
             if d.changed {
                 crops += 1;
                 let c = d.crop;
-                println!(
+                say!(
                     "{t:.1} s: crop {}/{} ({}): picture {} x {} rows, {:.3}:1",
                     c.top,
                     c.bottom,
@@ -819,7 +853,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     }
     drop(first);
     if opts.dry_run {
-        println!(
+        say!(
             "dry run: first frame rendered into a scanout buffer ({:.2} ms unpack, {:.2} ms render)",
             stages.unpack.first().copied().unwrap_or(0.0),
             stages.render.first().copied().unwrap_or(0.0)
@@ -832,14 +866,14 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         let report = out.read_scanout(buffers[0], |px, stride| {
             look(px, stride, fourcc, size, place)
         })?;
-        println!("{report}");
-        println!("stopping before the modeset");
+        say!("{report}");
+        say!("stopping before the modeset");
         return Ok(());
     }
     out.set_hdr(hdr);
     out.set_sdr_bt2020(true);
     out.modeset(index, buffers[0])?;
-    println!("after modeset: {}", out.hdr_state());
+    say!("after modeset: {}", out.hdr_state());
     let mut policy = follow::Policy::new(follow::Want {
         rate_mhz: rate_mhz(&input),
         signal: signal_of(hdr),
@@ -873,10 +907,29 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     // The input as last seen, and for how many frames in a row.
     let (mut last_key, mut held) = (key, frames_to_trust(key));
     let mut settled: Option<(Counts, u64)> = None;
+    // What the card last reported, to log when it reports something else.
+    let mut last_format = Some(input);
+    let mut next_status = STATUS_EVERY;
+    let mut last_source = first_source;
     let run_started = Instant::now();
     while run_started.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
         if settled.is_none() && run_started.elapsed() >= SETTLE {
             settled = Some((counts, mailbox.displaced()));
+        }
+        if run_started.elapsed() >= next_status {
+            next_status += STATUS_EVERY;
+            say!(
+                "{:.0} s: shown {}, vblanks repeated {}, replaced unseen {}, unrendered {}; crop {}",
+                run_started.elapsed().as_secs_f64(),
+                counts.shown,
+                counts.repeats,
+                mailbox.displaced(),
+                counts.unrendered,
+                match last_source {
+                    geo::Source::Rows { top, bottom } => format!("{top}/{bottom}"),
+                    _ => "off".into(),
+                }
+            );
         }
         if ready.is_none()
             && let Some(frame) = mailbox.take_wait(take_timeout)
@@ -884,8 +937,31 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
             let k = classify(&frame, &mut last_tunnel);
             if k != last_key {
                 counts.format_changes += 1;
+                // Capped: a source that flaps would bury everything else.
+                if counts.format_changes <= LOGGED_CHANGES {
+                    say!(
+                        "{:.1} s: input now {} x {}, {}{}",
+                        run_started.elapsed().as_secs_f64(),
+                        k.width,
+                        k.height,
+                        describe(k.kind),
+                        hdr_note(frame.info().color.hdr.as_ref())
+                    );
+                } else if counts.format_changes == LOGGED_CHANGES + 1 {
+                    say!("further input changes are counted, not logged");
+                }
                 last_key = k;
                 held = 0;
+            }
+            let reported = *format.lock().unwrap_or_else(PoisonError::into_inner);
+            if reported != last_format {
+                if let Some(f) = reported {
+                    say!(
+                        "{:.1} s: the card reports {f}",
+                        run_started.elapsed().as_secs_f64()
+                    );
+                }
+                last_format = reported;
             }
             held += 1;
             // RGB that may yet turn out to be a tunnel does not move the
@@ -935,6 +1011,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
                     run_started.elapsed().as_secs_f64(),
                     counts.format_changes as u32 + 1,
                 );
+                last_source = source;
                 let view = view_for(
                     (k.width, k.height),
                     size,
@@ -995,7 +1072,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
                         if ready.take().is_some() {
                             counts.shown += 1;
                         }
-                        println!(
+                        say!(
                             "{:.1} s: followed the source: {} with {}",
                             now.as_secs_f64(),
                             modes[i],
@@ -1022,7 +1099,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
                     Err(e) => {
                         policy.done(&a, false, now);
                         counts.refused += 1;
-                        println!(
+                        say!(
                             "{:.1} s: could not follow the source: {e}",
                             now.as_secs_f64()
                         );
@@ -1035,6 +1112,15 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
                 if ok {
                     counts.metadata += 1;
                 }
+                say!(
+                    "{:.1} s: HDR metadata {}: MaxCLL {}, MaxFALL {}, mastering {:.4}-{:.0} nits",
+                    now.as_secs_f64(),
+                    if ok { "sent" } else { "refused" },
+                    h.max_cll,
+                    h.max_fall,
+                    h.min_mastering,
+                    h.max_mastering
+                );
             }
             None => {}
         }
@@ -1053,14 +1139,14 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     let ran = run_started.elapsed();
     let _ = out.wait_flip();
     let restored = out.restore()?;
-    println!("{restored}; now: {}", out.hdr_state());
+    say!("{restored}; now: {}", out.hdr_state());
     let failed_restarts = capture.failed_restarts();
     drop(capture);
 
     if stop.load(Ordering::Relaxed) {
-        println!("stopped early by Ctrl-C");
+        say!("stopped early by Ctrl-C");
     }
-    println!(
+    say!(
         "ran {:.1} s: captured {} frames with a signal ({} without), shown {}, replaced unseen {}, vblanks repeated {}, unrendered {}, input format changes {}, RGB held back as a possible tunnel {}, failed restarts {failed_restarts}",
         ran.as_secs_f64(),
         captured.load(Ordering::Relaxed),
@@ -1076,16 +1162,18 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         Some((at, displaced)) => {
             let repeats = counts.repeats - at.repeats;
             let lost = mailbox.displaced() - displaced;
-            println!(
+            say!(
                 "after the first {} s: replaced unseen {lost}, vblanks repeated {repeats}",
                 SETTLE.as_secs()
             );
         }
-        None => println!("shorter than the {} s settle: no verdict", SETTLE.as_secs()),
+        None => say!("shorter than the {} s settle: no verdict", SETTLE.as_secs()),
     }
-    println!(
+    say!(
         "followed the source: {} modesets, {} metadata updates without one, {} refused",
-        counts.modesets, counts.metadata, counts.refused
+        counts.modesets,
+        counts.metadata,
+        counts.refused
     );
     if opts.config.crop {
         let shares: Vec<String> = det
@@ -1094,23 +1182,20 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|s| format!("{} rows {:.1} s", s.rows, s.seconds))
             .collect();
-        println!(
+        say!(
             "crop: {crops} changes; time at each height: {}",
             shares.join(", ")
         );
     }
     finished.push((mode_name, period, pacing));
     for (name, period, pacing) in &finished {
-        print!("{name}: {}", pacing.summary(*period));
+        say!("{name}: {}", pacing.summary(*period));
     }
-    print!(
-        "{}",
-        Stages::line("unpack, with upload", &mut stages.unpack)
-    );
-    print!(
-        "{}",
-        Stages::line("render, with the wait for the GPU", &mut stages.render)
-    );
+    runlog::line(&Stages::line("unpack, with upload", &mut stages.unpack));
+    runlog::line(&Stages::line(
+        "render, with the wait for the GPU",
+        &mut stages.render,
+    ));
     Ok(())
 }
 
@@ -1158,6 +1243,20 @@ struct Counts {
     modesets: u64,
     metadata: u64,
     refused: u64,
+}
+
+/// An input's HDR metadata, for a log line: empty when it carries none.
+fn hdr_note(hdr: Option<&HdrMetadata>) -> String {
+    let Some(h) = hdr else {
+        return String::new();
+    };
+    let n = |v: Option<f64>| v.map_or("unreported".to_string(), |v| format!("{v:.0}"));
+    format!(
+        "; HDR metadata MaxCLL {}, MaxFALL {}, mastering peak {}",
+        n(h.max_cll),
+        n(h.max_fall),
+        n(h.max_mastering)
+    )
 }
 
 fn describe(kind: Kind) -> String {
