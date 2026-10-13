@@ -220,6 +220,24 @@ impl Rect {
     }
 }
 
+/// All of a frame's geometry: which part of the source is drawn (`src`, in
+/// source pixels; `None` for the whole frame) and where it lands in the
+/// target (`dst`, in target pixels; `None` for the whole of it). Crop
+/// rectangles and nothing else, since a geometry change that commits is a
+/// bug.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct View {
+    pub src: Option<Rect>,
+    pub dst: Option<Rect>,
+}
+
+impl View {
+    /// The whole frame, placed at `dst`.
+    pub fn placed(dst: Option<Rect>) -> Self {
+        View { src: None, dst }
+    }
+}
+
 /// A dma-buf to render into, as a scanout buffer describes it.
 #[derive(Debug, Clone, Copy)]
 pub struct DmaBufTarget<'a> {
@@ -599,7 +617,7 @@ impl Placebo {
         dst_color: RgbColor,
         place: Option<Rect>,
     ) -> Result<(), Error> {
-        self.render_dovi_mapped(src, color, dst, dst_color, place, None)
+        self.render_dovi_mapped(src, color, dst, dst_color, View::placed(place), None)
     }
 
     /// [`render_dovi`](Self::render_dovi), with a tone mapping into a target
@@ -614,10 +632,11 @@ impl Placebo {
         color: &DoviColor,
         dst: &Texture<'_>,
         dst_color: RgbColor,
-        place: Option<Rect>,
+        view: View,
         map: Option<&Mapping>,
     ) -> Result<(), Error> {
-        let place = Rect::raw(place.as_ref());
+        let place = Rect::raw(view.dst.as_ref());
+        let src_crop = Rect::raw(view.src.as_ref());
         let map = map.map(Mapping::raw);
         let flat = |m: &[[f64; 3]; 3]| std::array::from_fn(|i| m[i / 3][i % 3] as f32);
         let raw = ffi::Dovi {
@@ -638,6 +657,7 @@ impl Placebo {
                 transfer_raw(dst_color.transfer),
                 place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
                 map.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                src_crop.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
@@ -659,7 +679,7 @@ impl Placebo {
         dst_color: RgbColor,
         place: Option<Rect>,
     ) -> Result<(), Error> {
-        self.render_ycbcr_mapped(src, color, dst, dst_color, place, None)
+        self.render_ycbcr_mapped(src, color, dst, dst_color, View::placed(place), None)
     }
 
     /// [`render_ycbcr`](Self::render_ycbcr), with a tone mapping into a
@@ -674,10 +694,11 @@ impl Placebo {
         color: YcbcrColor,
         dst: &Texture<'_>,
         dst_color: RgbColor,
-        place: Option<Rect>,
+        view: View,
         map: Option<&Mapping>,
     ) -> Result<(), Error> {
-        let place = Rect::raw(place.as_ref());
+        let place = Rect::raw(view.dst.as_ref());
+        let src_crop = Rect::raw(view.src.as_ref());
         let map = map.map(Mapping::raw);
         let matrix = match color.matrix {
             Matrix::Bt709 => ffi::MATRIX_BT709,
@@ -698,6 +719,7 @@ impl Placebo {
                 transfer_raw(dst_color.transfer),
                 place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
                 map.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                src_crop.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
@@ -783,7 +805,25 @@ impl Placebo {
         dst_color: RgbColor,
         place: Option<Rect>,
     ) -> Result<(), Error> {
-        let place = Rect::raw(place.as_ref());
+        self.render_rgb_view(src, color, dst, dst_color, View::placed(place))
+    }
+
+    /// [`render_rgb`](Self::render_rgb) with a source crop as well as a
+    /// placement.
+    ///
+    /// # Errors
+    ///
+    /// As [`render_rgb`](Self::render_rgb).
+    pub fn render_rgb_view(
+        &self,
+        src: &GpuRgb<'_>,
+        color: RgbSourceColor,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+        view: View,
+    ) -> Result<(), Error> {
+        let place = Rect::raw(view.dst.as_ref());
+        let src_crop = Rect::raw(view.src.as_ref());
         let levels = match color.levels {
             Levels::Full => ffi::LEVELS_FULL,
             Levels::Limited => ffi::LEVELS_LIMITED,
@@ -801,6 +841,7 @@ impl Placebo {
                 primaries_raw(dst_color.primaries),
                 transfer_raw(dst_color.transfer),
                 place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                src_crop.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }

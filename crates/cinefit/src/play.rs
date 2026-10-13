@@ -21,7 +21,7 @@ use cinefit_decklink::{
 };
 use cinefit_render::{
     Curve, DoviColor, GpuPlanes, GpuRgb, Levels, Mapping, Matrix, Placebo, Primaries, Rect,
-    RgbColor, RgbSourceColor, Texture, Transfer, YcbcrColor, rgb,
+    RgbColor, RgbSourceColor, Texture, Transfer, View, YcbcrColor, rgb,
 };
 
 /// Frames of unchanged input before the output is chosen. The first frames
@@ -489,7 +489,7 @@ fn render<'p>(
                         curve: dst.curve,
                     }
                 });
-            pl.render_ycbcr_mapped(p, color, dst.tex, out, place, map.as_ref())?;
+            pl.render_ycbcr_mapped(p, color, dst.tex, out, View::placed(place), map.as_ref())?;
             stages.render.push(ms(t));
         }
         Kind::Tunnel => {
@@ -508,7 +508,14 @@ fn render<'p>(
                 dst_peak: dst.white_nits,
                 curve: dst.curve,
             });
-            pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, place, map.as_ref())?;
+            pl.render_dovi_mapped(
+                p,
+                &tunnel.color,
+                dst.tex,
+                out,
+                View::placed(place),
+                map.as_ref(),
+            )?;
             stages.render.push(ms(t));
         }
         Kind::Rgb(format) => {

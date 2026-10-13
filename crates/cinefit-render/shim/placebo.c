@@ -424,6 +424,14 @@ static void set_place(struct pl_frame *target, const float *place) {
         target->crop = (pl_rect2df) { place[0], place[1], place[2], place[3] };
 }
 
+/* Which part of the source is drawn, as x0, y0, x1, y1 in source pixels, or
+ * the whole frame for NULL: the bars cropped out, as a crop rect and nothing
+ * else, since a geometry change that commits is a bug. */
+static void set_source(struct pl_frame *image, const float *src) {
+    if (src)
+        image->crop = (pl_rect2df) { src[0], src[1], src[2], src[3] };
+}
+
 static enum pl_color_transfer transfer(int t) {
     switch (t) {
     case CF_PL_TRC_PQ:  return PL_COLOR_TRC_PQ;
@@ -466,7 +474,7 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
 
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
                        cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
-                       const cf_pl_map *map) {
+                       const cf_pl_map *map, const float *src_crop) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -503,6 +511,7 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
         .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
     };
     set_place(&target, place);
+    set_source(&image, src_crop);
 
     struct pl_render_params params = pl_render_default_params;
     params.dither_params = NULL;
@@ -669,7 +678,8 @@ int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *r, uint16_t *out) {
 }
 
 int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
-                     cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place) {
+                     cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
+                     const float *src_crop) {
     if (!src->filled) {
         log_err(pl, "RGB read before any frame was unpacked into it");
         return -1;
@@ -694,6 +704,7 @@ int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
         .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
     };
     set_place(&target, place);
+    set_source(&image, src_crop);
 
     struct pl_render_params params = pl_render_default_params;
     params.dither_params = NULL;
@@ -801,7 +812,7 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
 
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
                       cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
-                      const cf_pl_map *map) {
+                      const cf_pl_map *map, const float *src_crop) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -858,6 +869,7 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
         .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
     };
     set_place(&target, place);
+    set_source(&image, src_crop);
 
     struct pl_render_params params = pl_render_default_params;
     params.dither_params = NULL;
