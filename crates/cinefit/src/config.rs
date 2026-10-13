@@ -329,8 +329,9 @@ static SETTINGS: &[Setting] = &[
         key: "geometry.fill_max_ar",
         kind: Kind::Float { min: 1.0, max: 3.0 },
         apply: Apply::Restart,
-        help: "Content wider than this is trimmed at the sides to fill the screen's height, rather than \
-               letterboxed inside it. 2.40 keeps 2.39 and 2.40 full height and trims 2.55 and 2.76.",
+        help: "Content wider than the screen but no wider than this fills the screen's height, losing a \
+               sliver at each side (2.39 and 2.40 on a 2.35 screen give up about 1% a side and show no bars). \
+               Wider content (2.55, 2.76) keeps its full width with thin bars inside the screen. 0 is off.",
         get: |c| Value::Float(c.fill_max_ar),
         set: |c, v| c.fill_max_ar = float(v),
     },
