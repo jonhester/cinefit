@@ -259,6 +259,9 @@ pub struct ClipFrame {
     pub row_bytes: usize,
     /// As the card reported it: "v210", "r210", "8-bit ARGB".
     pub pixel_format: String,
+    /// The frame's place in the source's stream, from the card's stream
+    /// time: unlike `index`, it skips the frames a recording dropped.
+    pub frame_number: u64,
 }
 
 /// Reads a clip's `frames.csv`.
@@ -284,6 +287,10 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
             height: num(7)? as usize,
             row_bytes: num(8)? as usize,
             pixel_format: f[9].to_string(),
+            frame_number: match (num(4)?, num(5)?) {
+                (_, 0) => num(0)?,
+                (time, duration) => time / duration,
+            },
         });
     }
     Ok(frames)
