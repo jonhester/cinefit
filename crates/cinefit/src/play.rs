@@ -27,6 +27,13 @@ use cinefit_render::{
 /// after a change can carry the wrong EOTF (the C++ version's finding), so
 /// one frame is not enough.
 const STABLE_FRAMES: usize = 12;
+/// Frames of 10-bit RGB that does not decode as a Dolby Vision tunnel before
+/// it is taken for plain RGB: two seconds at 24p. The player starts a Dolby
+/// Vision title with RGB frames that carry no tunnel yet, and believing them
+/// on [`STABLE_FRAMES`] cost a modeset to SDR and another back a second later
+/// (2026-10-13, S&M montage). Plain 10-bit RGB is rare from this chain, so
+/// waiting for it costs little.
+const TUNNEL_GRACE: usize = 48;
 /// Give up waiting for stable input after this long.
 const PRE_ROLL_LIMIT: Duration = Duration::from_secs(15);
 /// Startup is excluded from the run's verdict: the first seconds always
@@ -122,6 +129,9 @@ struct Tunnel {
     /// This scene's brightest maxRGB, as a 12-bit PQ code (level 1
     /// `max_PQ`): the same measure as MaxCLL, per scene.
     scene_max_pq: Option<u16>,
+    /// This scene's average maxRGB, as a 12-bit PQ code (level 1 `avg_PQ`),
+    /// sent as MaxFALL.
+    scene_avg_pq: Option<u16>,
 }
 
 /// Decodes the tunnel in an `r210` frame, if it carries one. `None` when no
@@ -146,6 +156,7 @@ fn decode_tunnel(info: &FrameInfo, bytes: &[u8]) -> Option<Option<Tunnel>> {
         source_min_pq: m.source_min_pq,
         source_max_pq: m.source_max_pq,
         scene_max_pq: m.level1.map(|l| l.max_pq),
+        scene_avg_pq: m.level1.map(|l| l.avg_pq),
     }))
 }
 
@@ -176,6 +187,14 @@ fn classify(frame: &Frame, last_tunnel: &mut Option<Tunnel>) -> Key {
     }
 }
 
+/// How many frames in a row an input must hold before it is believed.
+fn frames_to_trust(key: Key) -> usize {
+    match key.kind {
+        Kind::Rgb(rgb::Format::R210) => TUNNEL_GRACE,
+        _ => STABLE_FRAMES,
+    }
+}
+
 /// What the output signals and renders into for an input.
 fn output_for(
     kind: Kind,
@@ -201,13 +220,14 @@ fn output_for(
         // The grade's range as mastering, and this scene's peak as MaxCLL:
         // the JVC re-derives its curve from a MaxCLL change mid-stream with
         // no resync (measured 2026-10-12), so the curve follows the film
-        // scene by scene. Capped at the grade's peak; 0, "unknown", when the
-        // scene has no level 1.
+        // scene by scene. Capped at the grade's peak. With no level 1 yet,
+        // the grade's peak too: 0 is "unknown", and was sent at the start of
+        // a title until the first scene arrived (2026-10-13).
         Kind::Tunnel => {
             let mastering = tunnel.map_or(0.0, |t| cinefit_dovi::pq_to_nits(t.source_max_pq));
             let scene = tunnel
                 .and_then(|t| t.scene_max_pq)
-                .map_or(0.0, cinefit_dovi::pq_to_nits);
+                .map_or(mastering, cinefit_dovi::pq_to_nits);
             (
                 Some(cinefit_kms::HdrStatic {
                     max_mastering: mastering,
@@ -221,6 +241,14 @@ fn output_for(
                         scene
                     }
                     .round(),
+                    // An average taken in PQ, so below MaxFALL's linear one;
+                    // the nearest measure the metadata has. 0, "unknown",
+                    // with no level 1. Whether the JVC reads MaxFALL at all is
+                    // not yet measured.
+                    max_fall: tunnel
+                        .and_then(|t| t.scene_avg_pq)
+                        .map_or(0.0, cinefit_dovi::pq_to_nits)
+                        .round(),
                     ..base
                 }),
                 pq_out,
@@ -453,7 +481,14 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut last_tunnel = None;
     let started = Instant::now();
     let (mut key, mut stable, mut first) = (None, 0usize, None);
-    while stable < STABLE_FRAMES {
+    // The format report can trail the first frames, so it is waited for too.
+    let has_format = || {
+        format
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    };
+    while stable < key.map_or(STABLE_FRAMES, frames_to_trust) || !has_format() {
         if started.elapsed() > PRE_ROLL_LIMIT {
             return Err(format!(
                 "no stable input after {} s: {} frames with a signal, {} without",
@@ -480,7 +515,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     let input = format
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .ok_or("frames arrived before any input format")?;
+        .expect("pre-roll waits for the format");
     println!(
         "input: {input}, as {}; stable after {:.1} s",
         describe(key.kind),
@@ -633,6 +668,8 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     out.flip(buffers[front])?;
     let mut ready: Option<usize> = None;
     let mut counts = Counts::default();
+    // The input as last seen, and for how many frames in a row.
+    let (mut last_key, mut held) = (key, frames_to_trust(key));
     let mut settled: Option<(Counts, u64)> = None;
     let run_started = Instant::now();
     while run_started.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
@@ -643,47 +680,64 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
             && let Some(frame) = mailbox.take_wait(take_timeout)
         {
             let k = classify(&frame, &mut last_tunnel);
-            if k != key {
+            if k != last_key {
                 counts.format_changes += 1;
+                last_key = k;
+                held = 0;
             }
-            // What the output should be for this frame, for the policy after
-            // the next flip. The rate is the input's, as the card reported it.
-            // A PQ frame without its metadata block is not a change of
-            // metadata: the card attaches it only to frames it flags, and
-            // treating its absence as zeros would flap the output.
-            let pq_without_metadata = matches!(k.kind, Kind::Ycbcr(c) if c.transfer == Transfer::Pq)
-                && frame.info().color.hdr.is_none();
-            if !matches!(k.kind, Kind::Unsupported(_))
-                && !pq_without_metadata
-                && let Some(f) = *format.lock().unwrap_or_else(PoisonError::into_inner)
-            {
-                let (hdr, _) = output_for(
-                    k.kind,
-                    frame.info().color.hdr.as_ref(),
-                    last_tunnel.as_ref(),
-                );
-                latest_want = Some(follow::Want {
-                    rate_mhz: rate_mhz(&f),
-                    signal: signal_of(hdr),
-                });
-            }
-            let free = (0..BUFFERS)
-                .find(|&b| b != front && b != pending)
-                .expect("three buffers, two in use");
-            // Rendered into the output as it stands, which libplacebo maps
-            // to, until the policy moves the output.
-            if render(
-                &pl,
-                &frame,
-                k.kind,
-                last_tunnel.as_ref(),
-                &mut sources,
-                &target(free, out_color),
-                &mut stages,
-            )? {
+            held += 1;
+            // RGB that may yet turn out to be a tunnel does not move the
+            // output, and goes out as black: drawn as plain RGB, tunnel bytes
+            // are colour noise, and holding the last frame instead read as a
+            // frozen start to the film (2026-10-13). Black keeps time with
+            // the sound, which does not pass through here.
+            if held < frames_to_trust(k) && frames_to_trust(k) > STABLE_FRAMES {
+                counts.unproven += 1;
+                let free = (0..BUFFERS)
+                    .find(|&b| b != front && b != pending)
+                    .expect("three buffers, two in use");
+                pl.clear_black(&targets[free])?;
                 ready = Some(free);
             } else {
-                counts.unrendered += 1;
+                // What the output should be for this frame, for the policy after
+                // the next flip. The rate is the input's, as the card reported it.
+                // A PQ frame without its metadata block is not a change of
+                // metadata: the card attaches it only to frames it flags, and
+                // treating its absence as zeros would flap the output.
+                let pq_without_metadata = matches!(k.kind, Kind::Ycbcr(c) if c.transfer == Transfer::Pq)
+                    && frame.info().color.hdr.is_none();
+                if !matches!(k.kind, Kind::Unsupported(_))
+                    && !pq_without_metadata
+                    && let Some(f) = *format.lock().unwrap_or_else(PoisonError::into_inner)
+                {
+                    let (hdr, _) = output_for(
+                        k.kind,
+                        frame.info().color.hdr.as_ref(),
+                        last_tunnel.as_ref(),
+                    );
+                    latest_want = Some(follow::Want {
+                        rate_mhz: rate_mhz(&f),
+                        signal: signal_of(hdr),
+                    });
+                }
+                let free = (0..BUFFERS)
+                    .find(|&b| b != front && b != pending)
+                    .expect("three buffers, two in use");
+                // Rendered into the output as it stands, which libplacebo maps
+                // to, until the policy moves the output.
+                if render(
+                    &pl,
+                    &frame,
+                    k.kind,
+                    last_tunnel.as_ref(),
+                    &mut sources,
+                    &target(free, out_color),
+                    &mut stages,
+                )? {
+                    ready = Some(free);
+                } else {
+                    counts.unrendered += 1;
+                }
             }
         }
         let flip = out.wait_flip()?;
@@ -788,7 +842,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         println!("stopped early by Ctrl-C");
     }
     println!(
-        "ran {:.1} s: captured {} frames with a signal ({} without), shown {}, replaced unseen {}, vblanks repeated {}, unrendered {}, input format changes {}, failed restarts {failed_restarts}",
+        "ran {:.1} s: captured {} frames with a signal ({} without), shown {}, replaced unseen {}, vblanks repeated {}, unrendered {}, input format changes {}, RGB held back as a possible tunnel {}, failed restarts {failed_restarts}",
         ran.as_secs_f64(),
         captured.load(Ordering::Relaxed),
         no_input.load(Ordering::Relaxed),
@@ -797,6 +851,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         counts.repeats,
         counts.unrendered,
         counts.format_changes,
+        counts.unproven,
     );
     match settled {
         Some((at, displaced)) => {
@@ -867,6 +922,8 @@ struct Counts {
     repeats: u64,
     unrendered: u64,
     format_changes: u64,
+    /// Frames of RGB held back while it might still be a tunnel.
+    unproven: u64,
     modesets: u64,
     metadata: u64,
     refused: u64,
@@ -934,6 +991,7 @@ mod tests {
             source_min_pq: 62,
             source_max_pq: 3696,
             scene_max_pq: None,
+            scene_avg_pq: None,
         };
         let (h, out) = output_for(Kind::Tunnel, None, Some(&t));
         let h = h.expect("HDR");
@@ -944,8 +1002,10 @@ mod tests {
             h.max_mastering
         );
         assert!(h.min_mastering < 0.01);
-        // No level 1: MaxCLL unknown.
-        assert_eq!(h.max_cll, 0.0);
+        // No level 1: the grade's peak, never 0 ("unknown").
+        assert!((h.max_cll - 4000.0).abs() < 10.0, "{}", h.max_cll);
+        // No level 1, no average: MaxFALL unknown.
+        assert_eq!(h.max_fall, 0.0);
         // A scene peaking at PQ 3079 (about 1000 nits) sends that as MaxCLL;
         // one brighter than the grade is capped at the grade's peak.
         let scene = |pq| Tunnel {
@@ -956,6 +1016,13 @@ mod tests {
         assert!((h.expect("HDR").max_cll - 1001.0).abs() < 2.0);
         let (h, _) = output_for(Kind::Tunnel, None, Some(&scene(4000)));
         assert!((h.expect("HDR").max_cll - 4000.0).abs() < 10.0);
+        // The scene's average, PQ 2081 (about 100 nits), goes out as MaxFALL.
+        let avg = Tunnel {
+            scene_avg_pq: Some(2081),
+            ..scene(3079)
+        };
+        let (h, _) = output_for(Kind::Tunnel, None, Some(&avg));
+        assert!((h.expect("HDR").max_fall - 100.0).abs() < 1.5);
         assert_eq!(
             (out.primaries, out.transfer),
             (Primaries::Bt2020, Transfer::Pq)

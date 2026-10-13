@@ -91,6 +91,7 @@ unsafe extern "C" {
     pub fn cf_pl_upload_rgba8(pl: *mut Handle, w: c_int, h: c_int, rgba: *const u8) -> *mut Tex;
     pub fn cf_pl_tex_destroy(pl: *mut Handle, tex: *mut Tex);
     pub fn cf_pl_render(pl: *mut Handle, src: *mut Tex, dst: *mut Tex, shift_x: f32) -> c_int;
+    pub fn cf_pl_clear_black(pl: *mut Handle, dst: *mut Tex) -> c_int;
     pub fn cf_pl_planes_create(pl: *mut Handle, w: c_int, h: c_int) -> *mut Planes;
     pub fn cf_pl_planes_destroy(pl: *mut Handle, planes: *mut Planes);
     pub fn cf_pl_unpack_v210(

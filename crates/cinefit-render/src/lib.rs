@@ -764,6 +764,17 @@ impl Placebo {
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
     }
 
+    /// Fills `dst` with black: a frame with nothing to show yet.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo fails.
+    pub fn clear_black(&self, dst: &Texture<'_>) -> Result<(), Error> {
+        // SAFETY: the texture belongs to this live device.
+        let rc = unsafe { ffi::cf_pl_clear_black(self.handle.as_ptr(), dst.tex.as_ptr()) };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
     /// A `width` x `height` RGBA 16-bit target that can be read back.
     ///
     /// # Errors

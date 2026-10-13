@@ -197,6 +197,13 @@ void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *t) {
     pl_tex_destroy(pl->vk->gpu, &tex);
 }
 
+int cf_pl_clear_black(cf_pl *pl, cf_pl_tex *dst) {
+    // Zero in every channel: black for PQ and SDR alike, full-range RGB.
+    pl_tex_clear(pl->vk->gpu, unwrap_tex(dst), (float[4]){0.0f, 0.0f, 0.0f, 1.0f});
+    pl_gpu_finish(pl->vk->gpu);
+    return 0;
+}
+
 int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst, float shift_x) {
     pl_tex s = unwrap_tex(src), d = unwrap_tex(dst);
     struct pl_frame image = {
