@@ -1,6 +1,6 @@
 //! The bar detector: frames in, rows of bar to crop out. Ported from the C++
-//! version's `detect/`, cinefit's own detector, with its tests. The algorithm,
-//! with the reason for each constant, is in this crate's README.md.
+//! version's `detect/`, with its tests. The README has the short version of
+//! how it works; the reasons for each constant are on `bars::Params`.
 //!
 //! The detector reads rows of luma and chroma through [`Samples`], in v210's
 //! scale (10-bit limited: black 64, white 940, chroma centred on 512 with
