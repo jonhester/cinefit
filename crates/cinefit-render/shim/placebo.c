@@ -461,6 +461,16 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
     *cmp = pl_color_map_default_params;
     cmp->tone_mapping_function = curve(map->curve);
     cmp->contrast_recovery = 0.0f;
+    if (map->scene_max_pq > 0) {
+        // libplacebo's dynamic luminance metadata (CIE Y) is the same measure
+        // as level 1: the scene's maximum and average in PQ. Preferring it
+        // over HDR10's static values makes the curve follow the scene.
+        image->color.hdr.max_pq_y = map->scene_max_pq;
+        image->color.hdr.avg_pq_y = map->scene_avg_pq;
+        if (map->scene_min_pq > 0)
+            image->color.hdr.min_luma = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, map->scene_min_pq);
+        cmp->metadata = PL_HDR_METADATA_CIE_Y;
+    }
     params->color_map_params = cmp;
 }
 

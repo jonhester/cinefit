@@ -104,6 +104,12 @@ typedef struct {
     float src_peak;
     float dst_peak;
     int curve;
+    /* This scene's brightness, as PQ (0-1): its maximum, average and minimum,
+     * as Dolby Vision's level 1 carries them; 0 for none. With a maximum, the
+     * curve maps from the scene, not from the source's static peak. */
+    float scene_max_pq;
+    float scene_avg_pq;
+    float scene_min_pq;
 } cf_pl_map;
 
 #define CF_PL_CURVE_CLIP 0

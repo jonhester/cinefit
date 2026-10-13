@@ -487,6 +487,7 @@ fn render<'p>(
                         src_peak: peak.unwrap_or(1000.0),
                         dst_peak: dst.white_nits,
                         curve: dst.curve,
+                        scene: None,
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, place, map.as_ref())?;
@@ -507,6 +508,7 @@ fn render<'p>(
                 src_peak: cinefit_dovi::pq_to_nits(tunnel.source_max_pq) as f32,
                 dst_peak: dst.white_nits,
                 curve: dst.curve,
+                scene: None,
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, place, map.as_ref())?;
             stages.render.push(ms(t));

@@ -13,8 +13,8 @@ pub mod tunnel;
 pub mod v210;
 
 pub use color::{
-    Curve, DoviColor, Levels, Mapping, Matrix, Primaries, RgbColor, RgbSourceColor, Transfer,
-    YcbcrColor,
+    Curve, DoviColor, Levels, Mapping, Matrix, Primaries, RgbColor, RgbSourceColor, SceneLight,
+    Transfer, YcbcrColor,
 };
 
 use std::ffi::CStr;
@@ -889,6 +889,9 @@ impl Mapping {
                 Curve::Mobius => 7,
                 Curve::Reinhard => 8,
             },
+            scene_max_pq: self.scene.map_or(0.0, |s| s.max_pq),
+            scene_avg_pq: self.scene.map_or(0.0, |s| s.avg_pq),
+            scene_min_pq: self.scene.map_or(0.0, |s| s.min_pq),
         }
     }
 }

@@ -283,4 +283,16 @@ pub struct Mapping {
     pub src_peak: f32,
     pub dst_peak: f32,
     pub curve: Curve,
+    /// This scene's brightness, when the source says it: Dolby Vision's
+    /// level 1. With it, the curve maps from the scene, not the source.
+    pub scene: Option<SceneLight>,
+}
+
+/// A scene's brightness as PQ, 0-1: its minimum, average and maximum
+/// (Dolby Vision level 1, divided by 4095).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneLight {
+    pub min_pq: f32,
+    pub avg_pq: f32,
+    pub max_pq: f32,
 }

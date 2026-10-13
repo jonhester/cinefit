@@ -67,6 +67,9 @@ pub struct Map {
     pub src_peak: f32,
     pub dst_peak: f32,
     pub curve: c_int,
+    pub scene_max_pq: f32,
+    pub scene_avg_pq: f32,
+    pub scene_min_pq: f32,
 }
 
 unsafe extern "C" {
