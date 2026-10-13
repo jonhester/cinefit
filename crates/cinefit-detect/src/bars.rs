@@ -7,7 +7,7 @@
 //! flat at 64, 99.99% within 64-67, with at most one row of edge ringing);
 //! the rest are starting points set against recorded clips.
 
-use crate::Samples;
+use crate::{RowScratch, Samples};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
@@ -135,12 +135,6 @@ fn scaled(rows_at_2160: u32, h: u32) -> u32 {
     ((u64::from(rows_at_2160) * u64::from(h) / 2160) as u32).max(1)
 }
 
-/// Chroma more than `dc` from neutral, as the C++ version tests it: one
-/// unsigned compare, `c - (512 - dc)` wrapping for `c` below.
-fn chroma_off(c: u16, dc: u32) -> bool {
-    u32::from(c).wrapping_sub(512 - dc) > 2 * dc
-}
-
 /// Pair flags kept only inside a run of at least `run` lit pairs, in place;
 /// `start` is scratch.
 fn in_runs(flags: &mut [u8], start: &mut Vec<u8>, run: usize) {
@@ -176,6 +170,8 @@ struct Buffers {
     /// One row's chroma-lit flags per pair, and scratch for the run rule.
     flags: Vec<u8>,
     runs: Vec<u8>,
+    /// For the counting methods of a format without its own.
+    scratch: RowScratch,
 }
 
 /// One side's band of rows, read lazily from the frame edge inward.
@@ -216,19 +212,15 @@ impl Side<'_> {
         &self.b.chroma[k * n..(k + 1) * n]
     }
 
-    /// Row `i`'s pair flags into `b.flags`: chroma off neutral, and with
-    /// `run_rule`, kept only inside a run of at least `chroma_run` pairs.
-    fn pair_flags(&mut self, i: u32, run_rule: bool) {
-        let dc = self.p.delta_c;
+    /// Row `i`'s chroma-lit pair flags into `b.flags`, kept only inside a
+    /// run of at least `chroma_run` pairs.
+    fn run_flags(&mut self, i: u32) {
+        let y = self.y(i);
         let mut flags = std::mem::take(&mut self.b.flags);
-        flags.clear();
-        flags.extend(
-            self.chroma(i)
-                .iter()
-                .map(|c| u8::from(chroma_off(c[0], dc) | chroma_off(c[1], dc))),
-        );
+        self.f
+            .chroma_flags(y, self.p.delta_c, &mut flags, &mut self.b.scratch);
         let run = self.p.chroma_run as usize;
-        if run_rule && run > 1 && flags.contains(&1) {
+        if run > 1 && flags.contains(&1) {
             let mut start = std::mem::take(&mut self.b.runs);
             in_runs(&mut flags, &mut start, run);
             self.b.runs = start;
@@ -236,51 +228,23 @@ impl Side<'_> {
         self.b.flags = flags;
     }
 
-    /// Lit samples in row `i` by `b.flags`, the quarters with one, and how
-    /// many are lit by chroma alone. Branch-free in the inner loop.
-    fn count(&mut self, i: u32) -> (u32, u8, u32) {
-        let thr = (self.level + self.p.delta) as u16;
-        let w = self.w;
-        let flags = std::mem::take(&mut self.b.flags);
-        let luma = self.luma(i);
-        let (mut n, mut mask, mut chroma_only) = (0u32, 0u8, 0u32);
-        for q in 0..4 {
-            let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
-            let mut m = 0u32;
-            if x0 % 2 == 0 && x1 % 2 == 0 {
-                // Whole pairs: each pair of luma samples shares one flag.
-                let pairs = luma[x0..x1].as_chunks::<2>().0;
-                for (l, &c) in pairs.iter().zip(&flags[x0 / 2..x1 / 2]) {
-                    let (y0, y1, cl) = (u32::from(l[0] > thr), u32::from(l[1] > thr), u32::from(c));
-                    m += (y0 | cl) + (y1 | cl);
-                    chroma_only += (cl & (y0 ^ 1)) + (cl & (y1 ^ 1));
-                }
-            } else {
-                for (x, &l) in luma[x0..x1].iter().enumerate() {
-                    let yl = u32::from(l > thr);
-                    let cl = u32::from(flags[(x0 + x) / 2]);
-                    m += yl | cl;
-                    chroma_only += cl & (yl ^ 1);
-                }
-            }
-            n += m;
-            mask |= u8::from(m > 0) << q;
-        }
-        self.b.flags = flags;
-        (n, mask, chroma_only)
-    }
-
+    /// Row `i`'s lit samples and the quarters with one, counted in place by
+    /// the frame's format: the scan's whole cost.
     fn lit_count(&mut self, i: u32) -> (u32, u8) {
         if let Some(c) = self.b.lit[i as usize] {
             return c;
         }
-        self.pair_flags(i, false);
-        let (mut n, mut mask, chroma_only) = self.count(i);
+        let (y, thr) = (self.y(i), (self.level + self.p.delta) as u16);
+        let (mut n, mut mask, chroma_only) =
+            self.f
+                .count_lit(y, thr, self.p.delta_c, &mut self.b.scratch);
         // The run rule can only lower the count of a row with samples lit by
         // chroma alone; flat bar rows and picture lit by luma skip it.
         if self.p.chroma_run > 1 && chroma_only > 0 {
-            self.pair_flags(i, true);
-            (n, mask, _) = self.count(i);
+            self.run_flags(i);
+            (n, mask) = self
+                .f
+                .count_lit_flags(y, thr, &self.b.flags, &mut self.b.scratch);
         }
         self.b.lit[i as usize] = Some((n, mask));
         (n, mask)
@@ -293,7 +257,7 @@ impl Side<'_> {
     /// Every sample's lit flag, by the run rule: for the continuation probes.
     fn lit_pixels(&mut self, i: u32) -> Vec<bool> {
         let thr = self.level + self.p.delta;
-        self.pair_flags(i, true);
+        self.run_flags(i);
         let flags = std::mem::take(&mut self.b.flags);
         let out = self
             .luma(i)
