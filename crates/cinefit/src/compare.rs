@@ -518,6 +518,7 @@ mod tests {
             row_bytes: 5120,
             pixel_format: "v210".to_string(),
             frame_number,
+            time: 0.0,
         };
         // Recorded frames 0, 1, 2 are stream frames 10, 11 and 13: 12 dropped.
         let index = [frame(0, 10), frame(1, 11), frame(2, 13)];

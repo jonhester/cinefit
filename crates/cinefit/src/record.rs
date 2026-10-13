@@ -262,15 +262,23 @@ pub struct ClipFrame {
     /// The frame's place in the source's stream, from the card's stream
     /// time: unlike `index`, it skips the frames a recording dropped.
     pub frame_number: u64,
+    /// Seconds: the source's stream time for a C++ clip, which trimming
+    /// keeps, so a trimmed piece's times are the original clip's; the
+    /// capture time for one of ours, whose CSV has no time scale.
+    pub time: f64,
 }
 
-/// Reads a clip's `frames.csv`.
+/// Reads a clip's `frames.csv`, ours or the C++ version's (whose clips are
+/// the recorded library in `~/cinefit-clips`).
 ///
 /// # Errors
 ///
 /// If the file cannot be read or a line does not parse.
 pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
     let text = std::fs::read_to_string(dir.join("frames.csv"))?;
+    if text.lines().next().and_then(|h| h.split(',').nth(2)) == Some("sequence") {
+        return read_cpp_index(&text);
+    }
     let bad = |n: usize| std::io::Error::other(format!("frames.csv line {n} does not parse"));
     let mut frames = Vec::new();
     for (n, line) in text.lines().enumerate().skip(1) {
@@ -291,9 +299,56 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
                 (_, 0) => num(0)?,
                 (time, duration) => time / duration,
             },
+            time: f[3].parse().map_err(|_| bad(n + 1))?,
         });
     }
     Ok(frames)
+}
+
+/// A C++ clip's index: `index,offset,sequence,stream_time,rate_scale,
+/// rate_duration,width,height,row_bytes,...`, every frame v210 and
+/// `height * row_bytes` long.
+fn read_cpp_index(text: &str) -> std::io::Result<Vec<ClipFrame>> {
+    let bad = |n: usize| std::io::Error::other(format!("frames.csv line {n} does not parse"));
+    let mut frames = Vec::new();
+    for (n, line) in text.lines().enumerate().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 9 {
+            return Err(bad(n + 1));
+        }
+        let num = |i: usize| f[i].parse::<u64>().map_err(|_| bad(n + 1));
+        let stream_time = f[3].parse::<i64>().map_err(|_| bad(n + 1))?;
+        let (scale, duration) = (num(4)?, num(5)?);
+        let (height, row_bytes) = (num(7)? as usize, num(8)? as usize);
+        frames.push(ClipFrame {
+            index: num(0)?,
+            offset: num(1)?,
+            size: height * row_bytes,
+            width: num(6)? as usize,
+            height,
+            row_bytes,
+            pixel_format: "v210".into(),
+            frame_number: match duration {
+                0 => num(0)?,
+                d => stream_time.max(0) as u64 / d,
+            },
+            // In rate_scale ticks; nanoseconds when the card gave no scale,
+            // as the C++ capture source records it.
+            time: stream_time as f64 / if scale == 0 { 1e9 } else { scale as f64 },
+        });
+    }
+    Ok(frames)
+}
+
+/// A clip's compressed frames: ours, or the C++ version's.
+fn frames_path(dir: &Path) -> std::path::PathBuf {
+    let ours = dir.join("frames.zst");
+    let cpp = dir.join("frames.v210.zst");
+    if !ours.exists() && cpp.exists() {
+        cpp
+    } else {
+        ours
+    }
 }
 
 /// Streams a clip's frames through `zstd -dc` in order, calling `each` with
@@ -312,7 +367,7 @@ pub fn for_each_frame<E: From<std::io::Error>>(
     use std::io::Read;
     let mut child = Command::new("zstd")
         .arg("-dc")
-        .arg(dir.join("frames.zst"))
+        .arg(frames_path(dir))
         .stdout(Stdio::piped())
         .spawn()?;
     let mut out = std::io::BufReader::with_capacity(1 << 24, child.stdout.take().expect("piped"));
@@ -422,5 +477,20 @@ mod tests {
         // A second recording into the same directory is refused, not mixed in.
         assert!(ClipWriter::create(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cpp_clip_index_reads_with_stream_times_and_v210_sizes() {
+        let text = "index,offset,sequence,stream_time,rate_scale,rate_duration,width,height,row_bytes,eotf,hdr_valid,max_cll,max_fall,max_mastering,min_mastering
+0,0,299,311311,24000,1001,3840,2160,10240,2,1,1242,436,4000,0.0050
+1,22118400,300,312312,24000,1001,3840,2160,10240,2,1,1242,436,4000,0.0050
+";
+        let index = read_cpp_index(text).expect("parses");
+        assert_eq!(index.len(), 2);
+        assert_eq!((index[1].offset, index[1].size), (22_118_400, 2160 * 10240));
+        assert_eq!(index[0].pixel_format, "v210");
+        // 311311 / 1001 and / 24000: the original clip's frame and time.
+        assert_eq!(index[0].frame_number, 311);
+        assert!((index[0].time - 12.971_292).abs() < 1e-6);
     }
 }

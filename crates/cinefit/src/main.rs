@@ -8,6 +8,7 @@ mod follow;
 #[cfg(target_os = "linux")]
 mod play;
 mod record;
+mod replay;
 #[cfg(target_os = "linux")]
 mod runlog;
 #[cfg(target_os = "linux")]
@@ -103,6 +104,25 @@ enum Command {
         #[arg(long, requires = "gpu")]
         no_pstate: bool,
     },
+    /// Replay recorded clips through the bar detector: every crop change, the
+    /// time at each height, what the detector costs per frame, and with
+    /// --compare, every frame against the C++ version's replay log. Touches no
+    /// capture card or display.
+    Replay {
+        /// Clip directories: ours or the C++ version's, whole or trimmed.
+        #[arg(required = true)]
+        clips: Vec<PathBuf>,
+        /// A directory of the C++ version's replay logs (<clip>.cinefit.csv)
+        /// to compare every frame's crop with.
+        #[arg(long)]
+        compare: Option<PathBuf>,
+        /// Write every frame's decision to DIR/<clip>.rust.csv.
+        #[arg(long, value_name = "DIR")]
+        log: Option<PathBuf>,
+        /// Summaries only, without the list of crop changes.
+        #[arg(short, long)]
+        quiet: bool,
+    },
     /// Compare the same content recorded twice with `capture --record`, as a
     /// Dolby Vision tunnel and as HDR10: align the recordings, render matched
     /// frames through each path, and report how far apart they are (#24).
@@ -163,6 +183,17 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Probe { edid } => probe(edid),
         Command::Gpu => gpu(),
+        Command::Replay {
+            clips,
+            compare,
+            log,
+            quiet,
+        } => replay::run(replay::Options {
+            pieces: clips,
+            compare,
+            log,
+            quiet,
+        }),
         Command::Compare {
             tunnel,
             hdr10,
