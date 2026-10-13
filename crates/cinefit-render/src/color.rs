@@ -234,3 +234,53 @@ mod tests {
         }
     }
 }
+
+/// A tone curve between two brightness ranges: libplacebo's, by its names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Curve {
+    Clip,
+    Hable,
+    Spline,
+    Bt2390,
+    Bt2446a,
+    St2094_10,
+    St2094_40,
+    Mobius,
+    Reinhard,
+}
+
+impl Curve {
+    /// Every curve with its libplacebo name, in a stable order.
+    pub const ALL: [(Curve, &'static str); 9] = [
+        (Curve::Hable, "hable"),
+        (Curve::Spline, "spline"),
+        (Curve::Bt2390, "bt2390"),
+        (Curve::Bt2446a, "bt2446a"),
+        (Curve::St2094_10, "st2094-10"),
+        (Curve::St2094_40, "st2094-40"),
+        (Curve::Mobius, "mobius"),
+        (Curve::Reinhard, "reinhard"),
+        (Curve::Clip, "clip"),
+    ];
+
+    pub fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(c, _)| *c == self)
+            .map_or("clip", |(_, n)| n)
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(_, n)| *n == name).map(|(c, _)| *c)
+    }
+}
+
+/// A mapping for a render into a target that cannot show the source's range:
+/// the source's peak and the target's, in nits, and the curve between. A peak
+/// of 0 leaves libplacebo's default for that side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mapping {
+    pub src_peak: f32,
+    pub dst_peak: f32,
+    pub curve: Curve,
+}

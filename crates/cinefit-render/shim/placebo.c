@@ -432,8 +432,41 @@ static enum pl_color_transfer transfer(int t) {
     }
 }
 
+static const struct pl_tone_map_function *curve(int c) {
+    switch (c) {
+    case CF_PL_CURVE_HABLE:      return &pl_tone_map_hable;
+    case CF_PL_CURVE_SPLINE:     return &pl_tone_map_spline;
+    case CF_PL_CURVE_BT2390:     return &pl_tone_map_bt2390;
+    case CF_PL_CURVE_BT2446A:    return &pl_tone_map_bt2446a;
+    case CF_PL_CURVE_ST2094_10:  return &pl_tone_map_st2094_10;
+    case CF_PL_CURVE_ST2094_40:  return &pl_tone_map_st2094_40;
+    case CF_PL_CURVE_MOBIUS:     return &pl_tone_map_mobius;
+    case CF_PL_CURVE_REINHARD:   return &pl_tone_map_reinhard;
+    default:                     return &pl_tone_map_clip;
+    }
+}
+
+/* Applies a mapping to a render about to happen. The target's black is
+ * libplacebo's HDR black, not SDR's default 1000:1: BT.1886 would otherwise
+ * lift the shadows to emulate a display far greyer than a projector in a dark
+ * room. Contrast recovery is off: it sharpens, and this path is to be judged
+ * against Dolby's own renditions, which do not. */
+static void apply_map(struct pl_frame *image, struct pl_frame *target,
+                      struct pl_render_params *params, struct pl_color_map_params *cmp,
+                      const cf_pl_map *map) {
+    if (!map) return;
+    if (map->src_peak > 0) image->color.hdr.max_luma = map->src_peak;
+    if (map->dst_peak > 0) target->color.hdr.max_luma = map->dst_peak;
+    target->color.hdr.min_luma = PL_COLOR_HDR_BLACK;
+    *cmp = pl_color_map_default_params;
+    cmp->tone_mapping_function = curve(map->curve);
+    cmp->contrast_recovery = 0.0f;
+    params->color_map_params = cmp;
+}
+
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
-                       cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place) {
+                       cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
+                       const cf_pl_map *map) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -477,6 +510,8 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
     // metadata, which turns a render between identical colour spaces into a
     // tone mapping. Passthrough wants none.
     params.peak_detect_params = NULL;
+    struct pl_color_map_params cmp;
+    apply_map(&image, &target, &params, &cmp, map);
     if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
@@ -765,7 +800,8 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
 }
 
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
-                      cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place) {
+                      cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
+                      const cf_pl_map *map) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -827,6 +863,8 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     params.dither_params = NULL;
     // As in cf_pl_render_ycbcr: no tone mapping between identical spaces.
     params.peak_detect_params = NULL;
+    struct pl_color_map_params cmp;
+    apply_map(&image, &target, &params, &cmp, map);
     if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;

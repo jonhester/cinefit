@@ -26,7 +26,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use cinefit_render::Levels;
+use cinefit_render::{Curve, Levels};
 
 /// Every setting's value.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,6 +39,26 @@ pub struct Config {
     /// HDMI's default for video formats is limited (#23). YCbCr is always
     /// limited, and a Dolby Vision tunnel states its own range.
     pub rgb_range: Levels,
+    /// What the output sends: SDR in a BT.2020 container, tone-mapped where
+    /// the source is brighter, or HDR10 passed through as it came. Dolby
+    /// Vision is never passed through.
+    pub mode: OutputMode,
+    /// The brightness, in nits, that the SDR output's white stands for: what
+    /// HDR is mapped down to.
+    pub white_nits: u16,
+    /// Whether YCbCr input labelled SDR BT.2020 is a player's low-latency
+    /// Dolby Vision: PQ already mapped by the player to `lldv_nits`.
+    pub lldv: bool,
+    pub lldv_nits: u16,
+    /// The tone curve for HDR into the SDR output.
+    pub curve: Curve,
+}
+
+/// What the output sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    Sdr2020,
+    Passthrough,
 }
 
 impl Default for Config {
@@ -47,6 +67,15 @@ impl Default for Config {
             width: 4096,
             height: 2160,
             rgb_range: Levels::Limited,
+            mode: OutputMode::Sdr2020,
+            // The 96-nit low-latency Dolby Vision target the splitter's EDID
+            // declares (2026-10-13), so that input maps one to one.
+            white_nits: 96,
+            lldv: true,
+            lldv_nits: 96,
+            // The closest of libplacebo's curves to Dolby's own 100-nit
+            // rendition of a test disc (cinefit-cpp docs/findings.md).
+            curve: Curve::Hable,
         }
     }
 }
@@ -151,6 +180,39 @@ static SETTINGS: &[Setting] = &[
         set: |c, v| c.height = int(v) as u16,
     },
     Setting {
+        key: "output.mode",
+        kind: Kind::Choice(&["sdr2020", "passthrough"]),
+        apply: Apply::Restart,
+        help: "sdr2020: SDR in a BT.2020 container, HDR tone-mapped down to output.white_nits; set the display \
+               to an SDR BT.2020 mode. passthrough: HDR10 goes out as HDR10, for the display to map. Dolby \
+               Vision always goes out as SDR BT.2020.",
+        get: |c| {
+            Value::Name(
+                match c.mode {
+                    OutputMode::Sdr2020 => "sdr2020",
+                    OutputMode::Passthrough => "passthrough",
+                }
+                .into(),
+            )
+        },
+        set: |c, v| {
+            c.mode = if name(v) == "passthrough" {
+                OutputMode::Passthrough
+            } else {
+                OutputMode::Sdr2020
+            }
+        },
+    },
+    Setting {
+        key: "output.white_nits",
+        kind: Kind::Int { min: 48, max: 1000 },
+        apply: Apply::Restart,
+        help: "The brightness, in nits, that SDR output's white stands for: HDR above it is tone-mapped. \
+               Match input.lldv_nits so a player's low-latency Dolby Vision passes one to one.",
+        get: |c| Value::Int(c.white_nits.into()),
+        set: |c, v| c.white_nits = int(v) as u16,
+    },
+    Setting {
         key: "input.rgb_range",
         kind: Kind::Choice(&["limited", "full"]),
         apply: Apply::Live,
@@ -173,6 +235,46 @@ static SETTINGS: &[Setting] = &[
             }
         },
     },
+    Setting {
+        key: "input.lldv",
+        kind: Kind::Choice(&["on", "off"]),
+        apply: Apply::Restart,
+        help: "on: YCbCr input labelled SDR BT.2020 is a player's low-latency Dolby Vision, PQ already mapped \
+               to input.lldv_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
+        get: |c| Value::Name(if c.lldv { "on" } else { "off" }.into()),
+        set: |c, v| c.lldv = name(v) == "on",
+    },
+    Setting {
+        key: "input.lldv_nits",
+        kind: Kind::Int {
+            min: 48,
+            max: 10000,
+        },
+        apply: Apply::Restart,
+        help: "The peak, in nits, that low-latency Dolby Vision is mapped to: what the EDID upstream declares.",
+        get: |c| Value::Int(c.lldv_nits.into()),
+        set: |c, v| c.lldv_nits = int(v) as u16,
+    },
+    Setting {
+        key: "tonemap.curve",
+        kind: Kind::Choice(CURVES),
+        apply: Apply::Restart,
+        help: "The tone curve for HDR into SDR output: libplacebo's, by name.",
+        get: |c| Value::Name(c.curve.name().into()),
+        set: |c, v| c.curve = Curve::from_name(name(v)).unwrap_or(Curve::Hable),
+    },
+];
+
+const CURVES: &[&str] = &[
+    "hable",
+    "spline",
+    "bt2390",
+    "bt2446a",
+    "st2094-10",
+    "st2094-40",
+    "mobius",
+    "reinhard",
+    "clip",
 ];
 
 /// The table, in a stable order.
@@ -388,6 +490,21 @@ mod tests {
         let text = render(&c);
         assert!(text.contains("# The panel's width"));
         assert_eq!(parse(&text, p()).unwrap(), c);
+    }
+
+    #[test]
+    fn each_section_is_one_run_of_rows() {
+        // The file is written in table order, a header per change of section;
+        // a section that comes back is a duplicate key in TOML.
+        let mut done = std::collections::BTreeSet::new();
+        let mut current = "";
+        for s in settings() {
+            let section = s.key.split('.').next().unwrap_or("");
+            if section != current {
+                assert!(done.insert(section), "{section} rows are split");
+                current = section;
+            }
+        }
     }
 
     #[test]

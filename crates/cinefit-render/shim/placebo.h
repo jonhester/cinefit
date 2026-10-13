@@ -95,12 +95,34 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
 #define CF_PL_TRC_PQ 1
 #define CF_PL_TRC_HLG 2
 
+/* A mapping between brightness ranges, for a render into a target that cannot
+ * show the source's: the source's peak and the target's, in nits (0 leaves
+ * libplacebo's default for that side), and the tone curve between them, one
+ * of CF_PL_CURVE_*. NULL wherever one is taken means no mapping beyond what
+ * the colour spaces imply, as before. */
+typedef struct {
+    float src_peak;
+    float dst_peak;
+    int curve;
+} cf_pl_map;
+
+#define CF_PL_CURVE_CLIP 0
+#define CF_PL_CURVE_HABLE 1
+#define CF_PL_CURVE_SPLINE 2
+#define CF_PL_CURVE_BT2390 3
+#define CF_PL_CURVE_BT2446A 4
+#define CF_PL_CURVE_ST2094_10 5
+#define CF_PL_CURVE_ST2094_40 6
+#define CF_PL_CURVE_MOBIUS 7
+#define CF_PL_CURVE_REINHARD 8
+
 /* Renders the planes over the whole of dst: limited-range YCbCr with the
  * given matrix, primaries and transfer, chroma co-sited as HDMI 4:2:2 is,
  * into full-range RGB with dst_primaries and dst_trc. No dithering; waits for
  * the GPU. Returns 0, or -1 with the reason logged. */
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int primaries, int trc,
-                       cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place);
+                       cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
+                       const cf_pl_map *map);
 
 /* Uploads a tunneled Dolby Vision frame, captured as r210, into planes of
  * its size and unpacks the 12-bit ICtCp 4:2:2 inside it on the GPU: codes
@@ -120,7 +142,8 @@ typedef struct {
  * conversion (identity reshaping) to BT.2020 PQ, then into dst's primaries
  * and transfer. No dithering; waits for the GPU. Returns 0, or -1, logged. */
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
-                      cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place);
+                      cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
+                      const cf_pl_map *map);
 
 /* Captured RGB on the GPU: one rgba16 texture, w x h, each component stored
  * as its code shifted to the top of 16 bits (10-bit << 6, 8-bit << 8), plus

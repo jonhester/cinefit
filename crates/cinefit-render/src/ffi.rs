@@ -61,6 +61,14 @@ pub struct Tex {
 pub type LogCallback = unsafe extern "C" fn(ctx: *mut c_void, level: c_int, msg: *const c_char);
 
 #[cfg(target_os = "linux")]
+/// `cf_pl_map`.
+#[repr(C)]
+pub struct Map {
+    pub src_peak: f32,
+    pub dst_peak: f32,
+    pub curve: c_int,
+}
+
 unsafe extern "C" {
     pub fn cf_pl_api_version() -> c_int;
     pub fn cf_pl_create(
@@ -116,6 +124,7 @@ unsafe extern "C" {
         dst_primaries: c_int,
         dst_trc: c_int,
         place: *const f32,
+        map: *const Map,
     ) -> c_int;
     pub fn cf_pl_unpack_tunnel(
         pl: *mut Handle,
@@ -131,6 +140,7 @@ unsafe extern "C" {
         dst_primaries: c_int,
         dst_trc: c_int,
         place: *const f32,
+        map: *const Map,
     ) -> c_int;
     pub fn cf_pl_rgb_create(pl: *mut Handle, w: c_int, h: c_int) -> *mut Rgb;
     pub fn cf_pl_rgb_destroy(pl: *mut Handle, rgb: *mut Rgb);
