@@ -12,6 +12,7 @@
 //! every sample of each, so a star in a night sky is never missed between
 //! samples, and a frame with no bars costs a handful of rows.
 
+pub mod ar_policy;
 pub mod bars;
 pub mod cuts;
 #[cfg(test)]
