@@ -57,6 +57,8 @@ void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *tex);
  * for the GPU to finish. shift_x scrolls the source left by that many pixels,
  * wrapping around, for a pattern that moves. Returns 0, or -1 with the
  * reason logged. */
+/* Fills a render target with black, for a frame with nothing to show. */
+int cf_pl_clear_black(cf_pl *pl, cf_pl_tex *dst);
 int cf_pl_render(cf_pl *pl, cf_pl_tex *src, cf_pl_tex *dst, float shift_x);
 
 /* Captured YCbCr 4:2:2 on the GPU: a luma plane (r16, w x h) and a chroma

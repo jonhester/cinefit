@@ -129,6 +129,9 @@ struct Tunnel {
     /// This scene's brightest maxRGB, as a 12-bit PQ code (level 1
     /// `max_PQ`): the same measure as MaxCLL, per scene.
     scene_max_pq: Option<u16>,
+    /// This scene's average maxRGB, as a 12-bit PQ code (level 1 `avg_PQ`),
+    /// sent as MaxFALL.
+    scene_avg_pq: Option<u16>,
 }
 
 /// Decodes the tunnel in an `r210` frame, if it carries one. `None` when no
@@ -153,6 +156,7 @@ fn decode_tunnel(info: &FrameInfo, bytes: &[u8]) -> Option<Option<Tunnel>> {
         source_min_pq: m.source_min_pq,
         source_max_pq: m.source_max_pq,
         scene_max_pq: m.level1.map(|l| l.max_pq),
+        scene_avg_pq: m.level1.map(|l| l.avg_pq),
     }))
 }
 
@@ -237,6 +241,14 @@ fn output_for(
                         scene
                     }
                     .round(),
+                    // An average taken in PQ, so below MaxFALL's linear one;
+                    // the nearest measure the metadata has. 0, "unknown",
+                    // with no level 1. Whether the JVC reads MaxFALL at all is
+                    // not yet measured.
+                    max_fall: tunnel
+                        .and_then(|t| t.scene_avg_pq)
+                        .map_or(0.0, cinefit_dovi::pq_to_nits)
+                        .round(),
                     ..base
                 }),
                 pq_out,
@@ -674,11 +686,18 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
                 held = 0;
             }
             held += 1;
-            // RGB that may yet turn out to be a tunnel neither moves the
-            // output nor reaches the screen: drawn as plain RGB, tunnel bytes
-            // are colour noise. The last good frame stays up meanwhile.
+            // RGB that may yet turn out to be a tunnel does not move the
+            // output, and goes out as black: drawn as plain RGB, tunnel bytes
+            // are colour noise, and holding the last frame instead read as a
+            // frozen start to the film (2026-10-13). Black keeps time with
+            // the sound, which does not pass through here.
             if held < frames_to_trust(k) && frames_to_trust(k) > STABLE_FRAMES {
                 counts.unproven += 1;
+                let free = (0..BUFFERS)
+                    .find(|&b| b != front && b != pending)
+                    .expect("three buffers, two in use");
+                pl.clear_black(&targets[free])?;
+                ready = Some(free);
             } else {
                 // What the output should be for this frame, for the policy after
                 // the next flip. The rate is the input's, as the card reported it.
@@ -972,6 +991,7 @@ mod tests {
             source_min_pq: 62,
             source_max_pq: 3696,
             scene_max_pq: None,
+            scene_avg_pq: None,
         };
         let (h, out) = output_for(Kind::Tunnel, None, Some(&t));
         let h = h.expect("HDR");
@@ -984,6 +1004,8 @@ mod tests {
         assert!(h.min_mastering < 0.01);
         // No level 1: the grade's peak, never 0 ("unknown").
         assert!((h.max_cll - 4000.0).abs() < 10.0, "{}", h.max_cll);
+        // No level 1, no average: MaxFALL unknown.
+        assert_eq!(h.max_fall, 0.0);
         // A scene peaking at PQ 3079 (about 1000 nits) sends that as MaxCLL;
         // one brighter than the grade is capped at the grade's peak.
         let scene = |pq| Tunnel {
@@ -994,6 +1016,13 @@ mod tests {
         assert!((h.expect("HDR").max_cll - 1001.0).abs() < 2.0);
         let (h, _) = output_for(Kind::Tunnel, None, Some(&scene(4000)));
         assert!((h.expect("HDR").max_cll - 4000.0).abs() < 10.0);
+        // The scene's average, PQ 2081 (about 100 nits), goes out as MaxFALL.
+        let avg = Tunnel {
+            scene_avg_pq: Some(2081),
+            ..scene(3079)
+        };
+        let (h, _) = output_for(Kind::Tunnel, None, Some(&avg));
+        assert!((h.expect("HDR").max_fall - 100.0).abs() < 1.5);
         assert_eq!(
             (out.primaries, out.transfer),
             (Primaries::Bt2020, Transfer::Pq)
