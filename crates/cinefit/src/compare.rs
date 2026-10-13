@@ -94,6 +94,25 @@ fn ncc(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() / a.len() as f32
 }
 
+/// Fingerprints laid out by frame number from the first recorded frame, with
+/// `None` where the recording dropped one, and each slot's position in the
+/// recording.
+fn by_frame_number(index: &[ClipFrame], prints: Vec<Print>) -> (Vec<Print>, Vec<Option<usize>>) {
+    let first = index.iter().map(|f| f.frame_number).min().unwrap_or(0);
+    let len = index
+        .iter()
+        .map(|f| (f.frame_number - first) as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let (mut dense, mut pos) = (vec![None; len], vec![None; len]);
+    for (i, (f, p)) in index.iter().zip(prints).enumerate() {
+        let n = (f.frame_number - first) as usize;
+        dense[n] = p;
+        pos[n] = Some(i);
+    }
+    (dense, pos)
+}
+
 /// The offset `d` (tunnel frame `i` against HDR10 frame `i + d`) whose
 /// fingerprints agree best on average, with that average. Every `step`th
 /// tunnel frame is used; an offset needs at least 20 comparable frames.
@@ -142,8 +161,10 @@ fn pairs_at(t: &[Print], h: &[Print], d: i64) -> Vec<Pair> {
         let (Some(a), Some(b)) = (&t[i], &h[j as usize]) else {
             continue;
         };
-        // Motion: how far the frame's neighbours have moved from it.
-        let near = |k: usize| t[k].as_ref().map_or(0.0, |c| 1.0 - ncc(a, c));
+        // Motion: how far the frame's neighbours have moved from it. A
+        // dropped neighbour counts as full motion, so a frame beside a gap is
+        // not mistaken for a still.
+        let near = |k: usize| t[k].as_ref().map_or(1.0, |c| 1.0 - ncc(a, c));
         out.push(Pair {
             t: i,
             h: j as usize,
@@ -361,13 +382,27 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         fingerprints(&opts.tunnel, &ti)?,
         fingerprints(&opts.hdr10, &hi)?,
     );
+    // Aligned by the card's stream time, not by position: a frame the
+    // recorder dropped would otherwise shift every later one, so one offset
+    // held for only part of a recording (2026-10-13: 203 drops, mean match
+    // 0.667).
+    let ((tp, t_pos), (hp, h_pos)) = (by_frame_number(&ti, tp), by_frame_number(&hi, hp));
     // Every frame for a short clip, about 500 of them for a long one.
     let step = (tp.len() / 500).max(1);
     let Some((d, score)) = best_offset(&tp, &hp, opts.max_shift, step) else {
         return Err("no offset has enough comparable frames".into());
     };
-    println!("aligned: tunnel frame i is HDR10 frame i{d:+}, mean match {score:.3}");
-    let chosen = pick(&pairs_at(&tp, &hp, d), opts.pairs, 0.95);
+    println!("aligned by stream time: tunnel frame n is HDR10 frame n{d:+}, mean match {score:.3}");
+    let chosen: Vec<Pair> = pick(&pairs_at(&tp, &hp, d), opts.pairs, 0.95)
+        .into_iter()
+        .filter_map(|p| {
+            Some(Pair {
+                t: t_pos[p.t]?,
+                h: h_pos[p.h]?,
+                ..p
+            })
+        })
+        .collect();
     if chosen.is_empty() {
         return Err("no pair matches well enough (0.95)".into());
     }
@@ -470,6 +505,29 @@ mod tests {
         let (d, score) = best_offset(&t, &h, 40, 2).expect("offset");
         assert_eq!(d, 17);
         assert!(score > 0.99, "{score}");
+    }
+
+    #[test]
+    fn frames_are_laid_out_by_stream_time_with_gaps_for_drops() {
+        let frame = |index, frame_number| ClipFrame {
+            index,
+            offset: 0,
+            size: 0,
+            width: 1920,
+            height: 1080,
+            row_bytes: 5120,
+            pixel_format: "v210".to_string(),
+            frame_number,
+        };
+        // Recorded frames 0, 1, 2 are stream frames 10, 11 and 13: 12 dropped.
+        let index = [frame(0, 10), frame(1, 11), frame(2, 13)];
+        let prints = vec![Some(vec![0.0]), Some(vec![1.0]), Some(vec![3.0])];
+        let (dense, pos) = by_frame_number(&index, prints);
+        assert_eq!(
+            dense,
+            vec![Some(vec![0.0]), Some(vec![1.0]), None, Some(vec![3.0])]
+        );
+        assert_eq!(pos, vec![Some(0), Some(1), None, Some(2)]);
     }
 
     #[test]
