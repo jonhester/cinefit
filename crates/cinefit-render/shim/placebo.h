@@ -116,13 +116,16 @@ typedef struct {
 #define CF_PL_CURVE_MOBIUS 7
 #define CF_PL_CURVE_REINHARD 8
 
-/* Renders the planes over the whole of dst: limited-range YCbCr with the
+/* `src_crop`, on every render: which part of the source is drawn, as x0, y0,
+ * x1, y1 in source pixels, or NULL for the whole frame. The bars cropped out.
+ *
+ * Renders the planes over the whole of dst: limited-range YCbCr with the
  * given matrix, primaries and transfer, chroma co-sited as HDMI 4:2:2 is,
  * into full-range RGB with dst_primaries and dst_trc. No dithering; waits for
  * the GPU. Returns 0, or -1 with the reason logged. */
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int primaries, int trc,
                        cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
-                       const cf_pl_map *map);
+                       const cf_pl_map *map, const float *src_crop);
 
 /* Uploads a tunneled Dolby Vision frame, captured as r210, into planes of
  * its size and unpacks the 12-bit ICtCp 4:2:2 inside it on the GPU: codes
@@ -143,7 +146,7 @@ typedef struct {
  * and transfer. No dithering; waits for the GPU. Returns 0, or -1, logged. */
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
                       cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
-                      const cf_pl_map *map);
+                      const cf_pl_map *map, const float *src_crop);
 
 /* Captured RGB on the GPU: one rgba16 texture, w x h, each component stored
  * as its code shifted to the top of 16 bits (10-bit << 6, 8-bit << 8), plus
@@ -177,7 +180,8 @@ int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *rgb, uint16_t *out);
  * depth of the last unpack. No dithering; waits for the GPU. Returns 0, or
  * -1, logged. */
 int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int primaries, int trc,
-                     cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place);
+                     cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
+                     const float *src_crop);
 
 /* A w x h RGBA 16-bit texture to render into and read back, for checks. Null
  * on failure, logged. */

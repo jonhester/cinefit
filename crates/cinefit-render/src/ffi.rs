@@ -125,6 +125,7 @@ unsafe extern "C" {
         dst_trc: c_int,
         place: *const f32,
         map: *const Map,
+        src_crop: *const f32,
     ) -> c_int;
     pub fn cf_pl_unpack_tunnel(
         pl: *mut Handle,
@@ -141,6 +142,7 @@ unsafe extern "C" {
         dst_trc: c_int,
         place: *const f32,
         map: *const Map,
+        src_crop: *const f32,
     ) -> c_int;
     pub fn cf_pl_rgb_create(pl: *mut Handle, w: c_int, h: c_int) -> *mut Rgb;
     pub fn cf_pl_rgb_destroy(pl: *mut Handle, rgb: *mut Rgb);
@@ -162,6 +164,7 @@ unsafe extern "C" {
         dst_primaries: c_int,
         dst_trc: c_int,
         place: *const f32,
+        src_crop: *const f32,
     ) -> c_int;
     pub fn cf_pl_target_rgba16(pl: *mut Handle, w: c_int, h: c_int) -> *mut Tex;
     pub fn cf_pl_download_rgba16(pl: *mut Handle, tex: *mut Tex, out: *mut u16) -> c_int;
