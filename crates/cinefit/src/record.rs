@@ -248,6 +248,93 @@ fn csv_line(item: &Item, offset: u64) -> String {
     )
 }
 
+/// One frame of a recorded clip, from its `frames.csv`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipFrame {
+    pub index: u64,
+    pub offset: u64,
+    pub size: usize,
+    pub width: usize,
+    pub height: usize,
+    pub row_bytes: usize,
+    /// As the card reported it: "v210", "r210", "8-bit ARGB".
+    pub pixel_format: String,
+}
+
+/// Reads a clip's `frames.csv`.
+///
+/// # Errors
+///
+/// If the file cannot be read or a line does not parse.
+pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
+    let text = std::fs::read_to_string(dir.join("frames.csv"))?;
+    let bad = |n: usize| std::io::Error::other(format!("frames.csv line {n} does not parse"));
+    let mut frames = Vec::new();
+    for (n, line) in text.lines().enumerate().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 10 {
+            return Err(bad(n + 1));
+        }
+        let num = |i: usize| f[i].parse::<u64>().map_err(|_| bad(n + 1));
+        frames.push(ClipFrame {
+            index: num(0)?,
+            offset: num(1)?,
+            size: num(2)? as usize,
+            width: num(6)? as usize,
+            height: num(7)? as usize,
+            row_bytes: num(8)? as usize,
+            pixel_format: f[9].to_string(),
+        });
+    }
+    Ok(frames)
+}
+
+/// Streams a clip's frames through `zstd -dc` in order, calling `each` with
+/// every frame for which `want` says yes. Frames are read one at a time, so a
+/// clip of any length needs one frame of memory.
+///
+/// # Errors
+///
+/// If zstd cannot run, the stream ends early, or `each` fails.
+pub fn for_each_frame<E: From<std::io::Error>>(
+    dir: &Path,
+    index: &[ClipFrame],
+    mut want: impl FnMut(&ClipFrame) -> bool,
+    mut each: impl FnMut(&ClipFrame, &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    use std::io::Read;
+    let mut child = Command::new("zstd")
+        .arg("-dc")
+        .arg(dir.join("frames.zst"))
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut out = std::io::BufReader::with_capacity(1 << 24, child.stdout.take().expect("piped"));
+    let mut buf = Vec::new();
+    let mut at = 0u64;
+    let result = (|| {
+        for f in index {
+            if f.offset != at {
+                return Err(std::io::Error::other(format!(
+                    "frame {} is at {} in the stream, not {at}",
+                    f.index, f.offset
+                ))
+                .into());
+            }
+            buf.resize(f.size, 0);
+            out.read_exact(&mut buf)?;
+            at += f.size as u64;
+            if want(f) {
+                each(f, &buf)?;
+            }
+        }
+        Ok(())
+    })();
+    drop(out);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +390,28 @@ mod tests {
             .collect();
         assert_eq!(offsets, ["0", "32", "64", "96", "128"]);
         assert!(dir.join("README.txt").exists());
+        // And back through the reader: the index matches, and every frame
+        // comes out whole.
+        let index = read_index(&dir).expect("index");
+        assert_eq!(index.len(), 5);
+        assert_eq!(
+            (index[2].offset, index[2].size, index[2].row_bytes),
+            (64, 32, 16)
+        );
+        assert_eq!(index[0].pixel_format, "v210");
+        let mut got = Vec::new();
+        for_each_frame::<std::io::Error>(
+            &dir,
+            &index,
+            |f| f.index != 3,
+            |f, b| {
+                got.push((f.index, b.to_vec()));
+                Ok(())
+            },
+        )
+        .expect("read");
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[3], (4, frames[4].clone()));
         // A second recording into the same directory is refused, not mixed in.
         assert!(ClipWriter::create(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
