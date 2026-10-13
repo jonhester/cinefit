@@ -920,6 +920,10 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     params.peak_detect_params = NULL;
     struct pl_color_map_params cmp;
     apply_map(&image, &target, &params, &cmp, map);
+    if (pl->num_hooks) {
+        params.hooks = pl->hooks;
+        params.num_hooks = pl->num_hooks;
+    }
     if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
