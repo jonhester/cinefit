@@ -582,10 +582,13 @@ fn ms(since: Instant) -> f64 {
 /// cannot be opened is reported and the run goes on without one.
 pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     match runlog::init(runlog::default_dir().as_deref(), "play") {
-        Ok(path) => println!("log: {}", path.display()),
-        Err(e) => eprintln!("log: not written: {e}"),
+        Ok(path) => info!("log: {}", path.display()),
+        Err(e) => warn!("log: not written: {e}"),
     }
-    let args: Vec<String> = std::env::args().collect();
+    // args_os: clap takes a path that is not UTF-8, which args() would panic on.
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     log::debug!("{}", args.join(" "));
     // The settings as this run read them: a question about a run is often
     // which setting was on.

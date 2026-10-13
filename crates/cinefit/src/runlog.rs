@@ -53,13 +53,22 @@ fn create(dir: &Path, prefix: &str) -> io::Result<(PathBuf, File)> {
             "[year]-[month]-[day]-[hour][minute][second]"
         ))
         .map_err(io::Error::other)?;
-    let path = dir.join(format!("{prefix}-{stamp}.log"));
-    // create_new: two runs started in the same second must not share a file.
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    Ok((path, file))
+    // create_new, and a numbered name if taken: two runs started in the same
+    // second must neither share a file nor go unlogged (the second fails on
+    // the capture card, and its error is worth keeping).
+    let mut n = 1;
+    loop {
+        let name = match n {
+            1 => format!("{prefix}-{stamp}.log"),
+            _ => format!("{prefix}-{stamp}-{n}.log"),
+        };
+        let path = dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn dispatch(
@@ -128,6 +137,19 @@ mod tests {
                 .args(format_args!("{message}"))
                 .build(),
         );
+    }
+
+    #[test]
+    fn runs_in_the_same_second_get_their_own_files() {
+        let dir = std::env::temp_dir().join(format!("cinefit-runlog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths: Vec<PathBuf> = (0..3).map(|_| create(&dir, "play").unwrap().0).collect();
+        let _ = fs::remove_dir_all(&dir);
+        // Three in a row land in one second, or straddle two; either way no
+        // two share a name.
+        assert_ne!(paths[0], paths[1]);
+        assert_ne!(paths[1], paths[2]);
+        assert_ne!(paths[0], paths[2]);
     }
 
     #[test]
