@@ -52,6 +52,7 @@ On the machine with the hardware:
     cinefit pattern -t 30 [--gpu] [--hdr]   # puts a picture on the display
     cinefit play --dry-run             # capture, mode, signalling, first render; display untouched
     cinefit play -t 30                 # capture to screen: puts the input on the display
+    cinefit settings [--toml]          # every setting: value, range, cost, help
 
 `CINEFIT_STILLS=DIR cargo test --release -p cinefit-detect --test stills` reads
 the stills set and must match the C++ detector's baseline exactly.
@@ -86,6 +87,12 @@ unset.
   in `cinefit-render/build.rs`, together.
 
 ## Conventions
+
+- **Settings are rows in one table** (`crates/cinefit/src/config.rs`): key,
+  range, help, and what applying a change costs (live, modeset, restart).
+  An owner-facing knob is a row there, read from
+  `~/.config/cinefit-rs/cinefit.toml` and overridable with `--set`; switches
+  for one experiment stay flags, so they cannot be left on in a file.
 
 - Every `unsafe` block has a `// SAFETY:` comment; clippy enforces it.
 - Structs shared with a C shim are declared on both sides; assert every field

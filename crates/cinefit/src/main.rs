@@ -3,6 +3,7 @@
 
 mod capture;
 mod compare;
+mod config;
 mod follow;
 #[cfg(target_os = "linux")]
 mod play;
@@ -129,12 +130,13 @@ enum Command {
         /// The DRM device; by default the first with a connected display.
         #[arg(long)]
         card: Option<PathBuf>,
-        /// The panel's width and height: the output's size. The default is a
-        /// 17:9 4K panel.
-        #[arg(long, default_value_t = 4096)]
-        width: u16,
-        #[arg(long, default_value_t = 2160)]
-        height: u16,
+        /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override one setting for this run, as KEY=VALUE (repeatable;
+        /// `cinefit settings` lists them).
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        sets: Vec<String>,
         /// Leave the GPU's clocks to the driver's default policy instead of
         /// holding the standard stable power state.
         #[arg(long)]
@@ -143,6 +145,15 @@ enum Command {
         /// render, with the display untouched.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// List every setting: its value, range, what a change costs, and help.
+    Settings {
+        /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print the settings as a complete, commented settings file instead.
+        #[arg(long)]
+        toml: bool,
     },
 }
 
@@ -192,13 +203,16 @@ fn main() -> ExitCode {
             seconds,
             device,
             card,
-            width,
-            height,
+            config,
+            sets,
             no_pstate,
             dry_run,
-        } => play(play_options(
-            seconds, device, card, width, height, !no_pstate, dry_run,
-        )),
+        } => load_config(config.as_deref(), &sets).and_then(|config| {
+            play(play_options(
+                seconds, device, card, config, !no_pstate, dry_run,
+            ))
+        }),
+        Command::Settings { config, toml } => settings(config.as_deref(), toml),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -561,8 +575,7 @@ fn play_options(
     seconds: f64,
     device: usize,
     card: Option<PathBuf>,
-    width: u16,
-    height: u16,
+    config: config::Config,
     pstate: bool,
     dry_run: bool,
 ) -> play::Options {
@@ -570,8 +583,7 @@ fn play_options(
         seconds,
         device,
         card,
-        width,
-        height,
+        config,
         pstate,
         dry_run,
     }
@@ -587,8 +599,7 @@ fn play_options(
     _seconds: f64,
     _device: usize,
     _card: Option<PathBuf>,
-    _width: u16,
-    _height: u16,
+    _config: config::Config,
     _pstate: bool,
     _dry_run: bool,
 ) {
@@ -607,6 +618,48 @@ fn compare_run(opts: compare::Options) -> Result<(), Box<dyn std::error::Error>>
 #[cfg(not(target_os = "linux"))]
 fn compare_run(_opts: compare::Options) -> Result<(), Box<dyn std::error::Error>> {
     Err("comparing renders is only supported on Linux".into())
+}
+
+/// The settings file (or the defaults), then each `--set` over it.
+fn load_config(
+    path: Option<&std::path::Path>,
+    sets: &[String],
+) -> Result<config::Config, Box<dyn std::error::Error>> {
+    let path = path.map_or_else(config::default_path, std::path::Path::to_path_buf);
+    let mut c = config::load(&path)?;
+    for s in sets {
+        config::set(&mut c, s)?;
+    }
+    Ok(c)
+}
+
+fn settings(path: Option<&std::path::Path>, toml: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let file = path.map_or_else(config::default_path, std::path::Path::to_path_buf);
+    let c = config::load(&file)?;
+    if toml {
+        print!("{}", config::render(&c));
+        return Ok(());
+    }
+    println!(
+        "{} ({})",
+        file.display(),
+        if file.exists() {
+            "read"
+        } else {
+            "not there: defaults"
+        }
+    );
+    for s in config::settings() {
+        println!(
+            "{} = {}  ({}; applies: {})",
+            s.key,
+            s.get(&c),
+            s.range(),
+            s.apply
+        );
+        println!("    {}", s.help);
+    }
+    Ok(())
 }
 
 fn gpu() -> Result<(), Box<dyn std::error::Error>> {
