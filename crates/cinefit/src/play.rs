@@ -19,6 +19,8 @@ use crate::follow;
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
+use cinefit_detect::{Detector, V210};
+use cinefit_geometry as geo;
 use cinefit_render::{
     Curve, DoviColor, GpuPlanes, GpuRgb, Levels, Mapping, Matrix, Placebo, Primaries, Rect,
     RgbColor, RgbSourceColor, Texture, Transfer, View, YcbcrColor, rgb,
@@ -403,7 +405,6 @@ impl Stages {
 /// output's colour.
 struct Target<'a, 'p> {
     tex: &'a Texture<'p>,
-    size: (u32, u32),
     color: RgbColor,
     /// What plain RGB input's codes mean (the `input.rgb_range` setting).
     rgb_range: Levels,
@@ -414,6 +415,35 @@ struct Target<'a, 'p> {
     lldv_nits: Option<f32>,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
+    /// Which part of the frame is drawn and where it lands.
+    view: View,
+}
+
+/// The render's rectangles for a frame: the detector's rows placed at constant
+/// image height in the screen's band of the raster, or the whole frame fitted
+/// to the raster when cropping is off. Geometry stays in these crop rects; a
+/// geometry change never commits.
+fn view_for(
+    frame: (u32, u32),
+    out: (u32, u32),
+    win: geo::Rect,
+    source: geo::Source,
+    fill_max_ar: f64,
+) -> View {
+    if source == geo::Source::Whole {
+        return View::placed(Some(Rect::fit(frame.0, frame.1, out.0, out.1)));
+    }
+    let p = geo::place_frame(frame, out, win, source, fill_max_ar);
+    let rect = |r: geo::Rect| Rect {
+        x0: r.x as f32,
+        y0: r.y as f32,
+        x1: (r.x + r.w) as f32,
+        y1: (r.y + r.h) as f32,
+    };
+    View {
+        src: Some(rect(p.src)),
+        dst: Some(rect(p.dst)),
+    }
 }
 
 /// Unpacks `frame` and renders it, its shape kept, into `dst`. Returns false
@@ -433,7 +463,7 @@ fn render<'p>(
     let Some(pixels) = frame.pixels() else {
         return Ok(false);
     };
-    let place = Some(Rect::fit(info.width, info.height, dst.size.0, dst.size.1));
+    let view = dst.view;
     let out = dst.color;
     let planes = |s: &mut Sources<'p>| -> Result<(), Box<dyn Error>> {
         if s.planes
@@ -489,7 +519,7 @@ fn render<'p>(
                         curve: dst.curve,
                     }
                 });
-            pl.render_ycbcr_mapped(p, color, dst.tex, out, View::placed(place), map.as_ref())?;
+            pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
             stages.render.push(ms(t));
         }
         Kind::Tunnel => {
@@ -508,14 +538,7 @@ fn render<'p>(
                 dst_peak: dst.white_nits,
                 curve: dst.curve,
             });
-            pl.render_dovi_mapped(
-                p,
-                &tunnel.color,
-                dst.tex,
-                out,
-                View::placed(place),
-                map.as_ref(),
-            )?;
+            pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
             stages.render.push(ms(t));
         }
         Kind::Rgb(format) => {
@@ -536,7 +559,7 @@ fn render<'p>(
                 primaries: ycbcr_color(info).primaries,
                 transfer: ycbcr_color(info).transfer,
             };
-            pl.render_rgb(r, color, dst.tex, out, place)?;
+            pl.render_rgb_view(r, color, dst.tex, out, view)?;
             stages.render.push(ms(t));
         }
         Kind::Unsupported(_) => return Ok(false),
@@ -717,28 +740,83 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     // first frame is the source's.
     let mut sources = Sources::default();
     let mut stages = Stages::default();
-    let target = |b: usize, color: RgbColor| Target {
+    let target = |b: usize, color: RgbColor, view: View| Target {
         tex: &targets[b],
-        size,
         color,
         rgb_range: opts.config.rgb_range,
         white_nits: f32::from(opts.config.white_nits),
         curve: opts.config.curve,
         lldv_nits: opts.config.lldv.then_some(f32::from(opts.config.lldv_nits)),
         source_peak: (opts.config.source_peak > 0).then_some(f32::from(opts.config.source_peak)),
+        view,
     };
+
+    // The bar detector reads each YCbCr frame on this thread (about 8 ms at
+    // 2160p) and its crop goes to the geometry: the picture at constant
+    // image height in the screen's band of the raster. Other formats, which
+    // have no adapter yet, keep the last crop.
+    let win = geo::screen_window(size.0, size.1, opts.config.screen_ar);
+    if opts.config.crop {
+        println!(
+            "crop: on; screen {:.2}:1 is rows {}-{} of the raster, fill up to {:.2}:1",
+            opts.config.screen_ar,
+            win.y,
+            win.y + win.h,
+            opts.config.fill_max_ar
+        );
+    }
+    let mut det = Detector::default();
+    let mut crops = 0u64;
+    let mut detect = |frame: &Frame, kind: Kind, t: f64, epoch: u32| -> geo::Source {
+        if !opts.config.crop {
+            return geo::Source::Whole;
+        }
+        let info = frame.info();
+        if matches!(kind, Kind::Ycbcr(_))
+            && let Some(px) = frame.pixels()
+            && let Some(v) = V210::new(px.bytes(), info.width, info.height, info.row_bytes)
+        {
+            let d = det.push(&v, t, epoch);
+            if d.changed {
+                crops += 1;
+                let c = d.crop;
+                println!(
+                    "{t:.1} s: crop {}/{} ({}): picture {} x {} rows, {:.3}:1",
+                    c.top,
+                    c.bottom,
+                    d.diag.reason,
+                    info.width,
+                    c.active(info.height),
+                    f64::from(info.width) / f64::from(c.active(info.height).max(1))
+                );
+            }
+        }
+        let c = det.crop();
+        geo::Source::Rows {
+            top: c.top,
+            bottom: c.bottom,
+        }
+    };
+    let first_info = *first.info();
+    let first_source = detect(&first, key.kind, 0.0, 1);
+    let first_view = view_for(
+        (first_info.width, first_info.height),
+        size,
+        win,
+        first_source,
+        opts.config.fill_max_ar,
+    );
     if !render(
         &pl,
         &first,
         key.kind,
         last_tunnel.as_ref(),
         &mut sources,
-        &target(0, out_color),
+        &target(0, out_color, first_view),
         &mut stages,
     )? {
         return Err("the first frame could not be rendered".into());
     }
-    let first_info = *first.info();
     drop(first);
     if opts.dry_run {
         println!(
@@ -748,7 +826,9 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         );
         // A signal is not a picture: look at the pixels.
         let fourcc = out.export(buffers[0])?.fourcc;
-        let place = Rect::fit(first_info.width, first_info.height, size.0, size.1);
+        let place = first_view
+            .dst
+            .unwrap_or_else(|| Rect::fit(first_info.width, first_info.height, size.0, size.1));
         let report = out.read_scanout(buffers[0], |px, stride| {
             look(px, stride, fourcc, size, place)
         })?;
@@ -847,6 +927,21 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
                 let free = (0..BUFFERS)
                     .find(|&b| b != front && b != pending)
                     .expect("three buffers, two in use");
+                // Every change of input format is a new epoch for the
+                // detector, which forgets what it learned.
+                let source = detect(
+                    &frame,
+                    k.kind,
+                    run_started.elapsed().as_secs_f64(),
+                    counts.format_changes as u32 + 1,
+                );
+                let view = view_for(
+                    (k.width, k.height),
+                    size,
+                    win,
+                    source,
+                    opts.config.fill_max_ar,
+                );
                 // Rendered into the output as it stands, which libplacebo maps
                 // to, until the policy moves the output.
                 if render(
@@ -855,7 +950,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
                     k.kind,
                     last_tunnel.as_ref(),
                     &mut sources,
-                    &target(free, out_color),
+                    &target(free, out_color, view),
                     &mut stages,
                 )? {
                     ready = Some(free);
@@ -992,6 +1087,18 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         "followed the source: {} modesets, {} metadata updates without one, {} refused",
         counts.modesets, counts.metadata, counts.refused
     );
+    if opts.config.crop {
+        let shares: Vec<String> = det
+            .policy()
+            .shares()
+            .iter()
+            .map(|s| format!("{} rows {:.1} s", s.rows, s.seconds))
+            .collect();
+        println!(
+            "crop: {crops} changes; time at each height: {}",
+            shares.join(", ")
+        );
+    }
     finished.push((mode_name, period, pacing));
     for (name, period, pacing) in &finished {
         print!("{name}: {}", pacing.summary(*period));

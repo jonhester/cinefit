@@ -57,6 +57,14 @@ pub struct Config {
     /// holds: the test disc's 10,000-nit title says 10,000, its scenes peak
     /// at 2,700-4,000.
     pub source_peak: u16,
+    /// Find the black bars and crop them out, placing the picture at
+    /// constant image height; off, every frame fills the raster as it came.
+    pub crop: bool,
+    /// The screen's aspect: the band of the raster that lands on it.
+    pub screen_ar: f64,
+    /// Content wider than this is trimmed at the sides to fill the screen's
+    /// height rather than letterboxed inside it.
+    pub fill_max_ar: f64,
 }
 
 /// What the output sends.
@@ -87,6 +95,9 @@ impl Default for Config {
             // evidence yet.
             curve: Curve::Spline,
             source_peak: 0,
+            crop: true,
+            screen_ar: 2.35,
+            fill_max_ar: 2.40,
         }
     }
 }
@@ -125,6 +136,8 @@ pub enum Kind {
     Int { min: i64, max: i64 },
     /// One of these names.
     Choice(&'static [&'static str]),
+    /// A number in `min..=max`, with a fraction: a ratio.
+    Float { min: f64, max: f64 },
 }
 
 /// One row of the table.
@@ -142,6 +155,7 @@ pub struct Setting {
 pub enum Value {
     Int(i64),
     Name(String),
+    Float(f64),
 }
 
 impl fmt::Display for Value {
@@ -149,6 +163,7 @@ impl fmt::Display for Value {
         match self {
             Value::Int(v) => write!(f, "{v}"),
             Value::Name(n) => f.write_str(n),
+            Value::Float(v) => write!(f, "{v}"),
         }
     }
 }
@@ -156,6 +171,7 @@ impl fmt::Display for Value {
 fn int(v: &Value) -> i64 {
     match v {
         Value::Int(v) => *v,
+        Value::Float(v) => *v as i64,
         Value::Name(_) => 0,
     }
 }
@@ -163,7 +179,15 @@ fn int(v: &Value) -> i64 {
 fn name(v: &Value) -> &str {
     match v {
         Value::Name(n) => n,
-        Value::Int(_) => "",
+        Value::Int(_) | Value::Float(_) => "",
+    }
+}
+
+fn float(v: &Value) -> f64 {
+    match v {
+        Value::Float(v) => *v,
+        Value::Int(v) => *v as f64,
+        Value::Name(_) => 0.0,
     }
 }
 
@@ -283,6 +307,33 @@ static SETTINGS: &[Setting] = &[
         get: |c| Value::Int(c.source_peak.into()),
         set: |c, v| c.source_peak = int(v) as u16,
     },
+    Setting {
+        key: "detect.crop",
+        kind: Kind::Choice(&["on", "off"]),
+        apply: Apply::Restart,
+        help: "on: find the black bars and crop them out, the picture placed at constant image height in the \
+               screen's band of the raster. off: every frame fills the raster as it came.",
+        get: |c| Value::Name(if c.crop { "on" } else { "off" }.into()),
+        set: |c, v| c.crop = name(v) == "on",
+    },
+    Setting {
+        key: "geometry.screen_ar",
+        kind: Kind::Float { min: 1.0, max: 3.0 },
+        apply: Apply::Restart,
+        help: "The screen's aspect ratio: with the lens set so the raster's width fills the screen, the band of \
+               the raster that lands on it. 2.35 for a 2.35:1 screen.",
+        get: |c| Value::Float(c.screen_ar),
+        set: |c, v| c.screen_ar = float(v),
+    },
+    Setting {
+        key: "geometry.fill_max_ar",
+        kind: Kind::Float { min: 1.0, max: 3.0 },
+        apply: Apply::Restart,
+        help: "Content wider than this is trimmed at the sides to fill the screen's height, rather than \
+               letterboxed inside it. 2.40 keeps 2.39 and 2.40 full height and trims 2.55 and 2.76.",
+        get: |c| Value::Float(c.fill_max_ar),
+        set: |c, v| c.fill_max_ar = float(v),
+    },
 ];
 
 const CURVES: &[&str] = &[
@@ -316,6 +367,7 @@ impl Setting {
         match self.kind {
             Kind::Int { min, max } => format!("{min}-{max}"),
             Kind::Choice(names) => names.join(" | "),
+            Kind::Float { min, max } => format!("{min}-{max}"),
         }
     }
 
@@ -329,6 +381,9 @@ impl Setting {
         match (self.kind, v) {
             (Kind::Int { min, max }, Value::Int(n)) if (min..=max).contains(n) => {}
             (Kind::Choice(names), Value::Name(n)) if names.contains(&n.as_str()) => {}
+            (Kind::Float { min, max }, Value::Float(x)) if (min..=max).contains(x) => {}
+            // A whole number where a ratio goes: 2 for 2.0.
+            (Kind::Float { min, max }, Value::Int(n)) if (min..=max).contains(&(*n as f64)) => {}
             _ => return Err(bad()),
         }
         (self.set)(c, v);
@@ -387,7 +442,8 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, Error> {
             let value = match v {
                 toml::Value::Integer(n) => Value::Int(*n),
                 toml::Value::String(n) => Value::Name(n.clone()),
-                // A float, bool or table fits no setting yet: refused by put.
+                toml::Value::Float(x) => Value::Float(*x),
+                // A bool or table fits no setting: refused by put.
                 other => Value::Name(format!("a {}", other.type_str())),
             };
             s.put(&mut c, &value)?;
@@ -419,6 +475,11 @@ pub fn set(c: &mut Config, assignment: &str) -> Result<(), Error> {
             range: s.range(),
         })?),
         Kind::Choice(_) => Value::Name(text.to_string()),
+        Kind::Float { .. } => Value::Float(text.parse().map_err(|_| Error::Value {
+            key: s.key.to_string(),
+            value: text.to_string(),
+            range: s.range(),
+        })?),
     };
     s.put(c, &value)
 }
@@ -446,6 +507,8 @@ pub fn render(c: &Config) -> String {
         match s.get(c) {
             Value::Int(v) => out.push_str(&format!("{name} = {v}\n")),
             Value::Name(n) => out.push_str(&format!("{name} = \"{n}\"\n")),
+            // Always with a fraction, so it reads back as a float.
+            Value::Float(v) => out.push_str(&format!("{name} = {v:?}\n")),
         }
     }
     out
@@ -500,6 +563,26 @@ mod tests {
         assert_eq!((c.rgb_range, c.height), (Levels::Full, 1080));
         assert!(set(&mut c, "output.height=tall").is_err());
         assert!(set(&mut c, "nonsense").is_err());
+    }
+
+    #[test]
+    fn ratios_are_floats_with_a_range() {
+        let mut c = Config::default();
+        set(&mut c, "geometry.screen_ar=2.4").unwrap();
+        set(&mut c, "geometry.fill_max_ar = 2").unwrap();
+        assert_eq!((c.screen_ar, c.fill_max_ar), (2.4, 2.0));
+        assert!(set(&mut c, "geometry.screen_ar=0.5").is_err());
+        assert!(set(&mut c, "geometry.screen_ar=wide").is_err());
+        let text = render(&c);
+        assert!(
+            text.contains("screen_ar = 2.4\n") && text.contains("fill_max_ar = 2.0\n"),
+            "{text}"
+        );
+        assert_eq!(parse(&text, p()).unwrap(), c);
+        assert_eq!(
+            parse("[geometry]\nscreen_ar = 2\n", p()).unwrap().screen_ar,
+            2.0
+        );
     }
 
     #[test]
