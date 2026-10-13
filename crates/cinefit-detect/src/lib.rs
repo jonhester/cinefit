@@ -15,6 +15,10 @@
 pub mod ar_policy;
 pub mod bars;
 pub mod cuts;
+pub mod detector;
+
+pub use ar_policy::{Crop, Decision, Diagnostics};
+pub use detector::Detector;
 #[cfg(test)]
 mod synth;
 

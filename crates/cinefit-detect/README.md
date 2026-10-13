@@ -67,10 +67,16 @@ notice.
   clears the evidence of the previous shot; a format change, a new frame
   size or half an hour of nothing resets everything to full frame.
 
+## The detector
+
+`Detector` is the three together: Bars reads the frame, Cuts compares it with
+the last one over the crop on screen, the policy decides. Frames in, a
+`Decision` out: the crop, whether it changed, and diagnostics for a log or
+an overlay. It never touches the image path.
+
 ## Not ported yet
 
-- **The detector glue** (Bars, Cuts and the policy as one object), the
-  adapters for the tunnel and RGB formats, and the wiring into `play`.
+- The adapters for the tunnel and RGB formats, and the wiring into `play`.
 
 ## Tests
 
@@ -81,4 +87,5 @@ The stills are real frames, so they're not in the repo. On the rig:
 
     CINEFIT_STILLS=DIR cargo test --release -p cinefit-detect --test stills -- --nocapture
 
-All 513 must read the same as the C++ version.
+All 513 must read the same as the C++ version, through Bars and through the
+whole detector.
