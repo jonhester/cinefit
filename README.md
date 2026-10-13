@@ -16,8 +16,10 @@ run on any platform; without the driver, it reports that it is not loaded.
 hands over the newest frame, the bar detector finds the picture inside it,
 the geometry places that picture at constant image height, the renderer
 crops and scales it on the GPU, and the display code flips it out at the
-next vblank. Each step is its own crate, and none of them knows about the
-others; the `cinefit` crate wires them together and holds the settings.
+next vblank. The detector reads YCbCr input only: a Dolby Vision tunnel or
+RGB input keeps the last crop, and `detect.crop = off` skips it. Each step is
+its own crate, and none of them knows about the others; the `cinefit` crate
+wires them together and holds the settings.
 
 ```mermaid
 flowchart LR
