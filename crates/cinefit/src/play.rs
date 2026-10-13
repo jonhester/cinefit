@@ -488,6 +488,8 @@ fn render<'p>(
                         dst_peak: dst.white_nits,
                         curve: dst.curve,
                         scene: None,
+                        peak_detect: false,
+                        contrast_recovery: 0.0,
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, place, map.as_ref())?;
@@ -509,6 +511,8 @@ fn render<'p>(
                 dst_peak: dst.white_nits,
                 curve: dst.curve,
                 scene: None,
+                peak_detect: false,
+                contrast_recovery: 0.0,
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, place, map.as_ref())?;
             stages.render.push(ms(t));

@@ -71,6 +71,10 @@ cf_pl *cf_pl_create(cf_pl_log_cb log_cb, void *ctx, char *err, size_t err_len) {
     return pl;
 }
 
+void cf_pl_flush(cf_pl *pl) {
+    pl_renderer_flush_cache(pl->renderer);
+}
+
 int cf_pl_hook_add(cf_pl *pl, const char *text, size_t len) {
     if (pl->num_hooks == (int)(sizeof pl->hooks / sizeof pl->hooks[0])) return -1;
     const struct pl_hook *h = pl_mpv_user_shader_parse(pl->vk->gpu, text, len);
@@ -495,7 +499,9 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
     target->color.hdr.min_luma = PL_COLOR_HDR_BLACK;
     *cmp = pl_color_map_default_params;
     cmp->tone_mapping_function = curve(map->curve);
-    cmp->contrast_recovery = 0.0f;
+    cmp->contrast_recovery = map->contrast_recovery;
+    if (map->peak_detect)
+        params->peak_detect_params = &pl_peak_detect_default_params;
     if (map->scene_max_pq > 0) {
         // libplacebo's dynamic luminance metadata (CIE Y) is the same measure
         // as level 1: the scene's maximum and average in PQ. Preferring it

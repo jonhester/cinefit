@@ -827,6 +827,13 @@ impl Placebo {
         n.max(0) as usize
     }
 
+    /// Forgets the renderer's state between frames (peak detection's
+    /// smoothing, caches), for rendering unrelated stills one after another.
+    pub fn flush(&self) {
+        // SAFETY: the handle is live.
+        unsafe { ffi::cf_pl_flush(self.handle.as_ptr()) }
+    }
+
     pub fn clear_user_shaders(&self) {
         // SAFETY: the handle is live.
         unsafe { ffi::cf_pl_hooks_clear(self.handle.as_ptr()) }
@@ -918,6 +925,8 @@ impl Mapping {
             scene_max_pq: self.scene.map_or(0.0, |s| s.max_pq),
             scene_avg_pq: self.scene.map_or(0.0, |s| s.avg_pq),
             scene_min_pq: self.scene.map_or(0.0, |s| s.min_pq),
+            peak_detect: c_int::from(self.peak_detect),
+            contrast_recovery: self.contrast_recovery,
         }
     }
 }

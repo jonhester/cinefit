@@ -70,6 +70,8 @@ pub struct Map {
     pub scene_max_pq: f32,
     pub scene_avg_pq: f32,
     pub scene_min_pq: f32,
+    pub peak_detect: c_int,
+    pub contrast_recovery: f32,
 }
 
 unsafe extern "C" {
@@ -106,6 +108,7 @@ unsafe extern "C" {
     pub fn cf_pl_hook_add(pl: *mut Handle, text: *const c_char, len: usize) -> c_int;
     pub fn cf_pl_hook_set(pl: *mut Handle, name: *const c_char, value: f32) -> c_int;
     pub fn cf_pl_hooks_clear(pl: *mut Handle);
+    pub fn cf_pl_flush(pl: *mut Handle);
     pub fn cf_pl_planes_create(pl: *mut Handle, w: c_int, h: c_int) -> *mut Planes;
     pub fn cf_pl_planes_destroy(pl: *mut Handle, planes: *mut Planes);
     pub fn cf_pl_unpack_v210(

@@ -99,6 +99,9 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
  * while loaded, in the order added. Experimental. cf_pl_hook_add returns 0
  * or -1; cf_pl_hook_set sets a //!PARAM by name in every loaded shader and
  * returns how many it set. */
+/* Forgets the renderer's state between frames: peak detection's smoothing,
+ * caches. For rendering unrelated stills one after another. */
+void cf_pl_flush(cf_pl *pl);
 int cf_pl_hook_add(cf_pl *pl, const char *text, size_t len);
 int cf_pl_hook_set(cf_pl *pl, const char *name, float value);
 void cf_pl_hooks_clear(cf_pl *pl);
@@ -118,6 +121,11 @@ typedef struct {
     float scene_max_pq;
     float scene_avg_pq;
     float scene_min_pq;
+    /* Nonzero: libplacebo measures each frame's peak and average and maps
+     * from those (its peak detection, as mpv's gpu-next uses by default). */
+    int peak_detect;
+    /* libplacebo's contrast recovery strength; 0 is off, 0.3 its default. */
+    float contrast_recovery;
 } cf_pl_map;
 
 #define CF_PL_CURVE_CLIP 0

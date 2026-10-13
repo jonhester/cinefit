@@ -286,6 +286,11 @@ pub struct Mapping {
     /// This scene's brightness, when the source says it: Dolby Vision's
     /// level 1. With it, the curve maps from the scene, not the source.
     pub scene: Option<SceneLight>,
+    /// Let libplacebo measure each frame's peak and average (its peak
+    /// detection) and map from those.
+    pub peak_detect: bool,
+    /// libplacebo's contrast recovery: 0 off, 0.3 its default.
+    pub contrast_recovery: f32,
 }
 
 /// A scene's brightness as PQ, 0-1: its minimum, average and maximum
