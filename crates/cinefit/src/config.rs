@@ -52,6 +52,11 @@ pub struct Config {
     pub lldv_nits: u16,
     /// The tone curve for HDR into the SDR output.
     pub curve: Curve,
+    /// The HDR10 source's peak for the curve, in nits, in place of its
+    /// MaxCLL; 0 uses the metadata. A disc can declare far more than it
+    /// holds: the test disc's 10,000-nit title says 10,000, its scenes peak
+    /// at 2,700-4,000.
+    pub source_peak: u16,
 }
 
 /// What the output sends.
@@ -67,15 +72,21 @@ impl Default for Config {
             width: 4096,
             height: 2160,
             rgb_range: Levels::Limited,
-            mode: OutputMode::Sdr2020,
+            // HDR10 to the display's own mapping: on 2026-10-13 the JVC's
+            // Frame Adapt was judged as good as libplacebo's curves or
+            // better. Dolby Vision still goes out as SDR BT.2020.
+            mode: OutputMode::Passthrough,
             // The 96-nit low-latency Dolby Vision target the splitter's EDID
             // declares (2026-10-13), so that input maps one to one.
             white_nits: 96,
             lldv: true,
             lldv_nits: 96,
-            // The closest of libplacebo's curves to Dolby's own 100-nit
-            // rendition of a test disc (cinefit-cpp docs/findings.md).
-            curve: Curve::Hable,
+            // libplacebo's own default. Hable ranked closest to Dolby in the
+            // C++ version's step zero, but on a stand-in source, and blew out
+            // snow on the screen (2026-10-13); no curve has been chosen on
+            // evidence yet.
+            curve: Curve::Spline,
+            source_peak: 0,
         }
     }
 }
@@ -261,13 +272,22 @@ static SETTINGS: &[Setting] = &[
         apply: Apply::Restart,
         help: "The tone curve for HDR into SDR output: libplacebo's, by name.",
         get: |c| Value::Name(c.curve.name().into()),
-        set: |c, v| c.curve = Curve::from_name(name(v)).unwrap_or(Curve::Hable),
+        set: |c, v| c.curve = Curve::from_name(name(v)).unwrap_or(Curve::Spline),
+    },
+    Setting {
+        key: "tonemap.source_peak",
+        kind: Kind::Int { min: 0, max: 10000 },
+        apply: Apply::Restart,
+        help: "The HDR10 source's peak, in nits, that the curve maps from, in place of its MaxCLL or \
+               mastering peak; 0 uses the metadata.",
+        get: |c| Value::Int(c.source_peak.into()),
+        set: |c, v| c.source_peak = int(v) as u16,
     },
 ];
 
 const CURVES: &[&str] = &[
-    "hable",
     "spline",
+    "hable",
     "bt2390",
     "bt2446a",
     "st2094-10",

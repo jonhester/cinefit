@@ -252,8 +252,8 @@ pub enum Curve {
 impl Curve {
     /// Every curve with its libplacebo name, in a stable order.
     pub const ALL: [(Curve, &'static str); 9] = [
-        (Curve::Hable, "hable"),
         (Curve::Spline, "spline"),
+        (Curve::Hable, "hable"),
         (Curve::Bt2390, "bt2390"),
         (Curve::Bt2446a, "bt2446a"),
         (Curve::St2094_10, "st2094-10"),

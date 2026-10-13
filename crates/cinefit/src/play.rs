@@ -412,6 +412,8 @@ struct Target<'a, 'p> {
     white_nits: f32,
     curve: Curve,
     lldv_nits: Option<f32>,
+    /// The `tonemap.source_peak` override for HDR10, if set.
+    source_peak: Option<f32>,
 }
 
 /// Unpacks `frame` and renders it, its shape kept, into `dst`. Returns false
@@ -468,7 +470,7 @@ fn render<'p>(
                             sources.pq_peak = Some(p as f32);
                         }
                     }
-                    (color, sources.pq_peak)
+                    (color, dst.source_peak.or(sources.pq_peak))
                 }
             };
             planes(sources)?;
@@ -716,6 +718,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         white_nits: f32::from(opts.config.white_nits),
         curve: opts.config.curve,
         lldv_nits: opts.config.lldv.then_some(f32::from(opts.config.lldv_nits)),
+        source_peak: (opts.config.source_peak > 0).then_some(f32::from(opts.config.source_peak)),
     };
     if !render(
         &pl,
