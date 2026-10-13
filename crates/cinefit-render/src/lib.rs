@@ -13,7 +13,8 @@ pub mod tunnel;
 pub mod v210;
 
 pub use color::{
-    DoviColor, Levels, Matrix, Primaries, RgbColor, RgbSourceColor, Transfer, YcbcrColor,
+    Curve, DoviColor, Levels, Mapping, Matrix, Primaries, RgbColor, RgbSourceColor, Transfer,
+    YcbcrColor,
 };
 
 use std::ffi::CStr;
@@ -598,16 +599,35 @@ impl Placebo {
         dst_color: RgbColor,
         place: Option<Rect>,
     ) -> Result<(), Error> {
+        self.render_dovi_mapped(src, color, dst, dst_color, place, None)
+    }
+
+    /// [`render_dovi`](Self::render_dovi), with a tone mapping into a target
+    /// that cannot show the grade's range.
+    ///
+    /// # Errors
+    ///
+    /// As [`render_dovi`](Self::render_dovi).
+    pub fn render_dovi_mapped(
+        &self,
+        src: &GpuPlanes<'_>,
+        color: &DoviColor,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+        place: Option<Rect>,
+        map: Option<&Mapping>,
+    ) -> Result<(), Error> {
         let place = Rect::raw(place.as_ref());
+        let map = map.map(Mapping::raw);
         let flat = |m: &[[f64; 3]; 3]| std::array::from_fn(|i| m[i / 3][i % 3] as f32);
         let raw = ffi::Dovi {
             ycc_to_lms: flat(&color.ycc_to_lms),
             offset: color.offset.map(|o| o as f32),
             linear: flat(&color.linear),
         };
-        // SAFETY: `raw` is a struct whose layout the shim shares, and `place`
-        // null or four floats, both read during the call; the planes and the
-        // texture belong to this live device.
+        // SAFETY: `raw` and `map` (null or not) are structs whose layout the
+        // shim shares, and `place` null or four floats, all read during the
+        // call; the planes and the texture belong to this live device.
         let rc = unsafe {
             ffi::cf_pl_render_dovi(
                 self.handle.as_ptr(),
@@ -617,6 +637,7 @@ impl Placebo {
                 primaries_raw(dst_color.primaries),
                 transfer_raw(dst_color.transfer),
                 place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                map.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
@@ -638,13 +659,33 @@ impl Placebo {
         dst_color: RgbColor,
         place: Option<Rect>,
     ) -> Result<(), Error> {
+        self.render_ycbcr_mapped(src, color, dst, dst_color, place, None)
+    }
+
+    /// [`render_ycbcr`](Self::render_ycbcr), with a tone mapping into a
+    /// target that cannot show the source's range.
+    ///
+    /// # Errors
+    ///
+    /// As [`render_ycbcr`](Self::render_ycbcr).
+    pub fn render_ycbcr_mapped(
+        &self,
+        src: &GpuPlanes<'_>,
+        color: YcbcrColor,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+        place: Option<Rect>,
+        map: Option<&Mapping>,
+    ) -> Result<(), Error> {
         let place = Rect::raw(place.as_ref());
+        let map = map.map(Mapping::raw);
         let matrix = match color.matrix {
             Matrix::Bt709 => ffi::MATRIX_BT709,
             Matrix::Bt2020Nc => ffi::MATRIX_BT2020_NC,
         };
         // SAFETY: the planes and the texture belong to this live device;
-        // `place` is null or four floats, read during the call.
+        // `place` is null or four floats and `map` null or a struct whose
+        // layout the shim shares, both read during the call.
         let rc = unsafe {
             ffi::cf_pl_render_ycbcr(
                 self.handle.as_ptr(),
@@ -656,6 +697,7 @@ impl Placebo {
                 primaries_raw(dst_color.primaries),
                 transfer_raw(dst_color.transfer),
                 place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                map.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
@@ -827,6 +869,27 @@ impl Placebo {
     /// Never reached: no `Placebo` exists off Linux.
     pub fn render_rgba8(&self, _w: u32, _h: u32, _rgba: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::Unsupported)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Mapping {
+    fn raw(&self) -> ffi::Map {
+        ffi::Map {
+            src_peak: self.src_peak,
+            dst_peak: self.dst_peak,
+            curve: match self.curve {
+                Curve::Clip => 0,
+                Curve::Hable => 1,
+                Curve::Spline => 2,
+                Curve::Bt2390 => 3,
+                Curve::Bt2446a => 4,
+                Curve::St2094_10 => 5,
+                Curve::St2094_40 => 6,
+                Curve::Mobius => 7,
+                Curve::Reinhard => 8,
+            },
+        }
     }
 }
 

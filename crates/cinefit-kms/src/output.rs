@@ -175,6 +175,9 @@ pub struct Output {
     gbm: Option<gbm::Device<File>>,
     /// HDR metadata for the next modeset; `None` signals SDR.
     hdr: Option<HdrStatic>,
+    /// SDR in a BT.2020 container: `Colorspace` BT2020_RGB without HDR
+    /// metadata, for a display set to an SDR BT.2020 mode.
+    sdr_bt2020: bool,
     /// The blob on the connector now, and one queued for the next flip.
     hdr_blob: Option<u64>,
     pending_hdr_blob: Option<u64>,
@@ -331,6 +334,7 @@ impl Output {
             frames: Vec::new(),
             gbm: None,
             hdr: None,
+            sdr_bt2020: false,
             hdr_blob: None,
             pending_hdr_blob: None,
         }))
@@ -578,10 +582,25 @@ impl Output {
                 if let Some(prop) = p.hdr_metadata {
                     set.push((conn, prop, 0));
                 }
-                if let Some(cs) = &p.colorspace
-                    && let Some(v) = cs.default
+                let colorspace = p.colorspace.as_ref().and_then(|cs| {
+                    if self.sdr_bt2020 {
+                        cs.bt2020_rgb
+                    } else {
+                        cs.default
+                    }
+                    .map(|v| (cs.handle, v))
+                });
+                if let Some((handle, v)) = colorspace {
+                    set.push((conn, handle, v));
+                }
+                // SDR BT.2020 is rendered at 10 bits too; left at the
+                // kernel's 16, amdgpu picks the deepest format the sink
+                // takes, which landed on YCbCr (docs/findings.md in the C++
+                // version).
+                if self.sdr_bt2020
+                    && let Some(bpc) = p.max_bpc
                 {
-                    set.push((conn, cs.handle, v));
+                    set.push((conn, bpc, u64::from(timing(&mode).hdmi_bpc())));
                 }
             }
         }
@@ -618,6 +637,13 @@ impl Output {
     /// HDR metadata for the next [`Self::modeset`], or `None` for SDR.
     pub fn set_hdr(&mut self, hdr: Option<HdrStatic>) {
         self.hdr = hdr;
+    }
+
+    /// Whether SDR from the next [`Self::modeset`] on is signalled as BT.2020
+    /// (`Colorspace` BT2020_RGB) rather than the default. HDR is always
+    /// BT.2020.
+    pub fn set_sdr_bt2020(&mut self, on: bool) {
+        self.sdr_bt2020 = on;
     }
 
     /// Changes the HDR metadata while already in HDR, carried by the next
