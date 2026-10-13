@@ -15,6 +15,7 @@ It is developed and tested with a JVC RS3000 (a 4096x2160 panel).
 | `cinefit` | the one binary: `probe`, `capture`, `gpu`, `pattern` | — (it wires the others together) |
 | `cinefit-decklink` | capture, through a C++ shim over the vendored DeckLink SDK headers | KMS, Vulkan, libplacebo |
 | `cinefit-dovi` | tunneled Dolby Vision metadata from pixel parity (ETSI GS CCM 001 §6) | anything but bytes |
+| `cinefit-detect` | the bar detector: rows of luma and chroma in, rows of bar out | capture, GPU, display |
 | `cinefit-geometry` | constant-image-height geometry: the screen window, placements, crops from measured rows | anything but arithmetic |
 | `cinefit-kms` | KMS output: modesetting, flips, HDR signalling, GBM scanout buffers | libplacebo, Vulkan |
 | `cinefit-render` | libplacebo on Vulkan through a C shim; holds the GPU's clocks | KMS, capture |
@@ -52,6 +53,8 @@ On the machine with the hardware:
     cinefit play --dry-run             # capture, mode, signalling, first render; display untouched
     cinefit play -t 30                 # capture to screen: puts the input on the display
 
+`CINEFIT_STILLS=DIR cargo test --release -p cinefit-detect --test stills` reads
+the stills set and must match the C++ detector's baseline exactly.
 `CINEFIT_DOVI_DUMPS=DIR cargo test -p cinefit-dovi --test dumps` decodes saved
 frames. On the GPU against the CPU, `CINEFIT_RENDER_DUMPS=DIR cargo test -p
 cinefit-render --test dumps` unpacks a dump directory in any capture format
