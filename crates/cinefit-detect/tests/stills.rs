@@ -84,5 +84,12 @@ fn every_still_reads_as_the_cpp_version_read_it() {
         println!("  {d}");
     }
     assert!(checked > 0, "no stills listed");
+    // A still missing from golden.csv already shows up in `differ`; this
+    // catches the other direction, rows lost from stills.csv.
+    assert_eq!(
+        checked,
+        golden.len(),
+        "stills.csv and golden.csv list different numbers of stills"
+    );
     assert!(differ.is_empty(), "{} stills differ", differ.len());
 }
