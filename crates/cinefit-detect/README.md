@@ -44,10 +44,33 @@ A cut only clears the policy's pending zoom-in candidate. A false one delays a
 zoom-in by a few frames; a missed one lets old evidence count a little
 longer; neither can crop picture.
 
+## The policy
+
+Observations over time to a crop. One asymmetry decides everything: zooming
+out wrongly shows a sliver of bar, which is cheap; zooming in wrongly cuts
+the top and bottom off a menu or an IMAX shot, which is the mistake people
+notice.
+
+- **Zoom out** on the first frame that shows picture beyond the crop: on
+  both sides, or on one side running unbroken into the picture, or UI in a
+  bar. A subtitle is one-sided and detached, so it never does. Picture a few
+  rows past the crop widens it in place instead, so a dark scene's wandering
+  edge doesn't flap between full frame and the crop.
+- **Zoom in** only when evidence crosses a threshold: each clean letterbox
+  frame adds its strength, times a persistence that grows while the edges
+  hold still. A height seen recently needs half a frame's worth, so a film
+  comes back on the first frame after its menu; a known one needs two; a
+  never-seen one needs six, so a single frame never zooms in. Only heights
+  near a standard ratio or already known count; anything else must hold its
+  edges across a cut first, which a dark scene's edge and a static menu don't.
+- A zoom-in no later frame agreed with is penalised for a minute; a cut
+  clears the evidence of the previous shot; a format change, a new frame
+  size or half an hour of nothing resets everything to full frame.
+
 ## Not ported yet
 
-- **The policy:** deciding when the evidence is strong enough to change the
-  crop, without flapping back and forth.
+- **The detector glue** (Bars, Cuts and the policy as one object), the
+  adapters for the tunnel and RGB formats, and the wiring into `play`.
 
 ## Tests
 
