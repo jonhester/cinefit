@@ -114,7 +114,9 @@ name = "cinefit"
 version = "0.1.0"
 dependencies = [
  "cinefit-decklink",
+ "cinefit-detect",
  "cinefit-dovi",
+ "cinefit-geometry",
  "cinefit-kms",
  "cinefit-render",
  "clap",
