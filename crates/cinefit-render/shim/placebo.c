@@ -22,6 +22,9 @@ struct cf_pl {
     pl_dispatch dispatch;
     cf_pl_log_cb log_cb;
     void *log_ctx;
+    /* mpv-format user shaders, run on every YCbCr render while loaded. */
+    const struct pl_hook *hooks[32];
+    int num_hooks;
 };
 
 static void forward_log(void *priv, enum pl_log_level level, const char *msg) {
@@ -68,7 +71,39 @@ cf_pl *cf_pl_create(cf_pl_log_cb log_cb, void *ctx, char *err, size_t err_len) {
     return pl;
 }
 
+int cf_pl_hook_add(cf_pl *pl, const char *text, size_t len) {
+    if (pl->num_hooks == (int)(sizeof pl->hooks / sizeof pl->hooks[0])) return -1;
+    const struct pl_hook *h = pl_mpv_user_shader_parse(pl->vk->gpu, text, len);
+    if (!h) return -1;
+    pl->hooks[pl->num_hooks++] = h;
+    return 0;
+}
+
+int cf_pl_hook_set(cf_pl *pl, const char *name, float value) {
+    int set = 0;
+    for (int i = 0; i < pl->num_hooks; i++) {
+        for (int j = 0; j < pl->hooks[i]->num_parameters; j++) {
+            const struct pl_hook_par *p = &pl->hooks[i]->parameters[j];
+            if (strcmp(p->name, name) != 0) continue;
+            switch (p->type) {
+            case PL_VAR_FLOAT: p->data->f = value; break;
+            case PL_VAR_SINT:  p->data->i = (int)value; break;
+            case PL_VAR_UINT:  p->data->u = (unsigned)value; break;
+            default: continue;
+            }
+            set++;
+        }
+    }
+    return set;
+}
+
+void cf_pl_hooks_clear(cf_pl *pl) {
+    for (int i = 0; i < pl->num_hooks; i++) pl_mpv_user_shader_destroy(&pl->hooks[i]);
+    pl->num_hooks = 0;
+}
+
 void cf_pl_destroy(cf_pl *pl) {
+    cf_pl_hooks_clear(pl);
     if (!pl) return;
     pl_dispatch_destroy(&pl->dispatch);
     pl_renderer_destroy(&pl->renderer);
@@ -522,6 +557,10 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
     params.peak_detect_params = NULL;
     struct pl_color_map_params cmp;
     apply_map(&image, &target, &params, &cmp, map);
+    if (pl->num_hooks) {
+        params.hooks = pl->hooks;
+        params.num_hooks = pl->num_hooks;
+    }
     if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;

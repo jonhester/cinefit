@@ -95,6 +95,14 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
 #define CF_PL_TRC_PQ 1
 #define CF_PL_TRC_HLG 2
 
+/* mpv-format user shaders (`//!HOOK` syntax), applied to every YCbCr render
+ * while loaded, in the order added. Experimental. cf_pl_hook_add returns 0
+ * or -1; cf_pl_hook_set sets a //!PARAM by name in every loaded shader and
+ * returns how many it set. */
+int cf_pl_hook_add(cf_pl *pl, const char *text, size_t len);
+int cf_pl_hook_set(cf_pl *pl, const char *name, float value);
+void cf_pl_hooks_clear(cf_pl *pl);
+
 /* A mapping between brightness ranges, for a render into a target that cannot
  * show the source's: the source's peak and the target's, in nits (0 leaves
  * libplacebo's default for that side), and the tone curve between them, one

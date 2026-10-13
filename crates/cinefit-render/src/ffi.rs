@@ -103,6 +103,9 @@ unsafe extern "C" {
     pub fn cf_pl_tex_destroy(pl: *mut Handle, tex: *mut Tex);
     pub fn cf_pl_render(pl: *mut Handle, src: *mut Tex, dst: *mut Tex, shift_x: f32) -> c_int;
     pub fn cf_pl_clear_black(pl: *mut Handle, dst: *mut Tex) -> c_int;
+    pub fn cf_pl_hook_add(pl: *mut Handle, text: *const c_char, len: usize) -> c_int;
+    pub fn cf_pl_hook_set(pl: *mut Handle, name: *const c_char, value: f32) -> c_int;
+    pub fn cf_pl_hooks_clear(pl: *mut Handle);
     pub fn cf_pl_planes_create(pl: *mut Handle, w: c_int, h: c_int) -> *mut Planes;
     pub fn cf_pl_planes_destroy(pl: *mut Handle, planes: *mut Planes);
     pub fn cf_pl_unpack_v210(

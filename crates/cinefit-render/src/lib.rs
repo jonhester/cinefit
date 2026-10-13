@@ -806,6 +806,32 @@ impl Placebo {
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
     }
 
+    /// Loads an mpv-format user shader, run on every YCbCr render until
+    /// [`clear_user_shaders`](Self::clear_user_shaders). Experimental.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`] if libplacebo cannot parse it (see its log).
+    pub fn add_user_shader(&self, text: &str) -> Result<(), Error> {
+        // SAFETY: the handle is live; `text` is read during the call only.
+        let rc =
+            unsafe { ffi::cf_pl_hook_add(self.handle.as_ptr(), text.as_ptr().cast(), text.len()) };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// Sets a user shader `//!PARAM` by name; returns how many were set.
+    pub fn set_shader_param(&self, name: &str, value: f32) -> usize {
+        let name = std::ffi::CString::new(name).expect("no NUL in a parameter name");
+        // SAFETY: the handle is live; `name` is NUL-terminated and read during the call.
+        let n = unsafe { ffi::cf_pl_hook_set(self.handle.as_ptr(), name.as_ptr(), value) };
+        n.max(0) as usize
+    }
+
+    pub fn clear_user_shaders(&self) {
+        // SAFETY: the handle is live.
+        unsafe { ffi::cf_pl_hooks_clear(self.handle.as_ptr()) }
+    }
+
     /// Fills `dst` with black: a frame with nothing to show yet.
     ///
     /// # Errors
