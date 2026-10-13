@@ -27,9 +27,25 @@ The frame is a letterbox only if the result looks like a real film matte:
 A dark scene can fail these checks, and then it doesn't count. Each
 letterbox frame also gets a score for how sure it is.
 
+## Cuts
+
+Whether a frame starts a new shot. The picture inside the current crop is
+split into a grid of 32 cells across (square, so 18 rows at 16:9 and 13 at
+2.39), each the mean of a few luma samples. Against the previous frame, a
+cut needs all of: the cells moved a lot on average, most of them moved, the
+brightness histogram changed (or the move is too big for motion), and the
+move is a spike, at least twice the previous frame's. The last rule is what
+tells a cut from a camera rushing through texture, which passes the others on
+every frame. Bars are outside the grid, so a subtitle or menu appearing in
+them is never a cut, and a crop change starts a new baseline rather than
+being one.
+
+A cut only clears the policy's pending zoom-in candidate. A false one delays a
+zoom-in by a few frames; a missed one lets old evidence count a little
+longer; neither can crop picture.
+
 ## Not ported yet
 
-- **Cuts:** spotting a new shot.
 - **The policy:** deciding when the evidence is strong enough to change the
   crop, without flapping back and forth.
 

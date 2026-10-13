@@ -47,6 +47,10 @@ impl Row {
         Row(out)
     }
 
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     /// A row from a function of x (luma), neutral chroma.
     pub fn luma(width: u32, f: impl Fn(u32) -> u32) -> Self {
         let luma: Vec<u16> = (0..width).map(|x| f(x) as u16).collect();
