@@ -397,6 +397,16 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         let (Some(a), Some(b)) = (tb.get(&p.t), hb.get(&p.h)) else {
             continue;
         };
+        // `diff` pairs pixels by index, so frames of different sizes would
+        // compare unrelated points and still print plausible numbers.
+        let (ft, fh) = (&ti[p.t], &hi[p.h]);
+        if (ft.width, ft.height) != (fh.width, fh.height) {
+            println!(
+                "{:>7} {:>7}  {}x{} against {}x{}: skipped",
+                p.t, p.h, ft.width, ft.height, fh.width, fh.height
+            );
+            continue;
+        }
         let (Some(ra), Some(rb)) = (render(&pl, &ti[p.t], a)?, render(&pl, &hi[p.h], b)?) else {
             println!(
                 "{:>7} {:>7}  not a tunnel and HDR10 pair: skipped",
