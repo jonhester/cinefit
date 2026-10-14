@@ -2225,8 +2225,12 @@ struct Counts {
     metadata: u64,
     refused: u64,
     /// Frames the card flagged as carrying Dolby Vision metadata, and frames
-    /// it attached any to: whether HDMI input ever does, which would tell
-    /// low-latency Dolby Vision from SDR BT.2020 for certain.
+    /// it attached any to: whether the chain ever delivers it, which would
+    /// tell low-latency Dolby Vision from SDR BT.2020 for certain. None on
+    /// the owner's chain so far (2026-10-14: ~4,000 frames read as low-latency
+    /// Dolby Vision, none flagged). Either the HDCP splitter drops the
+    /// player's Dolby Vision InfoFrame or the card does not pass it on; this
+    /// cannot tell which.
     dv_flagged: u64,
     dv_bytes: u64,
     /// Frames that `input.lldv` reads as low-latency Dolby Vision: what the
