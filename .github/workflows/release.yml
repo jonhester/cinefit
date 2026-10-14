@@ -1,7 +1,8 @@
 name: Release
 
 # Builds and publishes cinefit (tools/version.sh says how versions work):
-# - a tag vYEAR.MONTH.N or vYEAR.MONTH.N-rc.K pushed (tools/version.sh tag)
+# - a tag vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.K pushed
+#   (tools/version.sh tag)
 #   publishes that release or release candidate;
 # - every night, a nightly of main, if main has changed since the last one;
 # - "Run workflow" by hand, a nightly now, changed or not.

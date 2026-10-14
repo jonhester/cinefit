@@ -63,9 +63,9 @@ downloads a published build), copies it there and repoints `current`;
 `RESTART=1`: a restart is a resync on the projector, so not while someone is
 watching.
 
-Releases are `YEAR.MONTH.N`, pre-releases carry the version they lead to
+Releases are SemVer from 0.1.0; pre-releases carry the version they lead to
 (`-nightly.YYYYMMDD`, `-rc.K`); `tools/version.sh` works them out and
-`tools/version.sh tag [--rc]` tags main for `.github/workflows/release.yml`,
+`tools/version.sh tag patch|minor|major [--rc]` tags main for `.github/workflows/release.yml`,
 which also publishes a nightly each night main has changed. The binary is one
 file: libplacebo is linked statically (LGPL-2.1, see the README).
 
