@@ -16,7 +16,7 @@
 //! every frame, and what tells a cut from it is that a cut is a spike after a
 //! calm frame.
 
-use crate::Samples;
+use crate::{RowScratch, Samples};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
@@ -92,7 +92,11 @@ pub struct Cuts {
     prev: Option<Baseline>,
     prev_mean: f64,
     cells: Vec<u32>,
+    /// The grid's columns, and one row's luma at them: points, not whole
+    /// rows, read from the frame.
+    xs: Vec<u32>,
     row: Vec<u16>,
+    scratch: RowScratch,
 }
 
 impl Default for Cuts {
@@ -108,7 +112,9 @@ impl Cuts {
             prev: None,
             prev_mean: 0.0,
             cells: Vec::new(),
+            xs: Vec::new(),
             row: Vec::new(),
+            scratch: RowScratch::default(),
         }
     }
 
@@ -152,21 +158,27 @@ impl Cuts {
         );
         self.cells.clear();
         self.cells.resize((cols * rows) as usize, 0);
-        self.row.resize(w as usize, 0);
+        // The columns, cell by cell, `points` to a cell.
+        self.xs.clear();
+        for c in 0..cols {
+            for i in 0..points {
+                let x = (((f64::from(c) + (f64::from(i) + 0.5) / f64::from(points)) * cw) as u32)
+                    .min(w - 1);
+                self.xs.push(x);
+            }
+        }
+        self.row.resize(self.xs.len(), 0);
         let mut hist = [0u32; 16];
         for r in 0..rows {
             for j in 0..points {
                 let y =
                     top + ((f64::from(r) + (f64::from(j) + 0.5) / f64::from(points)) * ch) as u32;
                 let y = y.min(top + active - 1);
-                f.luma_row(y, &mut self.row);
+                f.luma_at(y, &self.xs, &mut self.row, &mut self.scratch);
                 for c in 0..cols {
                     let cell = &mut self.cells[(r * cols + c) as usize];
                     for i in 0..points {
-                        let x = (((f64::from(c) + (f64::from(i) + 0.5) / f64::from(points)) * cw)
-                            as u32)
-                            .min(w - 1);
-                        let v = u32::from(self.row[x as usize]) & 0x3FF;
+                        let v = u32::from(self.row[(c * points + i) as usize]) & 0x3FF;
                         *cell += v;
                         hist[(v >> 6) as usize] += 1;
                     }
@@ -441,6 +453,11 @@ mod tests {
                 w: v.width(),
                 h: v.height(),
             }
+        }
+
+        /// The frame as `play` hands it over, with v210's own reads.
+        fn v210(&self) -> V210<'_> {
+            V210::new(&self.bytes, self.w, self.h, row_bytes(self.w)).expect("whole rows")
         }
     }
 
@@ -745,7 +762,7 @@ mod tests {
         let n = 50;
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            cuts.observe(&a, 0, 0);
+            cuts.observe(&a.v210(), 0, 0);
         }
         let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(n);
         eprintln!("cuts: {us:.1} us per frame at 2160p");
