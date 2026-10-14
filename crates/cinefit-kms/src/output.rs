@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
@@ -17,9 +17,14 @@ use drm::control::{
     property,
 };
 use drm::{ClientCapability, Device as BasicDevice};
+use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::hdr::HdrStatic;
 use crate::timing::ModeTiming;
+
+/// How long [`Output::wait_flip`] waits: six frame periods at 23.976 Hz, the
+/// slowest rate driven, and far beyond any flip that completes.
+pub const FLIP_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// An open DRM device node.
 struct Card(File);
@@ -55,6 +60,9 @@ pub enum Error {
     /// The operation needs the other kind of frame: CPU-drawn ones are drawn,
     /// GBM ones exported and read back.
     NotScanout,
+    /// A queued flip did not complete in time: the display or the driver has
+    /// stopped answering.
+    NoFlip(Duration),
 }
 
 impl fmt::Display for Error {
@@ -71,6 +79,11 @@ impl fmt::Display for Error {
             Error::MissingProperty(p) => write!(f, "the driver has no {p} property"),
             Error::Busy => f.write_str("another program holds the display (DRM master)"),
             Error::NotScanout => f.write_str("wrong kind of frame for this operation"),
+            Error::NoFlip(waited) => write!(
+                f,
+                "no page-flip event within {} ms: the display or driver stopped answering",
+                waited.as_millis()
+            ),
         }
     }
 }
@@ -926,26 +939,26 @@ impl Output {
         Ok(())
     }
 
-    /// Blocks until the queued flip completes.
+    /// Blocks until the queued flip completes, or [`FLIP_TIMEOUT`] passes.
     ///
     /// # Errors
     ///
-    /// If reading events from the device fails.
+    /// If reading events from the device fails, or no flip event arrives in
+    /// time ([`Error::NoFlip`]). Without the deadline a lost event would hang
+    /// the frame loop where nothing reads the stop flag, so a SIGTERM would
+    /// end in a kill and the display would never be put back.
     pub fn wait_flip(&self) -> Result<Flip, Error> {
-        loop {
-            for event in self
-                .card
-                .receive_events()
-                .map_err(io("reading DRM events"))?
-            {
-                if let Event::PageFlip(e) = event {
-                    return Ok(Flip {
-                        sequence: e.frame,
-                        at: e.duration,
-                    });
-                }
-            }
-        }
+        let flip = wait_readable(self.card.as_fd(), FLIP_TIMEOUT, || {
+            Ok(self.card.receive_events()?.find_map(|event| match event {
+                Event::PageFlip(e) => Some(Flip {
+                    sequence: e.frame,
+                    at: e.duration,
+                }),
+                _ => None,
+            }))
+        })
+        .map_err(io("reading DRM events"))?;
+        flip.ok_or(Error::NoFlip(FLIP_TIMEOUT))
     }
 
     /// Puts back every property the modeset changed, except HDR: leaving
@@ -1096,6 +1109,43 @@ impl Drop for Output {
     }
 }
 
+/// Calls `read` each time `fd` becomes readable until it returns a value, or
+/// `timeout` passes (`Ok(None)`). `read` must not block once `fd` polls
+/// readable.
+fn wait_readable<T>(
+    fd: BorrowedFd<'_>,
+    timeout: Duration,
+    mut read: impl FnMut() -> io::Result<Option<T>>,
+) -> io::Result<Option<T>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        // Rounded up, so a wait never ends a hair before the deadline and
+        // spins on a zero timeout.
+        let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        match poll(&mut fds, ms) {
+            Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+        // An error or hang-up alone would make `read` block on a device
+        // with nothing to read.
+        if !fds[0].revents().contains(PollFlags::IN) {
+            return Err(io::Error::other(format!(
+                "poll reported {:?}",
+                fds[0].revents()
+            )));
+        }
+        if let Some(v) = read()? {
+            return Ok(Some(v));
+        }
+    }
+}
+
 fn blob_id(value: property::Value<'static>) -> u64 {
     match value {
         property::Value::Blob(id) => id,
@@ -1228,5 +1278,60 @@ fn timing(m: &Mode) -> ModeTiming {
         vtotal: m.vsync().2,
         interlaced: m.flags().contains(ModeFlags::INTERLACE),
         preferred: m.mode_type().contains(ModeTypeFlags::PREFERRED),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn a_source_that_never_delivers_times_out() {
+        let (quiet, _other_end) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let got = wait_readable(quiet.as_fd(), Duration::from_millis(50), || {
+            panic!("read called with nothing to read")
+        })
+        .unwrap();
+        let waited = started.elapsed();
+        assert_eq!(got, None::<()>);
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
+    }
+
+    #[test]
+    fn events_that_are_not_the_one_wanted_still_time_out() {
+        // A vblank-only stream: readable over and over, never a flip.
+        let (quiet, mut other_end) = UnixStream::pair().unwrap();
+        let mut reader = quiet.try_clone().unwrap();
+        other_end.write_all(&[0; 64]).unwrap();
+        let mut reads = 0;
+        let got = wait_readable(quiet.as_fd(), Duration::from_millis(50), || {
+            reads += 1;
+            let mut b = [0];
+            reader.read_exact(&mut b)?;
+            Ok(None::<()>)
+        })
+        .unwrap();
+        assert_eq!(got, None);
+        assert_eq!(reads, 64);
+    }
+
+    #[test]
+    fn a_delivered_event_returns_at_once() {
+        let (quiet, mut other_end) = UnixStream::pair().unwrap();
+        let mut reader = quiet.try_clone().unwrap();
+        other_end.write_all(&[7]).unwrap();
+        let started = Instant::now();
+        let got = wait_readable(quiet.as_fd(), Duration::from_secs(5), || {
+            let mut b = [0];
+            reader.read_exact(&mut b)?;
+            Ok(Some(b[0]))
+        })
+        .unwrap();
+        assert_eq!(got, Some(7));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
