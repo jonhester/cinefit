@@ -14,9 +14,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::config::OutputMode;
+use crate::config::{Config, OutputMode};
 use crate::follow;
+use crate::osd::{BannerText, Encoding};
 use crate::runlog;
+use crate::ui::{Slate, Ui};
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
@@ -372,6 +374,84 @@ fn color_for(signal: follow::Signal) -> RgbColor {
             transfer: Transfer::Bt1886,
         },
     }
+}
+
+/// How the overlay is encoded for an output's signalling: PQ for HDR10, a
+/// gamma of 2.4 otherwise (HLG's lower range is close to it).
+fn encoding_for(signal: follow::Signal) -> Encoding {
+    match signal {
+        follow::Signal::Hdr(h) if h.eotf == cinefit_kms::Eotf::Pq => Encoding::Pq,
+        _ => Encoding::Sdr,
+    }
+}
+
+/// The slate's detail for a format nothing renders: what it is, and what
+/// to change.
+fn cant_show(f: PixelFormat) -> String {
+    format!("{f} \u{b7} set the player to YCbCr")
+}
+
+/// A picture size as people say it.
+fn size_name(width: u32, height: u32) -> String {
+    match (width, height) {
+        (3840 | 4096, 2160) => "4K".into(),
+        (1920, 1080) => "1080p".into(),
+        (1280, 720) => "720p".into(),
+        _ => format!("{width} \u{d7} {height}"),
+    }
+}
+
+/// A frame rate as people say it: 23.976, 24, 59.94.
+fn rate_name(rate_mhz: u32) -> String {
+    let s = format!("{:.3}", f64::from(rate_mhz) / 1000.0);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The banner for a picture (#77): what is coming in, and what happens to
+/// it. `None` for what nothing renders, which has the slate instead.
+fn banner_for(
+    kind: Kind,
+    key: (u32, u32),
+    rate_mhz: u32,
+    out_width: u32,
+    config: &Config,
+) -> Option<BannerText> {
+    let what = format!("{} {}", size_name(key.0, key.1), rate_name(rate_mhz));
+    let scaled = if key.0 < out_width.min(3840) {
+        " \u{b7} scaled to 4K"
+    } else {
+        ""
+    };
+    let passthrough = config.mode == OutputMode::Passthrough;
+    let (title, detail) = match kind {
+        Kind::Unsupported(_) => return None,
+        Kind::Tunnel => (
+            "Dolby Vision",
+            format!("{what} \u{b7} tunnel, cinefit\u{2019}s own mapping"),
+        ),
+        k if is_lldv(k, config.lldv) => (
+            "Dolby Vision",
+            format!("{what} \u{b7} mapped by the player, shown as is"),
+        ),
+        Kind::Ycbcr(c) if matches!(c.transfer, Transfer::Pq | Transfer::Hlg) => (
+            if c.transfer == Transfer::Pq {
+                "HDR10"
+            } else {
+                "HLG"
+            },
+            if passthrough {
+                format!("{what} \u{b7} to the projector")
+            } else {
+                format!("{what} \u{b7} tone-mapped by cinefit")
+            },
+        ),
+        Kind::Ycbcr(_) => ("SDR", format!("{what}{scaled}")),
+        Kind::Rgb(_) => ("SDR", format!("{what} \u{b7} RGB{scaled}")),
+    };
+    Some(BannerText {
+        title: title.into(),
+        detail,
+    })
 }
 
 /// A source's frame rate in millihertz, from its exact fraction.
@@ -935,6 +1015,42 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         info!("stopping before the modeset");
         return Ok(());
     }
+    // The slate and banners on the overlay plane: up with the modeset, so
+    // a run without a source opens on the slate.
+    let mut ui = Ui::new(
+        &mut out,
+        index,
+        size,
+        (win.y, win.h),
+        &opts.config.venue,
+        opts.config.banners,
+    );
+    let mut enc = encoding_for(signal_of(hdr));
+    let now = Instant::now();
+    match (&start_key, &start_input) {
+        (Some(key), Some(input)) => {
+            if let Some(b) = banner_for(
+                key.kind,
+                (key.width, key.height),
+                rate_mhz(input),
+                size.0,
+                &opts.config,
+            ) {
+                ui.picture(b, true, now);
+            }
+            ui.resynced(now);
+        }
+        _ => ui.set_slate(Some(match key {
+            Some(Key {
+                kind: Kind::Unsupported(f),
+                ..
+            }) => Slate::CantShow {
+                detail: cant_show(f),
+            },
+            _ => Slate::NoSignal,
+        })),
+    }
+    ui.update(&mut out, enc, now);
     out.set_hdr(hdr);
     out.set_sdr_bt2020(true);
     out.modeset(index, buffers[0])?;
@@ -971,6 +1087,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut mode_name = mode.to_string();
     let mut latest_want: Option<follow::Want> = None;
     let (mut front, mut pending) = (0usize, 0usize);
+    ui.update(&mut out, enc, Instant::now());
     out.flip(buffers[front])?;
     let mut ready: Option<usize> = None;
     let mut counts = Counts::default();
@@ -1022,6 +1139,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 ready = Some(free);
                 dark = true;
                 counts.signal_losses += 1;
+                ui.set_slate(Some(Slate::SignalLost {
+                    since: last_frame_at,
+                }));
                 info!(
                     "{:.1} s: no signal for {} ms: black",
                     run_started.elapsed().as_secs_f64(),
@@ -1077,6 +1197,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         .expect("three buffers, two in use");
                     pl.clear_black(&targets[free])?;
                     ready = Some(free);
+                    ui.set_slate(Some(Slate::Identifying {
+                        detail: format!(
+                            "{} \u{b7} {}",
+                            size_name(k.width, k.height),
+                            reported
+                                .map_or_else(|| "rate unknown".into(), |f| rate_name(rate_mhz(&f)))
+                        ),
+                    }));
                 } else {
                     // What the output should be for this frame, for the policy after
                     // the next flip. The rate is the input's, as the card reported it.
@@ -1096,10 +1224,26 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             frame.info().color.hdr.as_ref(),
                             last_tunnel.as_ref(),
                         );
-                        latest_want = Some(follow::Want {
+                        let want = follow::Want {
                             rate_mhz: rate_mhz(&f),
                             signal: signal_of(hdr),
-                        });
+                        };
+                        latest_want = Some(want);
+                        // Once the input has held still, as the policy
+                        // judges it: a banner if the picture type changed,
+                        // after the resync if the output is to follow it.
+                        if held == frames_to_trust(k).max(STABLE_FRAMES)
+                            && let Some(b) = banner_for(
+                                k.kind,
+                                (k.width, k.height),
+                                want.rate_mhz,
+                                size.0,
+                                &opts.config,
+                            )
+                        {
+                            let resync = want.mode_key() != policy.committed().mode_key();
+                            ui.picture(b, resync, Instant::now());
+                        }
                     }
                     let free = (0..BUFFERS)
                         .find(|&b| b != front && b != pending)
@@ -1132,12 +1276,19 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         &mut stages,
                     )? {
                         ready = Some(free);
+                        ui.set_slate(None);
                     } else {
                         // Nothing renders this format: black, not the last
                         // picture held over it.
                         counts.unrendered += 1;
                         pl.clear_black(&targets[free])?;
                         ready = Some(free);
+                        ui.set_slate(Some(Slate::CantShow {
+                            detail: match k.kind {
+                                Kind::Unsupported(f) => cant_show(f),
+                                other => describe(other),
+                            },
+                        }));
                     }
                 }
             }
@@ -1163,6 +1314,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             request.width, request.height, request.refresh_hz
                         )),
                         Some(i) => {
+                            // The overlay in the new signalling, in the same
+                            // commit.
+                            ui.update(&mut out, encoding_for(w.signal), Instant::now());
                             out.set_hdr(hdr);
                             let show = ready.unwrap_or(front);
                             out.modeset(i, buffers[show])
@@ -1195,9 +1349,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             period = modes[i].period();
                             take_timeout = period.mul_f64(0.8).min(Duration::from_millis(35));
                             out_color = color_for(w.signal);
+                            enc = encoding_for(w.signal);
+                            ui.resynced(Instant::now());
                             (front, pending) = (show, show);
                             // A modeset sends no flip event; queue one so the
                             // vblanks keep coming.
+                            ui.update(&mut out, enc, Instant::now());
                             out.flip(buffers[pending])?;
                             continue;
                         }
@@ -1239,6 +1396,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     pending = front;
                 }
             }
+            ui.update(&mut out, enc, Instant::now());
             out.flip(buffers[pending])?;
         }
         Ok(())
@@ -1545,6 +1703,55 @@ mod tests {
             place,
         );
         assert!(black.contains("0.0% of the picture area"), "{black}");
+    }
+
+    #[test]
+    fn banners_name_the_picture_and_what_happens_to_it() {
+        let c = Config::default();
+        let bt709 = Kind::Ycbcr(YcbcrColor {
+            matrix: Matrix::Bt709,
+            primaries: Primaries::Bt709,
+            transfer: Transfer::Bt1886,
+        });
+        let b = |kind, size, rate, c: &Config| {
+            banner_for(kind, size, rate, 4096, c).map(|b| format!("{} / {}", b.title, b.detail))
+        };
+        assert_eq!(
+            b(ycbcr(Transfer::Pq), (3840, 2160), 23976, &c).as_deref(),
+            Some("HDR10 / 4K 23.976 \u{b7} to the projector")
+        );
+        // Labelled SDR BT.2020: low-latency Dolby Vision, with input.lldv on.
+        assert_eq!(
+            b(ycbcr(Transfer::Bt1886), (3840, 2160), 23976, &c).as_deref(),
+            Some("Dolby Vision / 4K 23.976 \u{b7} mapped by the player, shown as is")
+        );
+        assert_eq!(
+            b(bt709, (1920, 1080), 59940, &c).as_deref(),
+            Some("SDR / 1080p 59.94 \u{b7} scaled to 4K")
+        );
+        assert_eq!(
+            b(Kind::Tunnel, (1920, 1080), 24000, &c).as_deref(),
+            Some("Dolby Vision / 1080p 24 \u{b7} tunnel, cinefit\u{2019}s own mapping")
+        );
+        let sdr2020 = Config {
+            mode: OutputMode::Sdr2020,
+            ..Config::default()
+        };
+        assert_eq!(
+            b(ycbcr(Transfer::Pq), (3840, 2160), 23976, &sdr2020).as_deref(),
+            Some("HDR10 / 4K 23.976 \u{b7} tone-mapped by cinefit")
+        );
+        assert_eq!(
+            b(
+                Kind::Unsupported(PixelFormat::Other(7)),
+                (3840, 2160),
+                23976,
+                &c
+            ),
+            None
+        );
+        assert_eq!(rate_name(50000), "50");
+        assert_eq!(size_name(2560, 1440), "2560 \u{d7} 1440");
     }
 
     #[test]

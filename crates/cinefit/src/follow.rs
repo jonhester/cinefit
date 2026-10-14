@@ -55,7 +55,7 @@ pub struct Want {
 
 impl Want {
     /// The part that takes a modeset to change.
-    fn mode_key(&self) -> (u32, Eotf) {
+    pub fn mode_key(&self) -> (u32, Eotf) {
         (self.rate_mhz, self.signal.eotf())
     }
 }
@@ -91,7 +91,7 @@ impl Policy {
         }
     }
 
-    #[cfg(test)]
+    /// What the output is committed to now.
     pub fn committed(&self) -> Want {
         self.out
     }
