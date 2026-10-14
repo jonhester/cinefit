@@ -450,6 +450,8 @@ fn output_section(
     lldv: bool,
     signal: follow::Signal,
     mode: cinefit_kms::ModeTiming,
+    shown: Option<f64>,
+    white_nits: u16,
 ) -> InfoSection {
     let (name, hdr) = match signal {
         follow::Signal::Sdr => ("SDR BT.2020", None),
@@ -480,11 +482,41 @@ fn output_section(
     if let Some(h) = hdr {
         detail += &format!(" \u{b7} MaxCLL {:.0}", h.max_cll);
     }
+    if let Some(n) = shown.and_then(|v| out_nits(v, signal, white_nits)) {
+        detail += &format!(" \u{b7} brightest {n:.0} nits");
+    }
     InfoSection {
         label: "OUT".into(),
         line: format!("{name} \u{b7} {what}"),
         detail,
     }
+}
+
+/// A level read back from the output (0-1) as light: SDR through its gamma
+/// to cinefit's white, PQ as it is. HLG has no absolute level.
+fn out_nits(v: f64, signal: follow::Signal, white_nits: u16) -> Option<f64> {
+    match signal {
+        follow::Signal::Sdr => Some(v.powf(2.4) * f64::from(white_nits)),
+        follow::Signal::Hdr(h) if h.eotf == cinefit_kms::Eotf::Pq => Some(pq_nits(v)),
+        follow::Signal::Hdr(_) => None,
+    }
+}
+
+/// The brightest channel (0-1) of a frame as it went out, from a grid of
+/// every 16th row and 8th column: what the display is sent, whatever the
+/// renderer was asked to do.
+fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Option<f64> {
+    let mut peak: Option<f64> = None;
+    for y in (0..size.1 as usize).step_by(16) {
+        for x in (0..size.0 as usize).step_by(8) {
+            let o = y * stride + x * 4;
+            let w = px.get(o..o + 4)?;
+            let rgb = cinefit_kms::scanout::decode(fourcc, [w[0], w[1], w[2], w[3]])?;
+            let v = rgb.iter().copied().fold(0.0, f64::max);
+            peak = Some(peak.map_or(v, |p: f64| p.max(v)));
+        }
+    }
+    peak
 }
 
 /// A picture size as people say it.
@@ -1145,10 +1177,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
 
     let pl = Placebo::new()?;
     let mut buffers = Vec::new();
+    // The scanout buffers' pixel format, to read one back for the info panel.
+    let mut scan_fourcc = 0;
     let mut targets = Vec::new();
     for _ in 0..BUFFERS {
         let b = out.create_scanout(index)?;
         let d = out.export(b)?;
+        scan_fourcc = d.fourcc;
         targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
             fd: d.fd.as_fd(),
             width: d.width,
@@ -1305,6 +1340,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // The remote and keyboards, read on their own thread.
     let keys = KeyReader::start(Path::new("/dev/input"), |line| info!("{line}"));
     let mut info_at: Option<Instant> = None;
+    let mut read_back_logged = false;
     let mut cur_mode = mode;
     let now = Instant::now();
     match (&start_key, &start_input) {
@@ -1391,8 +1427,35 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             }
             if run_started.elapsed() >= next_status {
                 next_status += STATUS_EVERY;
+                // The input's brightest of the last ten seconds against what
+                // went out on this frame: whether the renderer passes it
+                // through or maps it down, without the panel open.
+                let levels = {
+                    let brightest = window.borrow_mut().brightest(Instant::now());
+                    let shown = out
+                        .read_scanout(buffers[front], |px, stride| {
+                            scanout_peak(px, stride, scan_fourcc, size)
+                        })
+                        .ok()
+                        .flatten();
+                    let signal = policy.committed().signal;
+                    match (last_key.filter(|_| !dark), brightest) {
+                        (Some(k), Some(b)) => format!(
+                            "; in {}, out {}",
+                            peak_words(
+                                k.kind,
+                                b,
+                                opts.config.lldv.then_some(opts.config.lldv_nits)
+                            ),
+                            shown
+                                .and_then(|v| out_nits(v, signal, opts.config.white_nits))
+                                .map_or_else(|| "-".into(), |n| format!("brightest {n:.0} nits"))
+                        ),
+                        _ => String::new(),
+                    }
+                };
                 info!(
-                    "{:.0} s: shown {}, vblanks repeated {}, replaced unseen {}, unrendered {}; crop {}",
+                    "{:.0} s: shown {}, vblanks repeated {}, replaced unseen {}, unrendered {}; crop {}{levels}",
                     run_started.elapsed().as_secs_f64(),
                     counts.shown,
                     counts.repeats,
@@ -1429,6 +1492,22 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // Read first: the window is borrowed again for LAST 10 S
                 // below, and two borrows in one statement panic.
                 let brightest = window.borrow_mut().brightest(now);
+                // The frame on screen, read back: what the projector is
+                // sent. A mapping of the buffer, so timed and logged once.
+                let read_at = Instant::now();
+                let shown = out
+                    .read_scanout(buffers[front], |px, stride| {
+                        scanout_peak(px, stride, scan_fourcc, size)
+                    })
+                    .ok()
+                    .flatten();
+                if !read_back_logged {
+                    read_back_logged = true;
+                    info!(
+                        "osd: the frame on screen read back for the panel in {:.1} ms",
+                        ms(read_at)
+                    );
+                }
                 ui.set_info(InfoText {
                     sections: vec![
                         input_section(
@@ -1444,6 +1523,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             opts.config.lldv,
                             policy.committed().signal,
                             cur_mode,
+                            shown,
+                            opts.config.white_nits,
                         ),
                         status::crop_section(
                             last_key.filter(|_| !dark).map(|k| (k.width, k.height)),
@@ -2161,13 +2242,29 @@ mod tests {
             interlaced: false,
             preferred: false,
         };
-        let out = output_section(lldv, false, true, follow::Signal::Sdr, mode);
+        let out = output_section(lldv, false, true, follow::Signal::Sdr, mode, None, 96);
         assert_eq!(out.line, "SDR BT.2020 \u{b7} unchanged from the player");
         assert_eq!(out.detail, "4096 \u{d7} 2160 \u{b7} 23.976");
         let pq = Some(key(ycbcr(Transfer::Pq)));
-        let mapped = output_section(pq, false, true, follow::Signal::Sdr, mode);
+        let mapped = output_section(pq, false, true, follow::Signal::Sdr, mode, None, 96);
         assert_eq!(mapped.line, "SDR BT.2020 \u{b7} tone-mapped by cinefit");
-        let waiting = output_section(None, false, true, follow::Signal::Sdr, mode);
+        let waiting = output_section(None, false, true, follow::Signal::Sdr, mode, None, 96);
+        // What went out: SDR full scale is cinefit's white; 94 nits of it
+        // is (94/96)^(1/2.4) of the scale.
+        let shown = output_section(
+            lldv,
+            false,
+            true,
+            follow::Signal::Sdr,
+            mode,
+            Some((94.0f64 / 96.0).powf(1.0 / 2.4)),
+            96,
+        );
+        assert!(
+            shown.detail.ends_with("brightest 94 nits"),
+            "{}",
+            shown.detail
+        );
         assert_eq!(waiting.line, "SDR BT.2020 \u{b7} black, waiting");
     }
 
