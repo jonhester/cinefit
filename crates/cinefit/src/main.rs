@@ -23,6 +23,8 @@ mod tunnel_check;
 mod ui;
 #[cfg(target_os = "linux")]
 mod unpack_check;
+#[cfg(target_os = "linux")]
+mod web;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -22,6 +22,7 @@ use crate::osd::{BannerText, Encoding, InfoSection, InfoText};
 use crate::runlog;
 use crate::status::{self, Window};
 use crate::ui::{Slate, Ui};
+use crate::web::Web;
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
@@ -520,6 +521,71 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
         }
     }
     peak
+}
+
+/// The preview's size: a sixth of the 4096 x 2160 raster each way.
+const PREVIEW: (usize, usize) = (682, 360);
+
+/// The frame just drawn, drawn again into a small target in SDR BT.709:
+/// what the web page shows, read back later without waiting (see the
+/// caller). Its own stage times, so the run's are the frames' alone.
+#[allow(clippy::too_many_arguments)]
+fn render_preview<'p>(
+    pl: &'p Placebo,
+    tex: &mut Option<cinefit_render::Rgba16Target<'p>>,
+    info: &FrameInfo,
+    kind: Kind,
+    tunnel: Option<&Tunnel>,
+    sources: &mut Sources<'p>,
+    view: View,
+    out: (u32, u32),
+    c: &Config,
+) -> Result<(), Box<dyn Error>> {
+    let (w, h) = PREVIEW;
+    if tex.is_none() {
+        *tex = Some(pl.target_rgba16(w, h)?);
+    }
+    let t = tex.as_ref().expect("made above");
+    let (sx, sy) = (w as f32 / out.0 as f32, h as f32 / out.1 as f32);
+    let small = View {
+        src: view.src,
+        dst: view.dst.map(|r| Rect {
+            x0: r.x0 * sx,
+            y0: r.y0 * sy,
+            x1: r.x1 * sx,
+            y1: r.y1 * sy,
+        }),
+    };
+    let dst = Target {
+        tex: t.texture(),
+        color: RgbColor {
+            primaries: Primaries::Bt709,
+            transfer: Transfer::Bt1886,
+        },
+        rgb_range: c.rgb_range,
+        white_nits: f32::from(c.white_nits),
+        curve: c.curve,
+        lldv: c.lldv,
+        source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
+        view: small,
+    };
+    draw(
+        pl,
+        info,
+        kind,
+        tunnel,
+        sources,
+        &dst,
+        &mut Stages::default(),
+    )?;
+    Ok(())
+}
+
+/// A read-back preview as 8-bit RGB.
+fn preview_rgb(rgba: &[u16]) -> Vec<u8> {
+    rgba.chunks(4)
+        .flat_map(|p| [p[0] >> 8, p[1] >> 8, p[2] >> 8].map(|v| v as u8))
+        .collect()
 }
 
 /// A picture size as people say it.
@@ -1367,12 +1433,19 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         .collect();
     rates.sort_by(f64::total_cmp);
     rates.dedup();
+    // The web page: its own thread, the port from the settings.
+    let web = Web::start(cfg.web_port);
     let mut menu = Menu::new(rates, crate::VERSION.split(' ').next().unwrap_or("?"));
     // A rate-while-waiting change made while waiting: the output follows it
     // (a modeset) until a source comes.
     let mut wait_changed = false;
     let mut info_at: Option<Instant> = None;
     let mut read_back_logged = false;
+    // The web page's preview: its small target, made when first wanted, and
+    // when the last was made.
+    let mut preview_tex: Option<cinefit_render::Rgba16Target> = None;
+    let (mut preview_at, mut previews): (Option<Instant>, u32) = (None, 0);
+    let mut preview_busy = false;
     let mut cur_mode = mode;
     let now = Instant::now();
     match (&start_key, &start_input) {
@@ -1495,6 +1568,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     }
                 );
             }
+            // Setting changes from the menu and the web page, applied below
+            // the same way.
+            let mut changes: Vec<(&'static str, config::Value, &str)> = Vec::new();
             for a in keys.drain() {
                 info!(
                     "{:.1} s: key {}",
@@ -1503,42 +1579,55 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 );
                 // While the menu is open it takes every key but Info.
                 if a == Action::Menu || (menu.is_open() && a != Action::Info) {
-                    let Some((key, value)) = menu.key(a, &cfg, Instant::now()) else {
-                        continue;
-                    };
-                    let setting = config::find(key).expect("the menu's rows are settings");
-                    if let Err(e) = setting.put(&mut cfg, &value) {
-                        warn!("menu: {key} = {value} refused: {e}");
-                        continue;
-                    }
-                    // Saved over the file as it is, without --set.
-                    let _ = setting.put(&mut file_cfg, &value);
-                    let saved = match config::save(&file_cfg, &file_path) {
-                        Ok(()) => "saved".to_string(),
-                        Err(e) => format!("not saved: {e}"),
-                    };
-                    info!(
-                        "{:.1} s: menu: {key} = {value} ({}, {saved})",
-                        run_started.elapsed().as_secs_f64(),
-                        setting.apply
-                    );
-                    // What reads it each frame needs nothing; the rest is
-                    // told here.
-                    match key {
-                        "detect.crop" => finder.on = cfg.crop,
-                        "geometry.screen_ar" => {
-                            win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
-                            ui.set_band((win.y, win.h));
-                        }
-                        "osd.banners" => ui.set_banners(cfg.banners),
-                        "output.wait_hz" => wait_changed = dark,
-                        _ => {}
+                    if let Some((key, value)) = menu.key(a, &cfg, Instant::now()) {
+                        changes.push((key, value, "menu"));
                     }
                     continue;
                 }
                 match a {
                     Action::Info => ui.toggle_info(Instant::now()),
                     Action::Back => ui.close_info(),
+                    _ => {}
+                }
+            }
+            if let Some(w) = &web {
+                for (key, text) in w.take_changes() {
+                    // Checked by the server already; a race with another
+                    // change can still make one fail, which is logged.
+                    match config::find(&key).map(|s| (s.key, s.value_of(&text))) {
+                        Some((k, Ok(v))) => changes.push((k, v, "web")),
+                        _ => warn!("web: {key} = {text} not understood"),
+                    }
+                }
+            }
+            for (key, value, from) in changes {
+                let setting = config::find(key).expect("changes name settings");
+                if let Err(e) = setting.put(&mut cfg, &value) {
+                    warn!("{from}: {key} = {value} refused: {e}");
+                    continue;
+                }
+                // Saved over the file as it is, without --set.
+                let _ = setting.put(&mut file_cfg, &value);
+                let saved = match config::save(&file_cfg, &file_path) {
+                    Ok(()) => "saved".to_string(),
+                    Err(e) => format!("not saved: {e}"),
+                };
+                info!(
+                    "{:.1} s: {from}: {key} = {value} ({}, {saved})",
+                    run_started.elapsed().as_secs_f64(),
+                    setting.apply
+                );
+                // What reads it each frame needs nothing; the rest is told
+                // here.
+                match key {
+                    "detect.crop" => finder.on = cfg.crop,
+                    "geometry.screen_ar" => {
+                        win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
+                        ui.set_band((win.y, win.h));
+                    }
+                    "osd.banners" => ui.set_banners(cfg.banners),
+                    "slate.venue" => ui.set_venue(&cfg.venue),
+                    "output.wait_hz" => wait_changed = dark,
                     _ => {}
                 }
             }
@@ -1551,7 +1640,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     signal: follow::Signal::Sdr,
                 });
             }
-            if !ui.info_open() {
+            if !ui.info_open() && web.is_none() {
                 info_at = None;
             } else if info_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
                 let now = Instant::now();
@@ -1565,21 +1654,28 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let brightest = window.borrow_mut().brightest(now);
                 // The frame on screen, read back: what the projector is
                 // sent. A mapping of the buffer, so timed and logged once.
+                // Only while the panel or a page's preview is looking.
                 let read_at = Instant::now();
-                let shown = out
-                    .read_scanout(buffers[front], |px, stride| {
+                // Only while the panel is open: mapping the output buffer
+                // copies all of it off the GPU, ~13 ms (the web page's
+                // preview is a small render of its own instead).
+                let shown = if ui.info_open() {
+                    out.read_scanout(buffers[front], |px, stride| {
                         scanout_peak(px, stride, scan_fourcc, size)
                     })
                     .ok()
-                    .flatten();
-                if !read_back_logged {
+                    .flatten()
+                } else {
+                    None
+                };
+                if ui.info_open() && !read_back_logged {
                     read_back_logged = true;
                     info!(
                         "osd: the frame on screen read back for the panel in {:.1} ms",
                         ms(read_at)
                     );
                 }
-                ui.set_info(InfoText {
+                let text = InfoText {
                     sections: vec![
                         input_section(
                             last_key,
@@ -1604,7 +1700,29 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         ),
                         window.borrow_mut().section(now, period),
                     ],
-                });
+                };
+                if let Some(w) = &web {
+                    let pill = match last_key.filter(|_| !dark).map(|k| k.kind) {
+                        None => "Waiting",
+                        Some(Kind::Unsupported(_)) => "Can't show this",
+                        Some(_) => "Playing",
+                    };
+                    let now_rows: Vec<serde_json::Value> = text
+                        .sections
+                        .iter()
+                        .map(|s| serde_json::json!({"label": s.label, "line": s.line, "detail": s.detail}))
+                        .collect();
+                    w.publish(
+                        serde_json::json!({
+                            "version": crate::VERSION,
+                            "pill": pill,
+                            "now": now_rows,
+                            "settings": crate::web::settings_json(&cfg),
+                        }),
+                        &cfg,
+                    );
+                }
+                ui.set_info(text);
             }
             let taken = if ready.is_none() {
                 mailbox.take_wait(take_timeout)
@@ -1770,6 +1888,62 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         )?;
                         ready = Some(free);
                         ui.set_slate(None);
+                        // The web page's preview, when one is due: the same
+                        // frame drawn again, small and in ordinary SDR, for
+                        // a phone. About a millisecond on the GPU and a 2 MB
+                        // download, against mapping the whole output.
+                        if let Some(wb) = &web {
+                            // The last preview's read-back, if it has come.
+                            if let Some(rgba) = preview_tex.as_mut().and_then(|t| t.take_download())
+                            {
+                                preview_busy = false;
+                                let (w, h) = PREVIEW;
+                                wb.set_preview(w as u16, h as u16, preview_rgb(&rgba));
+                            }
+                            if let Some(every) = wb.preview_every()
+                                && !preview_busy
+                                && preview_at.is_none_or(|t| t.elapsed() >= every)
+                            {
+                                let t0 = Instant::now();
+                                preview_at = Some(t0);
+                                let made = render_preview(
+                                    &pl,
+                                    &mut preview_tex,
+                                    &frame_info,
+                                    k.kind,
+                                    last_tunnel.as_ref(),
+                                    &mut sources,
+                                    view,
+                                    size,
+                                    &cfg,
+                                )
+                                .and_then(|()| {
+                                    let t = preview_tex.as_mut().expect("made by render_preview");
+                                    Ok(t.start_download()?)
+                                });
+                                match made {
+                                    Ok(started) => {
+                                        preview_busy = started;
+                                        // The first includes making the target
+                                        // and its shaders; the tenth is the
+                                        // cost that repeats.
+                                        previews += 1;
+                                        if previews == 1 || previews == 10 {
+                                            info!(
+                                                "web: preview made in {:.1} ms on the frame thread ({})",
+                                                ms(t0),
+                                                if previews == 1 {
+                                                    "the first"
+                                                } else {
+                                                    "the tenth"
+                                                }
+                                            );
+                                        }
+                                    }
+                                    Err(e) => warn!("web: no preview: {e}"),
+                                }
+                            }
+                        }
                         if let Some(&r) = stages.render.last() {
                             // The frame's whole work, as it ran: detect beside
                             // the upload, then the draw.

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cinefit</title>
+<style>
+  :root {
+    --bg: #0b0b10; --card: #16151d; --row: #1b1a24; --line: #2a2838;
+    --text: #ece8e1; --secondary: #b3aec2; --hint: #9f99b2;
+    --accent: #b9a6ff; --attention: #f6b26b; --error: #f2666b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.4 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1500px; margin: 0 auto; padding: 18px; display: grid; gap: 18px; }
+  /* A desktop or tablet: the picture and status take the wider column,
+     the settings sit beside them and scroll on their own. */
+  @media (min-width: 900px) {
+    main { grid-template-columns: 3fr 2fr; align-items: start; padding: 28px; gap: 28px; }
+    #settings { max-height: calc(100vh - 120px); overflow-y: auto; position: sticky; top: 28px; }
+  }
+  header { display: flex; justify-content: space-between; align-items: center; grid-column: 1 / -1; }
+  .wordmark { font-size: 28px; font-weight: 600; letter-spacing: -0.5px; }
+  .wordmark span { color: var(--accent); }
+  .pill { background: #24203a; color: var(--accent); border-radius: 999px; padding: 4px 14px; font-weight: 600; }
+  .pill.attention { color: var(--attention); } .pill.error { color: var(--error); }
+  .card { background: var(--card); border-radius: 14px; padding: 14px 16px; }
+  .preview { position: relative; padding: 8px; border: 1px solid var(--line); }
+  .preview img { display: block; width: 100%; aspect-ratio: 17 / 9; background: #000; border-radius: 6px; object-fit: contain; }
+  .live { position: absolute; top: 14px; left: 14px; background: #000a; border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+  .live::before { content: "\25CF  "; color: var(--error); }
+  .now div { display: grid; grid-template-columns: 5.5em 1fr; margin: 6px 0; }
+  .label { color: var(--accent); font-weight: 600; font-size: 13px; letter-spacing: 1px; padding-top: 2px; }
+  .detail { color: var(--hint); font-size: 14px; }
+  h2 { color: var(--hint); font-size: 13px; letter-spacing: 1.5px; margin: 6px 4px; font-weight: 600; }
+  details { background: var(--row); border-radius: 12px; margin: 8px 0; }
+  summary { padding: 14px 16px; cursor: pointer; list-style: none; display: flex; justify-content: space-between; }
+  summary::after { content: "\203A"; color: var(--hint); }
+  details[open] summary::after { content: "\2039"; }
+  .setting { padding: 10px 16px 14px; border-top: 1px solid var(--line); }
+  .setting .top { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+  .setting .cost, .setting .help { color: var(--hint); font-size: 13px; margin-top: 4px; }
+  .setting .err { color: var(--error); font-size: 13px; margin-top: 4px; }
+  select, input { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+                  padding: 6px 8px; font: inherit; max-width: 60%; }
+  input[type=text] { width: 14em; }
+  button { background: #24203a; color: var(--accent); border: 1px solid #3a3358; border-radius: 8px; padding: 6px 12px; font: inherit; }
+  .logs a { color: var(--secondary); display: block; padding: 4px 0; text-decoration: none; }
+  .logs a:hover { color: var(--accent); }
+  footer { color: var(--hint); font-size: 13px; grid-column: 1 / -1; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <header><div class="wordmark">cine<span>fit</span></div><div id="pill" class="pill">…</div></header>
+  <section>
+    <div class="card preview"><img id="preview" alt="The screen as shown"><div class="live" id="live">LIVE</div></div>
+    <div class="card now" id="now" style="margin-top:18px"></div>
+    <h2 style="margin-top:22px">RECENT RUNS AND LOGS</h2>
+    <div class="card logs" id="logs"></div>
+  </section>
+  <section id="settings">
+    <h2>SETTINGS</h2>
+    <div id="pages"></div>
+  </section>
+  <footer id="version"></footer>
+</main>
+<script>
+"use strict";
+const PAGES = ["Picture", "Output", "Screen", "Input", "Web page"];
+// The menu's names for the table's values.
+const NAMES = { on: "On", off: "Off", passthrough: "To the projector",
+  sdr2020: "Tone-mapped to SDR BT.2020", limited: "Limited", full: "Full" };
+const el = (tag, cls, text) => { const e = document.createElement(tag);
+  if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+let built = false;
+const rows = {};   // key -> { control, err }
+
+async function post(key, value, row) {
+  row.err.textContent = "";
+  try {
+    const r = await fetch("/api/set", { method: "POST", body: JSON.stringify({ key, value }) });
+    const j = await r.json();
+    if (!r.ok) row.err.textContent = j.error || "refused";
+  } catch (e) { row.err.textContent = "cinefit did not answer"; }
+}
+
+function control(s) {
+  const k = s.kind;
+  let c;
+  if (k.type === "choice") {
+    c = el("select");
+    for (const v of k.choices) { const o = el("option", "", NAMES[v] || v); o.value = v; c.append(o); }
+    c.onchange = () => post(s.key, c.value, rows[s.key]);
+  } else {
+    c = el("input");
+    c.type = k.type === "text" || k.type === "ratio" ? "text" : "number";
+    if (k.type === "int") c.step = "1";
+    if (k.type === "float") c.step = "any";
+    if (k.min !== undefined && c.type === "number") { c.min = k.min; c.max = k.max; }
+    if (k.type === "ratio") c.placeholder = "2.35 or 16:9";
+    c.onchange = () => post(s.key, c.value, rows[s.key]);
+  }
+  return c;
+}
+
+function build(settings) {
+  const pages = document.getElementById("pages");
+  for (const page of PAGES) {
+    const d = el("details"); const sum = el("summary", "", page); d.append(sum);
+    for (const s of settings.filter(x => x.page === page)) {
+      const row = el("div", "setting"), top = el("div", "top");
+      top.append(el("span", "", s.label));
+      const c = control(s); top.append(c);
+      const err = el("div", "err");
+      row.append(top, el("div", "cost", s.cost), err);
+      const help = el("div", "help", s.help); row.append(help);
+      d.append(row);
+      rows[s.key] = { control: c, err };
+    }
+    pages.append(d);
+  }
+  built = true;
+}
+
+function update(state) {
+  const pill = document.getElementById("pill");
+  pill.textContent = state.pill || "…";
+  pill.className = "pill" + (state.pill === "Waiting" ? " attention" : state.pill === "Can't show this" ? " error" : "");
+  const now = document.getElementById("now"); now.replaceChildren();
+  for (const s of state.now || []) {
+    const r = el("div"); r.append(el("span", "label", s.label));
+    const v = el("span"); v.append(el("div", "", s.line), el("div", "detail", s.detail)); r.append(v);
+    now.append(r);
+  }
+  if (!built && state.settings) build(state.settings);
+  for (const s of state.settings || []) {
+    const r = rows[s.key];
+    // Never overwrite what someone is typing.
+    if (r && document.activeElement !== r.control) r.control.value = s.value;
+  }
+  document.getElementById("version").textContent = "cinefit " + (state.version || "");
+}
+
+async function poll() {
+  try { update(await (await fetch("/api/state", { cache: "no-store" })).json()); }
+  catch (e) { document.getElementById("pill").textContent = "No answer"; }
+}
+
+// The preview: a motion-JPEG stream (every frame), shown
+// as the image's source, which browsers play natively. Stopped while the
+// tab is hidden, so a forgotten tab costs cinefit nothing. If the stream
+// fails, a still once a second instead.
+const img = () => document.getElementById("preview");
+let streaming = true, shown;
+function startStream() { img().src = "/api/stream.mjpg?t=" + Date.now(); }
+function stopStream() { img().src = ""; }
+async function still() {
+  if (streaming || document.visibilityState !== "visible") return;
+  try {
+    const r = await fetch("/api/preview.jpg", { cache: "no-store" });
+    if (r.status !== 200) return;
+    const url = URL.createObjectURL(await r.blob());
+    img().src = url;
+    if (shown) URL.revokeObjectURL(shown);
+    shown = url;
+  } catch (e) {}
+}
+img().addEventListener("error", () => {
+  if (!streaming || !img().src.includes("stream")) return;
+  streaming = false;
+  document.getElementById("live").textContent = "LIVE · 1/s";
+});
+document.addEventListener("visibilitychange", () => {
+  if (!streaming) return;
+  document.visibilityState === "visible" ? startStream() : stopStream();
+});
+
+async function logs() {
+  const list = document.getElementById("logs"); list.replaceChildren();
+  try {
+    for (const l of await (await fetch("/api/logs")).json()) {
+      const a = el("a", "", l.name + "  ·  " + Math.max(1, Math.round(l.size / 1024)) + " KB");
+      a.href = "/api/logs/" + encodeURIComponent(l.name); a.target = "_blank"; list.append(a);
+    }
+  } catch (e) {}
+}
+
+poll(); logs(); startStream();
+setInterval(poll, 1000);
+setInterval(still, 1000);
+setInterval(logs, 30000);
+</script>
+</body>
+</html>

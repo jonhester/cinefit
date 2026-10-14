@@ -73,6 +73,8 @@ pub struct Config {
     pub venue: String,
     /// A banner on each change of picture type.
     pub banners: bool,
+    /// The web page's port on the home network; 0 for none.
+    pub web_port: u16,
 }
 
 /// An aspect ratio as it was written: `"16:9"` keeps its two sides, so it
@@ -149,6 +151,7 @@ impl Default for Config {
             fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
             banners: true,
+            web_port: 8080,
         }
     }
 }
@@ -434,6 +437,15 @@ static SETTINGS: &[Setting] = &[
         get: |c| Value::Name(if c.banners { "on" } else { "off" }.into()),
         set: |c, v| c.banners = name(v) == "on",
     },
+    Setting {
+        key: "web.port",
+        kind: Kind::Int { min: 0, max: 65535 },
+        apply: Apply::Start,
+        help: "The port of the web page with cinefit's status and settings, open to the home network: \
+               http://<this machine>:8080. 0: no web page. Above 1023, as it runs without root.",
+        get: |c| Value::Int(c.web_port.into()),
+        set: |c, v| c.web_port = int(v) as u16,
+    },
 ];
 
 const CURVES: &[&str] = &[
@@ -594,21 +606,32 @@ pub fn set(c: &mut Config, assignment: &str) -> Result<(), Error> {
         .split_once('=')
         .ok_or_else(|| Error::UnknownKey(assignment.to_string()))?;
     let s = find(key.trim()).ok_or_else(|| Error::UnknownKey(key.trim().to_string()))?;
-    let text = text.trim();
-    let value = match s.kind {
-        Kind::Int { .. } => Value::Int(text.parse().map_err(|_| Error::Value {
-            key: s.key.to_string(),
-            value: text.to_string(),
-            range: s.range(),
-        })?),
-        Kind::Choice(_) | Kind::Text { .. } | Kind::Ratio { .. } => Value::Name(text.to_string()),
-        Kind::Float { .. } => Value::Float(text.parse().map_err(|_| Error::Value {
-            key: s.key.to_string(),
-            value: text.to_string(),
-            range: s.range(),
-        })?),
-    };
+    let value = s.value_of(text)?;
     s.put(c, &value)
+}
+
+impl Setting {
+    /// A value as typed (on the command line, on the web page), read as
+    /// this setting's kind. Not checked against the range: `put` does that.
+    pub fn value_of(&self, text: &str) -> Result<Value, Error> {
+        let s = self;
+        let text = text.trim();
+        Ok(match s.kind {
+            Kind::Int { .. } => Value::Int(text.parse().map_err(|_| Error::Value {
+                key: s.key.to_string(),
+                value: text.to_string(),
+                range: s.range(),
+            })?),
+            Kind::Choice(_) | Kind::Text { .. } | Kind::Ratio { .. } => {
+                Value::Name(text.to_string())
+            }
+            Kind::Float { .. } => Value::Float(text.parse().map_err(|_| Error::Value {
+                key: s.key.to_string(),
+                value: text.to_string(),
+                range: s.range(),
+            })?),
+        })
+    }
 }
 
 /// The settings as TOML, every row with its help as a comment: what `save`

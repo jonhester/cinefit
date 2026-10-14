@@ -316,6 +316,11 @@ impl Ui {
         self.band = (band.0 as usize, band.1 as usize);
     }
 
+    /// The theater's name, after a change on the web page.
+    pub fn set_venue(&mut self, venue: &str) {
+        self.venue = venue.to_string();
+    }
+
     /// Banners on or off, from the menu.
     pub fn set_banners(&mut self, on: bool) {
         self.banners = on;
