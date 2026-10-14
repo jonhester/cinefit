@@ -14,6 +14,8 @@ mod replay;
 #[cfg(target_os = "linux")]
 mod runlog;
 #[cfg(target_os = "linux")]
+mod status;
+#[cfg(target_os = "linux")]
 mod tunnel_check;
 #[cfg(target_os = "linux")]
 mod ui;
@@ -195,6 +197,14 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show what the remote's and keyboards' buttons mean to cinefit, as
+    /// they are pressed. Takes the keyboards from anything else while it
+    /// runs, a running `play` included.
+    Keys {
+        /// How long to listen, in seconds.
+        #[arg(short = 't', long, default_value_t = 30.0)]
+        seconds: f64,
+    },
     /// List every setting: its value, range, what a change costs, and help.
     Settings {
         /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml.
@@ -288,6 +298,7 @@ fn main() -> ExitCode {
                 seconds, device, card, config, !no_pstate, dry_run,
             ))
         }),
+        Command::Keys { seconds } => keys(seconds),
         Command::Settings { config, toml } => settings(config.as_deref(), toml),
     };
     match result {
@@ -745,6 +756,29 @@ fn compare_run(_opts: compare::Options) -> Result<(), Box<dyn std::error::Error>
 }
 
 /// The settings file (or the defaults), then each `--set` over it.
+#[cfg(target_os = "linux")]
+fn keys(seconds: f64) -> Result<(), Box<dyn std::error::Error>> {
+    let until = Instant::now()
+        + Duration::try_from_secs_f64(seconds)
+            .map_err(|_| "--seconds must be a positive number")?;
+    let reader = cinefit_input::KeyReader::start(std::path::Path::new("/dev/input"), |line| {
+        println!("{line}")
+    });
+    println!("listening for {seconds:.0} s: press the remote's buttons");
+    while Instant::now() < until {
+        for a in reader.drain() {
+            println!("{}", a.name());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn keys(_seconds: f64) -> Result<(), Box<dyn std::error::Error>> {
+    Err("keys: Linux only".into())
+}
+
 fn load_config(
     path: Option<&std::path::Path>,
     sets: &[String],

@@ -11,6 +11,7 @@ cinefit-decklink = { path = "../cinefit-decklink" }
 cinefit-detect = { path = "../cinefit-detect" }
 cinefit-dovi = { path = "../cinefit-dovi" }
 cinefit-geometry = { path = "../cinefit-geometry" }
+cinefit-input = { path = "../cinefit-input" }
 cinefit-kms = { path = "../cinefit-kms" }
 cinefit-render = { path = "../cinefit-render" }
 clap = { version = "4.5", features = ["derive"] }
