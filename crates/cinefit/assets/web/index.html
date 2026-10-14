@@ -13,8 +13,13 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 16px/1.4 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 1200px; margin: 0 auto; padding: 18px; display: grid; gap: 18px; }
-  @media (min-width: 900px) { main { grid-template-columns: 1fr 1fr; align-items: start; } }
+  main { max-width: 1500px; margin: 0 auto; padding: 18px; display: grid; gap: 18px; }
+  /* A desktop or tablet: the picture and status take the wider column,
+     the settings sit beside them and scroll on their own. */
+  @media (min-width: 900px) {
+    main { grid-template-columns: 3fr 2fr; align-items: start; padding: 28px; gap: 28px; }
+    #settings { max-height: calc(100vh - 120px); overflow-y: auto; position: sticky; top: 28px; }
+  }
   header { display: flex; justify-content: space-between; align-items: center; grid-column: 1 / -1; }
   .wordmark { font-size: 28px; font-weight: 600; letter-spacing: -0.5px; }
   .wordmark span { color: var(--accent); }
@@ -55,7 +60,7 @@
     <h2 style="margin-top:22px">RECENT RUNS AND LOGS</h2>
     <div class="card logs" id="logs"></div>
   </section>
-  <section>
+  <section id="settings">
     <h2>SETTINGS</h2>
     <div id="pages"></div>
   </section>
