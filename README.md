@@ -52,6 +52,13 @@ next to it:
 - The Inter typeface, for on-screen text, under the SIL Open Font License 1.1:
   [crates/cinefit/assets/fonts/OFL-Inter.txt](crates/cinefit/assets/fonts/OFL-Inter.txt)
 
+cinefit's binary links [libplacebo](https://code.videolan.org/videolan/libplacebo)
+statically, under the GNU LGPL 2.1 or later; its licence is in each release
+archive. To link cinefit against a modified libplacebo, build it with
+[scripts/build-libplacebo.sh](scripts/build-libplacebo.sh) (or point
+`CINEFIT_LIBPLACEBO` at your own prefix) and rebuild cinefit from the source of
+the same version.
+
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.

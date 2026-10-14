@@ -673,6 +673,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         Ok(path) => info!("log: {}", path.display()),
         Err(e) => warn!("log: not written: {e}"),
     }
+    info!("cinefit {}", crate::VERSION);
     // args_os: clap takes a path that is not UTF-8, which args() would panic on.
     let args: Vec<String> = std::env::args_os()
         .map(|a| a.to_string_lossy().into_owned())

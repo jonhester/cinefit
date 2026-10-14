@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds the libplacebo cinefit is pinned to and installs it into a prefix
-# (default: .deps/libplacebo in the repository, where the build looks for it).
+# Builds the libplacebo cinefit is pinned to, as a static library, and
+# installs it into a prefix (default: .deps/libplacebo in the repository,
+# where the build looks for it).
 #
 # The pinned commit lives here and only here. Moving it is a deliberate change:
 # update COMMIT, run this, update PL_API_VER in
@@ -32,9 +33,13 @@ git -C "$work/src" submodule update -q --init --depth 1 \
 # Quiet unless something fails, then the whole log.
 log="$work/build.log"
 run() { "$@" >> "$log" 2>&1 || { cat "$log" >&2; exit 1; }; }
+# Static: it goes inside the cinefit binary, so an installed copy carries
+# nothing beside it and can't load another version by mistake. LGPL-2.1
+# permits this with cinefit's source public (README, "Licences").
 run meson setup "$work/build" "$work/src" \
   --prefix="$prefix" \
   --buildtype=release \
+  --default-library=static \
   -Dvulkan=enabled -Dglslang=enabled -Dshaderc=disabled \
   -Dopengl=disabled -Dd3d11=disabled \
   -Dlcms=enabled -Ddovi=enabled -Dlibdovi=disabled \
@@ -43,4 +48,6 @@ run meson setup "$work/build" "$work/src" \
 run ninja -C "$work/build" install
 
 echo "$COMMIT" > "$prefix/COMMIT"
+# Its licence travels with the binaries it is linked into.
+cp "$work/src/LICENSE" "$prefix/LICENSE"
 echo "libplacebo ${COMMIT:0:12} installed in $prefix"
