@@ -2,8 +2,7 @@ use std::process::Command;
 
 fn main() {
     // What `cinefit --version` and every play log say this build is. The
-    // release workflow sets CINEFIT_VERSION from the tag (a release, a
-    // release candidate or a nightly, tools/version.sh); any other build is
+    // release workflow sets CINEFIT_VERSION from the tag; any other build is
     // `0.0.0-dev`. The commit and its date come from git, so a build says
     // which source it is; "-dev" builds may carry uncommitted changes the
     // hash does not show.

@@ -1,7 +1,9 @@
 name: Release
 
-# A tag vMAJOR.MINOR.PATCH (tools/version.sh tag) publishes that release: one
-# archive, x86-64-v3 (any x86 CPU from about 2015 on), and its checksum.
+# A pushed tag vMAJOR.MINOR.PATCH publishes that release: one archive,
+# x86-64-v3 (any x86 CPU from about 2015 on), and its checksum.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
 
 on:
   push:
@@ -18,8 +20,13 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
+      # SemVer, no leading zeros, nothing after: v0.1 or v0.01.0 is refused.
       - id: version
-        run: echo "version=$(tools/version.sh check "$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+        run: |
+          n='(0|[1-9][0-9]*)'
+          echo "$GITHUB_REF_NAME" | grep -Eq "^v$n\.$n\.$n\$" ||
+            { echo "$GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH"; exit 1; }
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
           meson ninja-build glslang-dev glslang-tools python3-jinja2
