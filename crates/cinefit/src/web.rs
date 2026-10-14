@@ -44,8 +44,9 @@ const WATCHING: Duration = Duration::from_secs(3);
 const STILL_EVERY: Duration = Duration::from_secs(1);
 const STREAM_EVERY: Duration = Duration::ZERO;
 
-/// A preview: its number, width, height and RGB bytes.
-type Preview = (u64, u16, u16, Vec<u8>);
+/// A preview: its number, width, height and 16-bit RGBA as read back. The
+/// conversion and encoding happen here, off the frame thread.
+type Preview = (u64, u16, u16, Arc<Vec<u16>>);
 
 /// What `play` and the server share.
 #[derive(Default)]
@@ -58,6 +59,9 @@ struct Shared {
     /// on request; `fresh` wakes the streams when a new one comes.
     preview: Mutex<Option<Preview>>,
     fresh: Condvar,
+    /// The last preview encoded, by number: each frame is encoded once,
+    /// however many pages watch.
+    encoded: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
     /// Pages watching the stream.
     streams: AtomicUsize,
     /// When a page last asked for the preview.
@@ -122,11 +126,11 @@ impl Web {
         }
     }
 
-    /// A preview, RGB, `w` by `h`.
-    pub fn set_preview(&self, w: u16, h: u16, rgb: Vec<u8>) {
+    /// A preview, 16-bit RGBA as read back, `w` by `h`.
+    pub fn set_preview(&self, w: u16, h: u16, rgba: Vec<u16>) {
         let mut p = lock(&self.shared.preview);
         let n = p.as_ref().map_or(0, |x| x.0 + 1);
-        *p = Some((n, w, h, rgb));
+        *p = Some((n, w, h, Arc::new(rgba)));
         self.shared.fresh.notify_all();
     }
 
@@ -162,9 +166,8 @@ fn serve(s: &Arc<Shared>, mut request: tiny_http::Request) {
         }
         (Method::Get, "/api/preview.jpg") => {
             *lock(&s.asked) = Some(Instant::now());
-            let frame = lock(&s.preview).clone();
-            match frame.and_then(|(_, w, h, rgb)| jpeg(w, h, &rgb)) {
-                Some(bytes) => Response::from_data(bytes)
+            match encoded(s, None) {
+                Some((_, bytes)) => Response::from_data(bytes.as_slice())
                     .with_header(header("Content-Type", "image/jpeg"))
                     .with_header(header("Cache-Control", "no-store"))
                     .boxed(),
@@ -241,31 +244,46 @@ fn stream(s: &Shared, request: tiny_http::Request) {
 /// `None` after ten seconds without one (cinefit stopped, or no picture), and
 /// the page starts over.
 fn next_part(s: &Shared, last: &mut Option<u64>) -> Option<Vec<u8>> {
-    let mut p = lock(&s.preview);
-    loop {
-        if let Some((n, w, h, rgb)) = p.as_ref()
-            && Some(*n) != *last
-        {
-            *last = Some(*n);
-            let jpg = jpeg(*w, *h, rgb)?;
-            let mut part = format!(
-                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                jpg.len()
-            )
-            .into_bytes();
-            part.extend_from_slice(&jpg);
-            part.extend_from_slice(b"\r\n");
-            return Some(part);
-        }
-        let (guard, timeout) = s
-            .fresh
-            .wait_timeout(p, Duration::from_secs(10))
-            .unwrap_or_else(PoisonError::into_inner);
-        p = guard;
-        if timeout.timed_out() {
-            return None;
+    {
+        let mut p = lock(&s.preview);
+        while p.as_ref().is_none_or(|x| Some(x.0) == *last) {
+            let (guard, timeout) = s
+                .fresh
+                .wait_timeout(p, Duration::from_secs(10))
+                .unwrap_or_else(PoisonError::into_inner);
+            p = guard;
+            if timeout.timed_out() {
+                return None;
+            }
         }
     }
+    let (n, jpg) = encoded(s, *last)?;
+    *last = Some(n);
+    let mut part = format!(
+        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+        jpg.len()
+    )
+    .into_bytes();
+    part.extend_from_slice(&jpg);
+    part.extend_from_slice(b"\r\n");
+    Some(part)
+}
+
+/// The newest preview as a JPEG, with its number: encoded once and shared
+/// by every page. `None` when there is none newer than `after`.
+fn encoded(s: &Shared, after: Option<u64>) -> Option<(u64, Arc<Vec<u8>>)> {
+    let (n, w, h, rgba) = lock(&s.preview).clone()?;
+    if Some(n) == after {
+        return None;
+    }
+    if let Some((m, jpg)) = lock(&s.encoded).as_ref()
+        && *m == n
+    {
+        return Some((n, Arc::clone(jpg)));
+    }
+    let jpg = Arc::new(jpeg(w, h, &rgba)?);
+    *lock(&s.encoded) = Some((n, Arc::clone(&jpg)));
+    Some((n, jpg))
 }
 
 /// A change from the page: checked against the table now, queued for
@@ -292,11 +310,15 @@ fn set(s: &Shared, body: &str) -> (u16, Json) {
     (200, json!({"ok": true}))
 }
 
-/// The preview as a JPEG.
-fn jpeg(w: u16, h: u16, rgb: &[u8]) -> Option<Vec<u8>> {
+/// A preview as a JPEG, from 16-bit RGBA.
+fn jpeg(w: u16, h: u16, rgba: &[u16]) -> Option<Vec<u8>> {
+    let rgb: Vec<u8> = rgba
+        .chunks(4)
+        .flat_map(|p| [p[0] >> 8, p[1] >> 8, p[2] >> 8].map(|v| v as u8))
+        .collect();
     let mut out = Vec::new();
     jpeg_encoder::Encoder::new(&mut out, 80)
-        .encode(rgb, w, h, jpeg_encoder::ColorType::Rgb)
+        .encode(&rgb, w, h, jpeg_encoder::ColorType::Rgb)
         .ok()?;
     Some(out)
 }
@@ -520,7 +542,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        web.set_preview(8, 8, vec![200; 8 * 8 * 3]);
+        web.set_preview(8, 8, vec![50_000; 8 * 8 * 4]);
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
         while !got.windows(2).any(|w| w == [0xFF, 0xD9]) {
@@ -550,8 +572,8 @@ mod tests {
     #[test]
     fn a_preview_encodes() {
         let (w, h) = (64u16, 36u16);
-        let rgb = vec![128u8; usize::from(w) * usize::from(h) * 3];
-        let j = jpeg(w, h, &rgb).unwrap();
+        let rgba = vec![32_768u16; usize::from(w) * usize::from(h) * 4];
+        let j = jpeg(w, h, &rgba).unwrap();
         assert_eq!(&j[..2], &[0xFF, 0xD8], "a JPEG starts with SOI");
     }
 }

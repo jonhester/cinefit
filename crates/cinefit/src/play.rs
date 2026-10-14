@@ -523,8 +523,9 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
     peak
 }
 
-/// The preview's size: a sixth of the 4096 x 2160 raster each way.
-const PREVIEW: (usize, usize) = (682, 360);
+/// The preview's size: 720 lines' worth, 1280 wide, in the 4096 x 2160
+/// raster's shape.
+const PREVIEW: (usize, usize) = (1280, 675);
 
 /// The frame just drawn, drawn again into a small target in SDR BT.709:
 /// what the web page shows, read back later without waiting (see the
@@ -579,13 +580,6 @@ fn render_preview<'p>(
         &mut Stages::default(),
     )?;
     Ok(())
-}
-
-/// A read-back preview as 8-bit RGB.
-fn preview_rgb(rgba: &[u16]) -> Vec<u8> {
-    rgba.chunks(4)
-        .flat_map(|p| [p[0] >> 8, p[1] >> 8, p[2] >> 8].map(|v| v as u8))
-        .collect()
 }
 
 /// A picture size as people say it.
@@ -1898,7 +1892,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             {
                                 preview_busy = false;
                                 let (w, h) = PREVIEW;
-                                wb.set_preview(w as u16, h as u16, preview_rgb(&rgba));
+                                // Converted and encoded on the web side.
+                                wb.set_preview(w as u16, h as u16, rgba);
                             }
                             if let Some(every) = wb.preview_every()
                                 && !preview_busy
