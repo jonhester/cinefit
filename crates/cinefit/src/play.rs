@@ -22,6 +22,7 @@ use crate::osd::{BannerText, Encoding, InfoSection, InfoText};
 use crate::runlog;
 use crate::status::{self, Window};
 use crate::ui::{Slate, Ui};
+use crate::web::Web;
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
@@ -520,6 +521,29 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
         }
     }
     peak
+}
+
+/// A small copy of the frame on screen for the web page's preview: every
+/// sixth pixel each way, as 8-bit RGB of the codes sent (so BT.2020 SDR, or
+/// PQ when HDR10 goes out, shown as is).
+fn scanout_preview(
+    px: &[u8],
+    stride: usize,
+    fourcc: u32,
+    size: (u32, u32),
+) -> Option<(u16, u16, Vec<u8>)> {
+    const STEP: usize = 6;
+    let (w, h) = (size.0 as usize / STEP, size.1 as usize / STEP);
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let o = y * STEP * stride + x * STEP * 4;
+            let p = px.get(o..o + 4)?;
+            let c = cinefit_kms::scanout::decode(fourcc, [p[0], p[1], p[2], p[3]])?;
+            rgb.extend(c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+        }
+    }
+    Some((u16::try_from(w).ok()?, u16::try_from(h).ok()?, rgb))
 }
 
 /// A picture size as people say it.
@@ -1367,6 +1391,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         .collect();
     rates.sort_by(f64::total_cmp);
     rates.dedup();
+    // The web page: its own thread, the port from the settings.
+    let web = Web::start(cfg.web_port);
     let mut menu = Menu::new(rates, crate::VERSION.split(' ').next().unwrap_or("?"));
     // A rate-while-waiting change made while waiting: the output follows it
     // (a modeset) until a source comes.
@@ -1495,6 +1521,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     }
                 );
             }
+            // Setting changes from the menu and the web page, applied below
+            // the same way.
+            let mut changes: Vec<(&'static str, config::Value, &str)> = Vec::new();
             for a in keys.drain() {
                 info!(
                     "{:.1} s: key {}",
@@ -1503,42 +1532,55 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 );
                 // While the menu is open it takes every key but Info.
                 if a == Action::Menu || (menu.is_open() && a != Action::Info) {
-                    let Some((key, value)) = menu.key(a, &cfg, Instant::now()) else {
-                        continue;
-                    };
-                    let setting = config::find(key).expect("the menu's rows are settings");
-                    if let Err(e) = setting.put(&mut cfg, &value) {
-                        warn!("menu: {key} = {value} refused: {e}");
-                        continue;
-                    }
-                    // Saved over the file as it is, without --set.
-                    let _ = setting.put(&mut file_cfg, &value);
-                    let saved = match config::save(&file_cfg, &file_path) {
-                        Ok(()) => "saved".to_string(),
-                        Err(e) => format!("not saved: {e}"),
-                    };
-                    info!(
-                        "{:.1} s: menu: {key} = {value} ({}, {saved})",
-                        run_started.elapsed().as_secs_f64(),
-                        setting.apply
-                    );
-                    // What reads it each frame needs nothing; the rest is
-                    // told here.
-                    match key {
-                        "detect.crop" => finder.on = cfg.crop,
-                        "geometry.screen_ar" => {
-                            win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
-                            ui.set_band((win.y, win.h));
-                        }
-                        "osd.banners" => ui.set_banners(cfg.banners),
-                        "output.wait_hz" => wait_changed = dark,
-                        _ => {}
+                    if let Some((key, value)) = menu.key(a, &cfg, Instant::now()) {
+                        changes.push((key, value, "menu"));
                     }
                     continue;
                 }
                 match a {
                     Action::Info => ui.toggle_info(Instant::now()),
                     Action::Back => ui.close_info(),
+                    _ => {}
+                }
+            }
+            if let Some(w) = &web {
+                for (key, text) in w.take_changes() {
+                    // Checked by the server already; a race with another
+                    // change can still make one fail, which is logged.
+                    match config::find(&key).map(|s| (s.key, s.value_of(&text))) {
+                        Some((k, Ok(v))) => changes.push((k, v, "web")),
+                        _ => warn!("web: {key} = {text} not understood"),
+                    }
+                }
+            }
+            for (key, value, from) in changes {
+                let setting = config::find(key).expect("changes name settings");
+                if let Err(e) = setting.put(&mut cfg, &value) {
+                    warn!("{from}: {key} = {value} refused: {e}");
+                    continue;
+                }
+                // Saved over the file as it is, without --set.
+                let _ = setting.put(&mut file_cfg, &value);
+                let saved = match config::save(&file_cfg, &file_path) {
+                    Ok(()) => "saved".to_string(),
+                    Err(e) => format!("not saved: {e}"),
+                };
+                info!(
+                    "{:.1} s: {from}: {key} = {value} ({}, {saved})",
+                    run_started.elapsed().as_secs_f64(),
+                    setting.apply
+                );
+                // What reads it each frame needs nothing; the rest is told
+                // here.
+                match key {
+                    "detect.crop" => finder.on = cfg.crop,
+                    "geometry.screen_ar" => {
+                        win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
+                        ui.set_band((win.y, win.h));
+                    }
+                    "osd.banners" => ui.set_banners(cfg.banners),
+                    "slate.venue" => ui.set_venue(&cfg.venue),
+                    "output.wait_hz" => wait_changed = dark,
                     _ => {}
                 }
             }
@@ -1551,7 +1593,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     signal: follow::Signal::Sdr,
                 });
             }
-            if !ui.info_open() {
+            let watching = web.as_ref().is_some_and(Web::wants_preview);
+            if !ui.info_open() && web.is_none() {
                 info_at = None;
             } else if info_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
                 let now = Instant::now();
@@ -1565,21 +1608,31 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let brightest = window.borrow_mut().brightest(now);
                 // The frame on screen, read back: what the projector is
                 // sent. A mapping of the buffer, so timed and logged once.
+                // Only while the panel or a page's preview is looking.
                 let read_at = Instant::now();
-                let shown = out
-                    .read_scanout(buffers[front], |px, stride| {
-                        scanout_peak(px, stride, scan_fourcc, size)
+                let (shown, preview) = if ui.info_open() || watching {
+                    out.read_scanout(buffers[front], |px, stride| {
+                        let peak = scanout_peak(px, stride, scan_fourcc, size);
+                        let small = watching
+                            .then(|| scanout_preview(px, stride, scan_fourcc, size))
+                            .flatten();
+                        (peak, small)
                     })
-                    .ok()
-                    .flatten();
-                if !read_back_logged {
+                    .unwrap_or((None, None))
+                } else {
+                    (None, None)
+                };
+                if let (Some(w), Some((pw, ph, rgb))) = (&web, preview) {
+                    w.set_preview(pw, ph, rgb);
+                }
+                if (ui.info_open() || watching) && !read_back_logged {
                     read_back_logged = true;
                     info!(
                         "osd: the frame on screen read back for the panel in {:.1} ms",
                         ms(read_at)
                     );
                 }
-                ui.set_info(InfoText {
+                let text = InfoText {
                     sections: vec![
                         input_section(
                             last_key,
@@ -1604,7 +1657,29 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         ),
                         window.borrow_mut().section(now, period),
                     ],
-                });
+                };
+                if let Some(w) = &web {
+                    let pill = match last_key.filter(|_| !dark).map(|k| k.kind) {
+                        None => "Waiting",
+                        Some(Kind::Unsupported(_)) => "Can't show this",
+                        Some(_) => "Playing",
+                    };
+                    let now_rows: Vec<serde_json::Value> = text
+                        .sections
+                        .iter()
+                        .map(|s| serde_json::json!({"label": s.label, "line": s.line, "detail": s.detail}))
+                        .collect();
+                    w.publish(
+                        serde_json::json!({
+                            "version": crate::VERSION,
+                            "pill": pill,
+                            "now": now_rows,
+                            "settings": crate::web::settings_json(&cfg),
+                        }),
+                        &cfg,
+                    );
+                }
+                ui.set_info(text);
             }
             let taken = if ready.is_none() {
                 mailbox.take_wait(take_timeout)
