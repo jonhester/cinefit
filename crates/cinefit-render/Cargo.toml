@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# Hands the pinned libplacebo's directory to dependents (DEP_CINEFIT_PLACEBO_LIBDIR).
+# One crate links libplacebo.
 links = "cinefit_placebo"
 
-# libplacebo (LGPL-2.1+) is linked dynamically: the pinned build from
+# libplacebo (LGPL-2.1+) is linked statically: the pinned build from
 # scripts/build-libplacebo.sh, found through CINEFIT_LIBPLACEBO.
 [build-dependencies]
 cc = "1.2"

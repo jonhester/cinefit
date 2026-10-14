@@ -3,10 +3,15 @@
 # switches the service to another build. No root: the service runs
 # ~/cinefit-app/current, a symlink this script repoints.
 #
-#   tools/install.sh             build this tree and make it current
-#   tools/install.sh --rollback  swap current and previous
-#   tools/install.sh --cpp       point current at the C++ build
-#   tools/install.sh --status    show what current and previous point at
+#   tools/install.sh                     build this tree and make it current
+#   tools/install.sh --release [VERSION] a published release (default: the
+#                                        latest); also takes an rc's or a
+#                                        nightly's version
+#   tools/install.sh --nightly [DATE]    the newest nightly, or that day's
+#                                        (YYYY-MM-DD)
+#   tools/install.sh --rollback          swap current and previous
+#   tools/install.sh --cpp               point current at the C++ build
+#   tools/install.sh --status            show what current and previous point at
 #
 # Every switch keeps the build it replaced as `previous`, so --rollback undoes
 # it and a second --rollback redoes it. A running service keeps its build until
@@ -15,9 +20,11 @@
 # it now.
 #
 # The service never runs out of a working tree: a rebuild there would change
-# what runs mid-film. Builds are copied into ~/cinefit-app/rust-<commit>/ with
-# the libplacebo they were linked against, which the binary finds beside itself
-# ($ORIGIN, crates/cinefit/build.rs).
+# what runs mid-film. A build from this tree is copied into
+# ~/cinefit-app/rust-<commit>/, a published one into rust-<version>/: one file,
+# with libplacebo linked in. Published builds come from GitHub's releases
+# (CINEFIT_REPO, default jonhester/cinefit), the x86_64-v3 archive where the
+# CPU runs it, checked against SHA256SUMS.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -92,6 +99,37 @@ restart() {
     fi
 }
 
+# Puts binary $1 in place as $app/$2/cinefit, with $3 in its VERSION file,
+# checks the copy, and makes it current.
+place() {
+    dest="$app/$2"
+    mkdir -p "$dest"
+    # Copy beside it and rename over it: reinstalling the build that is
+    # running must not leave it a half-written file.
+    cp "$1" "$dest/.cinefit.new"
+    chmod +x "$dest/.cinefit.new"
+    mv -f "$dest/.cinefit.new" "$dest/cinefit"
+    echo "$3 $(date -Iseconds)" > "$dest/VERSION"
+
+    # Everything it links resolves, and libplacebo is inside it: a copy that
+    # loaded one from a build tree would break the day that tree changed.
+    links=$(ldd "$dest/cinefit") || die "ldd $dest/cinefit failed"
+    if echo "$links" | grep -q "not found"; then
+        die "$dest/cinefit is missing libraries:
+$(echo "$links" | grep "not found")"
+    fi
+    if echo "$links" | grep -q libplacebo; then
+        die "$dest/cinefit loads libplacebo as a shared library; it should carry it"
+    fi
+    # It starts, and reads the settings file the service will: a bad file
+    # found now, not as a service failing every 5 s.
+    "$dest/cinefit" settings > /dev/null ||
+        die "$dest/cinefit settings failed; current left as it was"
+
+    echo "installed $("$dest/cinefit" --version) into $dest"
+    switch_to "$2/cinefit"
+}
+
 install_build() {
     cd "$root"
     # A version that names a commit, so `current` says what is running.
@@ -105,36 +143,55 @@ install_build() {
     # Built here rather than trusted: an up-to-date build costs seconds, and a
     # stale binary has passed for a fix before.
     cargo build --release --locked -p cinefit
-    bin="$root/target/release/cinefit"
+    place "$root/target/release/cinefit" "rust-$version" "$version"
+}
 
-    # The libplacebo the binary loads from the build tree, by its soname.
-    lib=$(ldd "$bin" | awk '$1 ~ /^libplacebo\.so/ && $2 == "=>" { print $3 }')
-    [ -f "$lib" ] || die "the build does not resolve libplacebo (ldd: '$lib')"
+repo="${CINEFIT_REPO:-jonhester/cinefit}"
 
-    name="rust-$version"
-    dest="$app/$name"
-    mkdir -p "$dest"
-    # Copy beside each file and rename over it: reinstalling the build that is
-    # running must not leave it a half-written file.
-    for f in "$bin" "$lib"; do
-        base=$(basename "$f")
-        cp -L "$f" "$dest/.$base.new"
-        mv -f "$dest/.$base.new" "$dest/$base"
+# GitHub's API, one JSON value out: $1 the path, $2 a Python expression over
+# the parsed reply `r`. Nothing on any failure: the caller says what is missing.
+api() {
+    { curl -fsSL "https://api.github.com/repos/$repo/$1" |
+        python3 -c "import json, sys; r = json.load(sys.stdin); print($2)"; } 2>/dev/null || true
+}
+
+# The archive this CPU should run: v3 needs AVX2, BMI1/2, FMA, F16C, LZCNT
+# (abm), MOVBE and XSAVE.
+flavour() {
+    flags=$(grep -m1 '^flags' /proc/cpuinfo)
+    for f in avx2 bmi1 bmi2 fma f16c abm movbe xsave; do
+        echo "$flags" | grep -qw "$f" || { echo x86_64; return; }
     done
-    echo "$version $(date -Iseconds)" > "$dest/VERSION"
+    echo x86_64-v3
+}
 
-    # The copy must load its own libplacebo, not the build tree's or the
-    # system's; otherwise it breaks the day .deps changes.
-    loaded=$(ldd "$dest/cinefit" | awk '$1 ~ /^libplacebo\.so/ { print $3 }')
-    [ "$loaded" = "$dest/$(basename "$lib")" ] ||
-        die "$dest/cinefit loads libplacebo from '$loaded', not beside itself"
-    # It starts, and reads the settings file the service will: a bad file
-    # found now, not as a service failing every 5 s.
-    "$dest/cinefit" settings > /dev/null ||
-        die "$dest/cinefit settings failed; current left as it was"
+# Downloads, checks and installs release version $1.
+install_release() {
+    version=$1
+    name="cinefit-$version-$(flavour)"
+    base="https://github.com/$repo/releases/download/v$version"
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    echo "downloading $name..."
+    curl -fsSL -o "$work/$name.tar.gz" "$base/$name.tar.gz" ||
+        die "no $name.tar.gz in release v$version"
+    curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" || die "no SHA256SUMS in release v$version"
+    (cd "$work" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c --quiet -) ||
+        die "$name.tar.gz does not match its SHA256SUMS"
+    tar -C "$work" -xzf "$work/$name.tar.gz"
+    place "$work/$name/cinefit" "rust-$version" "$version"
+}
 
-    echo "installed $version into $dest"
-    switch_to "$name/cinefit"
+# The newest release's version, or the newest nightly's (that day's, given
+# YYYY-MM-DD). The API lists releases newest first.
+latest_release() {
+    api releases/latest "r['tag_name'][1:]"
+}
+
+latest_nightly() {
+    day=$(echo "${1:-}" | tr -d -)
+    api "releases?per_page=100" \
+        "next((x['tag_name'][1:] for x in r if '-nightly.$day' in x['tag_name']), '')"
 }
 
 # The C++ build takes no subcommand and refuses `play`, so the service reaches
@@ -157,6 +214,14 @@ EOF
 mkdir -p "$app"
 case "${1:-}" in
     "") install_build ;;
+    --release)
+        v=${2:-$(latest_release)}
+        [ -n "$v" ] || die "no release found"
+        install_release "${v#v}" ;;
+    --nightly)
+        v=$(latest_nightly "${2:-}")
+        [ -n "$v" ] || die "no nightly${2:+ for $2} found"
+        install_release "$v" ;;
     --rollback)
         prev=$(readlink "$app/previous" 2>/dev/null) || die "nothing to roll back to"
         switch_to "$prev" ;;

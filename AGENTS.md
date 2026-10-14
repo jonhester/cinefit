@@ -57,10 +57,17 @@ On the machine with the hardware:
     cinefit settings [--toml]          # every setting: value, range, cost, help
 
 The installed service runs `~/cinefit-app/current play`, never a working
-tree. `tools/install.sh` builds the tree, copies it there with its libplacebo
-and repoints `current`; `--rollback` and `--cpp` switch builds. It restarts
-the service only with `RESTART=1`: a restart is a resync on the projector, so
-not while someone is watching.
+tree. `tools/install.sh` builds the tree (or with `--release`/`--nightly`
+downloads a published build), copies it there and repoints `current`;
+`--rollback` and `--cpp` switch builds. It restarts the service only with
+`RESTART=1`: a restart is a resync on the projector, so not while someone is
+watching.
+
+Releases are `YEAR.MONTH.N`, pre-releases carry the version they lead to
+(`-nightly.YYYYMMDD`, `-rc.K`); `tools/version.sh` works them out and
+`tools/version.sh tag [--rc]` tags main for `.github/workflows/release.yml`,
+which also publishes a nightly each night main has changed. The binary is one
+file: libplacebo is linked statically (LGPL-2.1, see the README).
 
 `CINEFIT_STILLS=DIR cargo test --release -p cinefit-detect --test stills` reads
 the stills set and must match the C++ detector's baseline exactly.

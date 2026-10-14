@@ -28,8 +28,11 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
+/// This build: its version, commit and the commit's date (`build.rs`).
+pub const VERSION: &str = env!("CINEFIT_VERSION_LINE");
+
 #[derive(Parser)]
-#[command(version, about = "Constant image height video processing")]
+#[command(version = VERSION, about = "Constant image height video processing")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

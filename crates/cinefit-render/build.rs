@@ -34,9 +34,22 @@ fn main() {
     unsafe { std::env::set_var("PKG_CONFIG_PATH", pc_path) };
 
     // At least the pinned API: the system's older libplacebo fails here
-    // rather than at the shim's compile-time check.
+    // rather than at the shim's compile-time check. Static, from the pinned
+    // build's prefix: the binary carries it, and nothing at run time can load
+    // another version in its place. Its own dependencies come from its .pc
+    // file: the system's Vulkan loader and lcms2 as shared libraries, and
+    // glslang's static archives by path.
+    let archive = ["lib/x86_64-linux-gnu", "lib/aarch64-linux-gnu", "lib"]
+        .iter()
+        .any(|d| prefix.join(d).join("libplacebo.a").is_file());
+    assert!(
+        archive,
+        "no libplacebo.a in {}: libplacebo is now linked statically; run scripts/build-libplacebo.sh again",
+        prefix.display()
+    );
     let placebo = pkg_config::Config::new()
         .atleast_version("7.375")
+        .statik(true)
         .probe("libplacebo")
         .unwrap_or_else(|e| {
             panic!(
@@ -44,19 +57,15 @@ fn main() {
                 prefix.display()
             )
         });
+    // libplacebo and glslang are partly C++, and a static archive does not
+    // name its C++ runtime: link it here, or every test binary that does not
+    // happen to pull it in from elsewhere fails to link.
+    println!("cargo::rustc-link-lib=stdc++");
     let vulkan = pkg_config::probe_library("vulkan")
         .expect("Vulkan headers (on Ubuntu: apt install libvulkan-dev)");
     // For holding the GPU's clocks (src/power.rs).
     pkg_config::probe_library("libdrm_amdgpu")
         .expect("libdrm_amdgpu (on Ubuntu: apt install libdrm-dev)");
-
-    // An rpath so this crate's tests load the pinned library rather than the
-    // system's, and the directory handed on (as DEP_CINEFIT_PLACEBO_LIBDIR)
-    // so the cinefit binary can set its own.
-    for dir in &placebo.link_paths {
-        println!("cargo::rustc-link-arg=-Wl,-rpath,{}", dir.display());
-        println!("cargo::metadata=libdir={}", dir.display());
-    }
 
     cc::Build::new()
         .file("shim/placebo.c")

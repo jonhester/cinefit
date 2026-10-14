@@ -1,0 +1,118 @@
+name: Release
+
+# Builds and publishes cinefit (tools/version.sh says how versions work):
+# - a tag vYEAR.MONTH.N or vYEAR.MONTH.N-rc.K pushed (tools/version.sh tag)
+#   publishes that release or release candidate;
+# - every night, a nightly of main, if main has changed since the last one;
+# - "Run workflow" by hand, a nightly now, changed or not.
+# Each is two archives: x86_64 (any 64-bit x86) and x86_64-v3 (AVX2 and
+# friends), with SHA256SUMS. Nightlies older than 30 days are deleted.
+
+on:
+  push:
+    tags: ["v*"]
+  schedule:
+    # 03:23 in New York in summer, 02:23 in winter: nobody is watching.
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Every tag: versions are worked out from them.
+          fetch-depth: 0
+      - id: version
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            version=$(tools/version.sh check "$GITHUB_REF_NAME")
+          else
+            last=$(git tag -l 'v*-nightly.*' --sort=-creatordate | head -1)
+            if [ "$EVENT" = schedule ] && [ -n "$last" ] &&
+               [ "$(git rev-list -n1 "$last")" = "$(git rev-parse HEAD)" ]; then
+              echo "main has not changed since $last: no nightly"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            version=$(tools/version.sh nightly)
+          fi
+          case "$version" in *-*) pre=true ;; *) pre=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+          echo "cinefit $version"
+      - if: steps.version.outputs.skip != 'true'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          meson ninja-build glslang-dev glslang-tools python3-jinja2
+          libvulkan-dev liblcms2-dev libdrm-dev libgbm-dev
+      - if: steps.version.outputs.skip != 'true'
+        id: libplacebo
+        uses: actions/cache@v6
+        with:
+          path: .deps/libplacebo
+          key: libplacebo-${{ runner.os }}-${{ hashFiles('scripts/build-libplacebo.sh') }}
+      - if: steps.version.outputs.skip != 'true' && steps.libplacebo.outputs.cache-hit != 'true'
+        run: scripts/build-libplacebo.sh
+      - if: steps.version.outputs.skip != 'true'
+        run: rustup toolchain install stable --profile minimal
+      # What is published passed the tests, at this commit.
+      - if: steps.version.outputs.skip != 'true'
+        run: cargo test --workspace --locked
+      - if: steps.version.outputs.skip != 'true'
+        env:
+          CINEFIT_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eu
+          cargo build --release --locked -p cinefit
+          tools/package.sh target/release/cinefit "$CINEFIT_VERSION" x86_64 dist
+          RUSTFLAGS="-C target-cpu=x86-64-v3" \
+            cargo build --release --locked -p cinefit --target-dir target/v3
+          tools/package.sh target/v3/release/cinefit "$CINEFIT_VERSION" x86_64-v3 dist
+          # The binary says the version it was built as.
+          target/release/cinefit --version | grep -F "cinefit $CINEFIT_VERSION ("
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+      - if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          set -eu
+          case "$VERSION" in
+            *-nightly.*) title="cinefit nightly $VERSION" ;;
+            *-rc.*) title="cinefit $VERSION (release candidate)" ;;
+            *) title="cinefit $VERSION" ;;
+          esac
+          flags="--generate-notes"
+          [ "$PRERELEASE" = true ] && flags="$flags --prerelease"
+          # A nightly's tag is made here, on the commit just built.
+          gh release create "v$VERSION" dist/* --title "$title" --target "$GITHUB_SHA" $flags
+      # Nightlies are for trying things: a month of them is enough to find
+      # the night something changed.
+      - if: steps.version.outputs.skip != 'true' && github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cutoff=$(date -u -d '30 days ago' +%Y%m%d)
+          gh release list --limit 200 --json tagName --jq '.[].tagName' |
+            sed -n 's/^\(v.*-nightly\.\([0-9]\{8\}\).*\)$/\2 \1/p' |
+            while read -r day tag; do
+              if [ "$day" -lt "$cutoff" ]; then
+                echo "deleting $tag"
+                gh release delete "$tag" --cleanup-tag --yes
+              fi
+            done
