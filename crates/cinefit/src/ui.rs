@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use cinefit_kms::Output;
 use log::{info, warn};
 
+use crate::menu::MenuText;
 use crate::osd::{
     self, Area, BannerText, Canvas, Corner, Encoding, Fonts, InfoText, SlateText, Tone,
 };
@@ -106,18 +107,22 @@ enum Content {
     Slate(SlateText, Corner),
     Banner(BannerText),
     Info(InfoText),
+    Menu(MenuText),
 }
 
 /// A picture asked of the drawing thread.
 struct Job {
     content: Content,
     enc: Encoding,
+    /// The screen's band as it is now: the screen ratio can change mid-run.
+    band: (usize, usize),
 }
 
 /// A picture the drawing thread made: `px` covers `area` of the raster.
 struct Painted {
     content: Content,
     enc: Encoding,
+    band: (usize, usize),
     area: Area,
     px: Vec<u8>,
     ms: f64,
@@ -131,7 +136,7 @@ struct Painter {
 }
 
 impl Painter {
-    fn start(raster: (usize, usize), band: (usize, usize)) -> Option<Self> {
+    fn start(raster: (usize, usize)) -> Option<Self> {
         let (jobs, job_rx) = channel::<Job>();
         let (done_tx, done) = channel();
         std::thread::Builder::new()
@@ -142,7 +147,7 @@ impl Painter {
                     while let Ok(newer) = job_rx.try_recv() {
                         job = newer;
                     }
-                    if done_tx.send(paint(&fonts, raster, band, job)).is_err() {
+                    if done_tx.send(paint(&fonts, raster, job)).is_err() {
                         break;
                     }
                 }
@@ -153,12 +158,14 @@ impl Painter {
 }
 
 /// Draws one picture, off the overlay's memory.
-fn paint(fonts: &Fonts, raster: (usize, usize), band: (usize, usize), job: Job) -> Painted {
+fn paint(fonts: &Fonts, raster: (usize, usize), job: Job) -> Painted {
     let started = Instant::now();
+    let band = job.band;
     let area = match &job.content {
         Content::Slate(_, corner) => osd::slate_area(raster, band, *corner),
         Content::Banner(text) => osd::banner_area(raster, band.0, fonts, text),
         Content::Info(text) => osd::info_area(raster, band, text),
+        Content::Menu(_) => osd::menu_area(raster, band.0),
     };
     let mut px = vec![0u8; area.w * 4 * area.h];
     let mut c = Canvas::window(&mut px, area.w * 4, area, raster, job.enc);
@@ -166,15 +173,21 @@ fn paint(fonts: &Fonts, raster: (usize, usize), band: (usize, usize), job: Job) 
         Content::Slate(text, corner) => osd::slate(&mut c, fonts, area, *corner, text),
         Content::Banner(text) => osd::banner(&mut c, fonts, area, text),
         Content::Info(text) => osd::info(&mut c, fonts, area, text),
+        Content::Menu(m) => osd::menu(&mut c, fonts, area, m),
     }
     Painted {
         content: job.content,
         enc: job.enc,
+        band,
         area,
         px,
         ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }
+
+/// What a picture was drawn for besides its content: the output's encoding
+/// and the screen's band. A change to either redraws it.
+type Look = (Encoding, (usize, usize));
 
 pub struct Ui {
     painter: Option<Painter>,
@@ -185,10 +198,14 @@ pub struct Ui {
     buffers: Option<[usize; 2]>,
     /// Where each buffer has been drawn, to clear before drawing again.
     drawn: [Option<Area>; 2],
-    /// The buffer on screen, what it holds, and in which encoding.
-    shown: Option<(usize, Content, Encoding)>,
+    /// The buffer on screen, what it holds, and in which encoding and band.
+    shown: Option<(usize, Content, Look)>,
     /// The picture last asked of the drawing thread.
-    asked: Option<(Content, Encoding)>,
+    asked: Option<(Content, Look)>,
+    /// The screen's band of the raster: top row and height.
+    band: (usize, usize),
+    /// The menu, while open: what it shows.
+    menu: Option<MenuText>,
     /// The info panel: opened when, and what it says.
     info: Option<(Instant, Option<InfoText>)>,
     fades: bool,
@@ -232,7 +249,7 @@ impl Ui {
         }
         let raster = (raster.0 as usize, raster.1 as usize);
         let band = (band.0 as usize, band.1 as usize);
-        let painter = buffers.and_then(|_| Painter::start(raster, band));
+        let painter = buffers.and_then(|_| Painter::start(raster));
         Self {
             painter,
             venue: venue.to_string(),
@@ -241,6 +258,8 @@ impl Ui {
             drawn: [None; 2],
             shown: None,
             asked: None,
+            band,
+            menu: None,
             info: None,
             fades,
             started: Instant::now(),
@@ -283,6 +302,27 @@ impl Ui {
             Waiting::At(now)
         };
         self.waiting = Some((text, when));
+    }
+
+    /// The menu as it is now, or `None` while it is closed: it comes before
+    /// everything else.
+    pub fn set_menu(&mut self, menu: Option<MenuText>) {
+        self.menu = menu;
+    }
+
+    /// The screen's band, after a change of screen ratio: whatever is shown
+    /// is redrawn in it.
+    pub fn set_band(&mut self, band: (u32, u32)) {
+        self.band = (band.0 as usize, band.1 as usize);
+    }
+
+    /// Banners on or off, from the menu.
+    pub fn set_banners(&mut self, on: bool) {
+        self.banners = on;
+        if !on {
+            self.waiting = None;
+            self.showing = None;
+        }
     }
 
     /// The remote's Info button: opens the panel, or closes it.
@@ -334,17 +374,19 @@ impl Ui {
             self.asked = None;
             return;
         };
+        let look = (enc, self.band);
         let up_to_date = self
             .shown
             .as_ref()
-            .is_some_and(|(_, c, e)| *c == content && *e == enc);
+            .is_some_and(|(_, c, l)| *c == content && *l == look);
         if !up_to_date {
             let painter = self.painter.as_ref().expect("checked above");
-            let wanted = (content, enc);
+            let wanted = (content, look);
             if self.asked.as_ref() != Some(&wanted) {
                 let job = Job {
                     content: wanted.0.clone(),
                     enc,
+                    band: self.band,
                 };
                 if painter.jobs.send(job).is_err() {
                     warn!("osd: the drawing thread is gone, so no overlay from now");
@@ -363,7 +405,7 @@ impl Ui {
                 && self
                     .asked
                     .as_ref()
-                    .is_some_and(|(c, e)| *c == p.content && *e == p.enc)
+                    .is_some_and(|(c, l)| *c == p.content && *l == (p.enc, p.band))
             {
                 // The buffer not on screen: the last commit has completed,
                 // so nothing scans it out.
@@ -378,7 +420,7 @@ impl Ui {
                     return;
                 }
                 out.set_overlay(Some(buffers[i]));
-                self.shown = Some((buffers[i], p.content, p.enc));
+                self.shown = Some((buffers[i], p.content, (p.enc, p.band)));
             }
         }
         out.set_overlay_alpha((alpha * 65535.0).round() as u16);
@@ -386,6 +428,9 @@ impl Ui {
 
     /// What should show now, and at what opacity.
     fn want(&mut self, now: Instant) -> (Option<Content>, f32) {
+        if let Some(m) = &self.menu {
+            return (Some(Content::Menu(m.clone())), 1.0);
+        }
         if let Some((opened, text)) = &self.info {
             if now - *opened >= INFO_FOR {
                 self.info = None;
@@ -465,6 +510,7 @@ impl Ui {
             Content::Slate(t, _) => format!("slate \"{}\"", t.state),
             Content::Banner(t) => format!("banner \"{} / {}\"", t.title, t.detail),
             Content::Info(_) => "info".to_string(),
+            Content::Menu(_) => "menu".to_string(),
         };
         if what != self.logged {
             info!(
@@ -492,6 +538,8 @@ mod tests {
             drawn: [None; 2],
             shown: None,
             asked: None,
+            band: (209, 1742),
+            menu: None,
             info: None,
             fades: true,
             started: Instant::now(),
