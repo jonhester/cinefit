@@ -6,6 +6,8 @@ mod compare;
 mod config;
 mod follow;
 #[cfg(target_os = "linux")]
+mod osd;
+#[cfg(target_os = "linux")]
 mod play;
 mod record;
 mod replay;
@@ -103,6 +105,11 @@ enum Command {
         /// instead of holding the standard stable power state. For A/B timing.
         #[arg(long, requires = "gpu")]
         no_pstate: bool,
+        /// Also show an OSD test card on the overlay plane (slate, banner and
+        /// grey steps), encoded for SDR or, with --hdr, PQ. It comes down a
+        /// third of the way through and back at two thirds: watch for a resync.
+        #[arg(long)]
+        slate: bool,
     },
     /// Replay recorded clips through the bar detector: every crop change, the
     /// time at each height, what the detector costs per frame, and with
@@ -223,6 +230,7 @@ fn main() -> ExitCode {
             change_max_cll,
             gpu,
             no_pstate,
+            slate,
         } => {
             let hdr = hdr.then_some(cinefit_kms::HdrStatic {
                 max_cll,
@@ -230,7 +238,16 @@ fn main() -> ExitCode {
                 max_mastering,
                 ..cinefit_kms::HdrStatic::BT2020_1000
             });
-            pattern(seconds, mode, card, hdr, change_max_cll, gpu, !no_pstate)
+            pattern(PatternRun {
+                seconds,
+                want: mode,
+                card,
+                hdr,
+                change_max_cll,
+                gpu,
+                pstate: !no_pstate,
+                slate,
+            })
         }
         Command::Play {
             seconds,
@@ -399,21 +416,8 @@ fn capture(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn pattern(
-    _seconds: f64,
-    _mode: cinefit_kms::ModeRequest,
-    _card: Option<PathBuf>,
-    _hdr: Option<cinefit_kms::HdrStatic>,
-    _change_max_cll: Option<f64>,
-    _gpu: bool,
-    _pstate: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    Err("display output is only supported on Linux".into())
-}
-
-#[cfg(target_os = "linux")]
-fn pattern(
+/// What `cinefit pattern` was asked for.
+struct PatternRun {
     seconds: f64,
     want: cinefit_kms::ModeRequest,
     card: Option<PathBuf>,
@@ -421,9 +425,28 @@ fn pattern(
     change_max_cll: Option<f64>,
     gpu: bool,
     pstate: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    slate: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pattern(_run: PatternRun) -> Result<(), Box<dyn std::error::Error>> {
+    Err("display output is only supported on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn pattern(run: PatternRun) -> Result<(), Box<dyn std::error::Error>> {
     use cinefit_kms::pattern;
     use std::sync::atomic::{AtomicBool, Ordering};
+    let PatternRun {
+        seconds,
+        want,
+        card,
+        hdr,
+        change_max_cll,
+        gpu,
+        pstate,
+        slate,
+    } = run;
 
     let run_for = Duration::try_from_secs_f64(seconds)
         .ok()
@@ -528,9 +551,36 @@ fn pattern(
             h.max_cll, h.max_fall, h.min_mastering, h.max_mastering
         );
     }
+    // The OSD test card goes up with the modeset, in the same commit.
+    let card_frame = if slate {
+        if !out.has_overlay() {
+            return Err("--slate: this output has no overlay plane taking ARGB8888".into());
+        }
+        let i = out.create_overlay(index)?;
+        let enc = if hdr.is_some() {
+            osd::Encoding::Pq
+        } else {
+            osd::Encoding::Sdr
+        };
+        let fonts = osd::Fonts::load();
+        let t = Instant::now();
+        out.draw_overlay(i, |px, pitch| {
+            osd::test_card(&mut osd::Canvas::new(px, pitch, w, h, enc), &fonts, enc);
+        })?;
+        println!(
+            "overlay: test card drawn in {:.0} ms, encoded for {enc:?}",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        out.set_overlay(Some(i));
+        Some(i)
+    } else {
+        None
+    };
     out.set_hdr(hdr);
     out.modeset(index, frames[0])?;
     println!("after modeset: {}", out.hdr_state());
+    let mut overlay_steps =
+        card_frame.map(|i| vec![(run_for * 2 / 3, Some(i)), (run_for / 3, None)]);
 
     // Ctrl-C ends the run and still restores the display and prints the
     // summary; a second one exits at once.
@@ -560,6 +610,21 @@ fn pattern(
                 "{:.1} s: MaxCLL {} -> {cll}, sent with the next flip (no modeset allowed)",
                 started.elapsed().as_secs_f64(),
                 h.max_cll
+            );
+        }
+        if let Some(steps) = overlay_steps.as_mut()
+            && steps.last().is_some_and(|&(at, _)| started.elapsed() >= at)
+        {
+            let (_, change) = steps.pop().expect("checked");
+            out.set_overlay(change);
+            println!(
+                "{:.1} s: overlay {} with the next flip (no modeset)",
+                started.elapsed().as_secs_f64(),
+                if change.is_some() {
+                    "back up"
+                } else {
+                    "taken down"
+                }
             );
         }
         let next = 1 - shown;
