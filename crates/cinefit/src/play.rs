@@ -24,7 +24,7 @@ use crate::ui::{Slate, Ui};
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
-use cinefit_detect::{Detector, V210};
+use cinefit_detect::{Crop, Detector, V210};
 use cinefit_geometry as geo;
 use cinefit_input::{Action, KeyReader};
 use cinefit_render::{
@@ -633,34 +633,166 @@ fn view_for(
     }
 }
 
-/// Unpacks `frame` and renders it, its shape kept, into `dst`. Returns false
-/// for a frame that cannot be rendered (an unsupported format, a tunnel with
-/// no conversion yet), leaving `dst` as it was.
-fn render<'p>(
+/// The bar detector as `play` runs it: on a worker thread, beside the
+/// upload of the same frame.
+struct CropFinder {
+    det: Detector,
+    /// The `detect.crop` setting.
+    on: bool,
+    crops: u64,
+}
+
+/// What the detector made of one frame.
+struct Found {
+    source: geo::Source,
+    /// Its time on this frame, when it ran.
+    ms: Option<f64>,
+    /// The crop it changed to on this frame, and why.
+    change: Option<(Crop, &'static str)>,
+}
+
+impl CropFinder {
+    fn find(
+        &mut self,
+        info: &FrameInfo,
+        bytes: Option<&[u8]>,
+        kind: Kind,
+        t: f64,
+        epoch: u32,
+    ) -> Found {
+        if !self.on {
+            return Found {
+                source: geo::Source::Whole,
+                ms: None,
+                change: None,
+            };
+        }
+        let (mut took, mut change) = (None, None);
+        // YCbCr only: the other formats have no adapter yet, and keep the
+        // last crop.
+        if matches!(kind, Kind::Ycbcr(_))
+            && let Some(b) = bytes
+            && let Some(v) = V210::new(b, info.width, info.height, info.row_bytes)
+        {
+            let t0 = Instant::now();
+            let d = self.det.push(&v, t, epoch);
+            took = Some(ms(t0));
+            if d.changed {
+                self.crops += 1;
+                change = Some((d.crop, d.diag.reason));
+            }
+        }
+        let c = self.det.crop();
+        Found {
+            source: geo::Source::Rows {
+                top: c.top,
+                bottom: c.bottom,
+            },
+            ms: took,
+            change,
+        }
+    }
+}
+
+/// A frame's detection and upload, side by side: the detector reads the
+/// captured bytes on a worker thread while this thread copies the same bytes
+/// to the GPU and unpacks them. Both only read the frame, and only the draw
+/// that follows needs the crop, so it still applies to this same frame:
+/// nothing waits a frame, and the frame costs the longer of the two instead
+/// of their sum. `at` is the frame's time and the detector's epoch. Returns
+/// what the detector found and whether the frame was uploaded.
+#[allow(clippy::too_many_arguments)]
+fn detect_and_upload<'p>(
     pl: &'p Placebo,
+    finder: &mut CropFinder,
     frame: &Frame,
+    kind: Kind,
+    tunnel: Option<&Tunnel>,
+    sources: &mut Sources<'p>,
+    stages: &mut Stages,
+    at: (f64, u32),
+) -> Result<(Found, bool), Box<dyn Error>> {
+    let info = *frame.info();
+    let Some(pixels) = frame.pixels() else {
+        return Ok((finder.find(&info, None, kind, at.0, at.1), false));
+    };
+    let bytes = pixels.bytes();
+    std::thread::scope(|s| {
+        // A thread a frame: starting one costs tens of microseconds, against
+        // the milliseconds the detector takes.
+        let worker = s.spawn(|| finder.find(&info, Some(bytes), kind, at.0, at.1));
+        let uploaded = upload(pl, &info, bytes, kind, tunnel, sources, stages);
+        let found = worker
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        Ok((found, uploaded?))
+    })
+}
+
+/// The first half of a frame: its bytes into the GPU, unpacked into planes
+/// (copy and unpack). Needs nothing from the detector, so it runs while the
+/// detector reads the same bytes on another thread. `false` for what nothing
+/// renders.
+fn upload<'p>(
+    pl: &'p Placebo,
+    info: &FrameInfo,
+    bytes: &[u8],
+    kind: Kind,
+    tunnel: Option<&Tunnel>,
+    sources: &mut Sources<'p>,
+    stages: &mut Stages,
+) -> Result<bool, Box<dyn Error>> {
+    let (w, h) = (info.width as usize, info.height as usize);
+    let t = Instant::now();
+    match kind {
+        Kind::Ycbcr(_) | Kind::Tunnel => {
+            if kind == Kind::Tunnel && tunnel.is_none() {
+                return Ok(false);
+            }
+            if sources
+                .planes
+                .as_ref()
+                .is_none_or(|p| (p.width(), p.height()) != (w, h))
+            {
+                sources.planes = Some(pl.planes(w, h)?);
+            }
+            let p = sources.planes.as_mut().expect("made above");
+            if kind == Kind::Tunnel {
+                pl.unpack_tunnel(p, bytes, info.row_bytes)?;
+            } else {
+                pl.unpack_v210(p, bytes, info.row_bytes)?;
+            }
+        }
+        Kind::Rgb(format) => {
+            if sources
+                .rgb
+                .as_ref()
+                .is_none_or(|r| (r.width(), r.height()) != (w, h))
+            {
+                sources.rgb = Some(pl.rgb(w, h)?);
+            }
+            let r = sources.rgb.as_mut().expect("made above");
+            pl.unpack_rgb(r, bytes, info.row_bytes, format)?;
+        }
+        Kind::Unsupported(_) => return Ok(false),
+    }
+    stages.unpack.push(ms(t));
+    Ok(true)
+}
+
+/// The second half: the uploaded frame drawn into the target, with the crop
+/// the detector found for this same frame.
+fn draw<'p>(
+    pl: &'p Placebo,
+    info: &FrameInfo,
     kind: Kind,
     tunnel: Option<&Tunnel>,
     sources: &mut Sources<'p>,
     dst: &Target<'_, '_>,
     stages: &mut Stages,
-) -> Result<bool, Box<dyn Error>> {
-    let info = frame.info();
-    let (w, h) = (info.width as usize, info.height as usize);
-    let Some(pixels) = frame.pixels() else {
-        return Ok(false);
-    };
+) -> Result<(), Box<dyn Error>> {
     let view = dst.view;
     let out = dst.color;
-    let planes = |s: &mut Sources<'p>| -> Result<(), Box<dyn Error>> {
-        if s.planes
-            .as_ref()
-            .is_none_or(|p| (p.width(), p.height()) != (w, h))
-        {
-            s.planes = Some(pl.planes(w, h)?);
-        }
-        Ok(())
-    };
     let t = Instant::now();
     match kind {
         Kind::Ycbcr(color) => {
@@ -690,11 +822,7 @@ fn render<'p>(
                     (color, dst.source_peak.or(sources.pq_peak))
                 }
             };
-            planes(sources)?;
-            let p = sources.planes.as_mut().expect("made above");
-            pl.unpack_v210(p, pixels.bytes(), info.row_bytes)?;
-            stages.unpack.push(ms(t));
-            let t = Instant::now();
+            let p = sources.planes.as_mut().expect("uploaded");
             // HDR into SDR is tone-mapped; anything else only changes space.
             let map =
                 (color.transfer == Transfer::Pq && out.transfer == Transfer::Bt1886).then(|| {
@@ -707,17 +835,10 @@ fn render<'p>(
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
-            stages.render.push(ms(t));
         }
         Kind::Tunnel => {
-            let Some(tunnel) = tunnel else {
-                return Ok(false);
-            };
-            planes(sources)?;
-            let p = sources.planes.as_mut().expect("made above");
-            pl.unpack_tunnel(p, pixels.bytes(), info.row_bytes)?;
-            stages.unpack.push(ms(t));
-            let t = Instant::now();
+            let tunnel = tunnel.expect("uploaded only with one");
+            let p = sources.planes.as_mut().expect("uploaded");
             // Into SDR from the grade's own peak, the whole title on one
             // curve: the scene-by-scene metadata is not used yet.
             let map = (out.transfer == Transfer::Bt1886).then(|| Mapping {
@@ -726,20 +847,9 @@ fn render<'p>(
                 curve: dst.curve,
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
-            stages.render.push(ms(t));
         }
-        Kind::Rgb(format) => {
-            if sources
-                .rgb
-                .as_ref()
-                .is_none_or(|r| (r.width(), r.height()) != (w, h))
-            {
-                sources.rgb = Some(pl.rgb(w, h)?);
-            }
-            let r = sources.rgb.as_mut().expect("made above");
-            pl.unpack_rgb(r, pixels.bytes(), info.row_bytes, format)?;
-            stages.unpack.push(ms(t));
-            let t = Instant::now();
+        Kind::Rgb(_) => {
+            let r = sources.rgb.as_mut().expect("uploaded");
             // The card does not report RGB's range: the setting says (#23).
             let color = RgbSourceColor {
                 levels: dst.rgb_range,
@@ -747,11 +857,11 @@ fn render<'p>(
                 transfer: ycbcr_color(info).transfer,
             };
             pl.render_rgb_view(r, color, dst.tex, out, view)?;
-            stages.render.push(ms(t));
         }
-        Kind::Unsupported(_) => return Ok(false),
+        Kind::Unsupported(_) => unreachable!("never uploaded"),
     }
-    Ok(true)
+    stages.render.push(ms(t));
+    Ok(())
 }
 
 fn ms(since: Instant) -> f64 {
@@ -1017,54 +1127,48 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             opts.config.fill_max_ar
         );
     }
-    let mut det = Detector::default();
-    let mut crops = 0u64;
+    let mut finder = CropFinder {
+        det: Detector::default(),
+        on: opts.config.crop,
+        crops: 0,
+    };
     // For the info panel: the last ten seconds' timings, and when and why
     // the crop last changed.
     let window = RefCell::new(Window::default());
     let crop_change: Cell<Option<(Instant, &'static str)>> = Cell::new(None);
-    // This frame's detector time, 0 when it did not run, for the frame's
-    // whole work below.
-    let detect_ms = Cell::new(0.0);
-    let mut detect = |frame: &Frame, kind: Kind, t: f64, epoch: u32| -> geo::Source {
-        if !opts.config.crop {
-            return geo::Source::Whole;
+    // What the detector found on a frame: its time into the panel's window,
+    // and a crop change into the log.
+    let noted = |found: &Found, info: &FrameInfo, t: f64| {
+        if let Some(d) = found.ms {
+            window.borrow_mut().detect(Instant::now(), d);
         }
-        let info = frame.info();
-        detect_ms.set(0.0);
-        if matches!(kind, Kind::Ycbcr(_))
-            && let Some(px) = frame.pixels()
-            && let Some(v) = V210::new(px.bytes(), info.width, info.height, info.row_bytes)
-        {
-            let t0 = Instant::now();
-            let d = det.push(&v, t, epoch);
-            detect_ms.set(ms(t0));
-            window.borrow_mut().detect(Instant::now(), detect_ms.get());
-            if d.changed {
-                crops += 1;
-                crop_change.set(Some((Instant::now(), d.diag.reason)));
-                let c = d.crop;
-                info!(
-                    "{t:.1} s: crop {}/{} ({}): picture {} x {} rows, {:.3}:1",
-                    c.top,
-                    c.bottom,
-                    d.diag.reason,
-                    info.width,
-                    c.active(info.height),
-                    f64::from(info.width) / f64::from(c.active(info.height).max(1))
-                );
-            }
-        }
-        let c = det.crop();
-        geo::Source::Rows {
-            top: c.top,
-            bottom: c.bottom,
+        if let Some((c, reason)) = found.change {
+            crop_change.set(Some((Instant::now(), reason)));
+            info!(
+                "{t:.1} s: crop {}/{} ({reason}): picture {} x {} rows, {:.3}:1",
+                c.top,
+                c.bottom,
+                info.width,
+                c.active(info.height),
+                f64::from(info.width) / f64::from(c.active(info.height).max(1))
+            );
         }
     };
     let (first_source, first_place) = match &start {
         Some((key, first, _)) => {
             let first_info = *first.info();
-            let source = detect(first, key.kind, 0.0, 1);
+            let (found, uploaded) = detect_and_upload(
+                &pl,
+                &mut finder,
+                first,
+                key.kind,
+                last_tunnel.as_ref(),
+                &mut sources,
+                &mut stages,
+                (0.0, 1),
+            )?;
+            noted(&found, &first_info, 0.0);
+            let source = found.source;
             let view = view_for(
                 (first_info.width, first_info.height),
                 size,
@@ -1072,17 +1176,18 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 source,
                 opts.config.fill_max_ar,
             );
-            if !render(
+            if !uploaded {
+                return Err("the first frame could not be rendered".into());
+            }
+            draw(
                 &pl,
-                first,
+                &first_info,
                 key.kind,
                 last_tunnel.as_ref(),
                 &mut sources,
                 &target(0, out_color, view),
                 &mut stages,
-            )? {
-                return Err("the first frame could not be rendered".into());
-            }
+            )?;
             let place = view
                 .dst
                 .unwrap_or_else(|| Rect::fit(first_info.width, first_info.height, size.0, size.1));
@@ -1400,12 +1505,21 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         .expect("three buffers, two in use");
                     // Every change of input format is a new epoch for the
                     // detector, which forgets what it learned.
-                    let source = detect(
+                    let started = Instant::now();
+                    let t = run_started.elapsed().as_secs_f64();
+                    let frame_info = *frame.info();
+                    let (found, uploaded) = detect_and_upload(
+                        &pl,
+                        &mut finder,
                         &frame,
                         k.kind,
-                        run_started.elapsed().as_secs_f64(),
-                        counts.format_changes as u32 + returns + 1,
-                    );
+                        last_tunnel.as_ref(),
+                        &mut sources,
+                        &mut stages,
+                        (t, counts.format_changes as u32 + returns + 1),
+                    )?;
+                    noted(&found, &frame_info, t);
+                    let source = found.source;
                     last_source = source;
                     let view = view_for(
                         (k.width, k.height),
@@ -1416,23 +1530,22 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     );
                     // Rendered into the output as it stands, which libplacebo maps
                     // to, until the policy moves the output.
-                    if render(
-                        &pl,
-                        &frame,
-                        k.kind,
-                        last_tunnel.as_ref(),
-                        &mut sources,
-                        &target(free, out_color, view),
-                        &mut stages,
-                    )? {
+                    if uploaded {
+                        draw(
+                            &pl,
+                            &frame_info,
+                            k.kind,
+                            last_tunnel.as_ref(),
+                            &mut sources,
+                            &target(free, out_color, view),
+                            &mut stages,
+                        )?;
                         ready = Some(free);
                         ui.set_slate(None);
-                        if let (Some(&u), Some(&r)) = (stages.unpack.last(), stages.render.last()) {
-                            // Detect, unpack and render run one after the
-                            // other on this thread.
-                            window
-                                .borrow_mut()
-                                .render(Instant::now(), r, detect_ms.get() + u + r);
+                        if let Some(&r) = stages.render.last() {
+                            // The frame's whole work, as it ran: detect beside
+                            // the upload, then the draw.
+                            window.borrow_mut().render(Instant::now(), r, ms(started));
                         }
                     } else {
                         // Nothing renders this format: black, not the last
@@ -1611,14 +1724,16 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         counts.modesets, counts.metadata, counts.refused
     );
     if opts.config.crop {
-        let shares: Vec<String> = det
+        let shares: Vec<String> = finder
+            .det
             .policy()
             .shares()
             .iter()
             .map(|s| format!("{} rows {:.1} s", s.rows, s.seconds))
             .collect();
         info!(
-            "crop: {crops} changes; time at each height: {}",
+            "crop: {} changes; time at each height: {}",
+            finder.crops,
             shares.join(", ")
         );
     }
