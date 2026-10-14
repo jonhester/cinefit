@@ -109,11 +109,12 @@ pub fn ago(d: Duration) -> String {
 
 /// CROP: the picture's shape and rows of bar, and the last change. `source`
 /// is the input's size; `rows` the crop (top, bottom), `None` with the crop
-/// off.
+/// off; `unread` why the detector does not read this input, if it does not.
 pub fn crop_section(
     source: Option<(u32, u32)>,
     rows: Option<(u32, u32)>,
     last: Option<(Duration, &str)>,
+    unread: Option<&str>,
 ) -> InfoSection {
     let label = "CROP".to_string();
     let Some(rows) = rows else {
@@ -140,9 +141,12 @@ pub fn crop_section(
     InfoSection {
         label,
         line,
-        detail: match last {
-            Some((d, reason)) => format!("{reason}, {}", ago(d)),
-            None => "no change yet".into(),
+        detail: match (unread, last) {
+            // Said whether or not a crop was dropped for it: an input that
+            // was never cropped is still not being looked at.
+            (Some(why), _) => why.into(),
+            (None, Some((d, reason))) => format!("{reason}, {}", ago(d)),
+            (None, None) => "no change yet".into(),
         },
     }
 }
@@ -183,16 +187,37 @@ mod tests {
             Some((3840, 2160)),
             Some((280, 279)),
             Some((Duration::from_secs(12), "zoom in (recent)")),
+            None,
         );
         assert_eq!(s.line, "2.40 : 1 \u{b7} 280 / 279 rows");
         assert_eq!(s.detail, "zoom in (recent), 12 s ago");
-        let full = crop_section(Some((1920, 1080)), Some((0, 0)), None);
+        let full = crop_section(Some((1920, 1080)), Some((0, 0)), None, None);
         assert_eq!(
             (full.line.as_str(), full.detail.as_str()),
             ("Full frame \u{b7} 1.78 : 1", "no change yet")
         );
-        assert_eq!(crop_section(Some((1920, 1080)), None, None).line, "Off");
-        assert_eq!(crop_section(None, Some((0, 0)), None).detail, "no picture");
+        assert_eq!(
+            crop_section(Some((1920, 1080)), None, None, None).line,
+            "Off"
+        );
+        assert_eq!(
+            crop_section(None, Some((0, 0)), None, None).detail,
+            "no picture"
+        );
+        // RGB input: full frame, and why, even with no crop dropped for it.
+        let rgb = crop_section(
+            Some((3840, 2160)),
+            Some((0, 0)),
+            None,
+            Some("the detector does not read RGB"),
+        );
+        assert_eq!(
+            (rgb.line.as_str(), rgb.detail.as_str()),
+            (
+                "Full frame \u{b7} 1.78 : 1",
+                "the detector does not read RGB"
+            )
+        );
         assert_eq!(ago(Duration::from_secs(185)), "3 min ago");
         assert_eq!(ago(Duration::from_secs(3 * 3600 + 120)), "3 h 2 min ago");
     }
