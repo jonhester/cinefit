@@ -44,15 +44,16 @@ pub struct Config {
     /// Vision is never passed through.
     pub mode: OutputMode,
     /// The brightness, in nits, that the SDR output's white stands for: what
-    /// HDR is mapped down to.
+    /// HDR is mapped down to, and the peak a player's low-latency Dolby
+    /// Vision is taken to be mapped to, so that it passes one to one. One
+    /// setting for both: two that must be equal could drift apart.
     pub white_nits: u16,
     /// The output's rate, in hertz, while there is no source to follow:
     /// the rate the sources start in saves a resync when one comes on.
     pub wait_hz: f64,
     /// Whether YCbCr input labelled SDR BT.2020 is a player's low-latency
-    /// Dolby Vision: PQ already mapped by the player to `lldv_nits`.
+    /// Dolby Vision: PQ already mapped by the player to `white_nits`.
     pub lldv: bool,
-    pub lldv_nits: u16,
     /// The tone curve for HDR into the SDR output.
     pub curve: Curve,
     /// The HDR10 source's peak for the curve, in nits, in place of its
@@ -96,7 +97,6 @@ impl Default for Config {
             white_nits: 96,
             wait_hz: 23.976,
             lldv: true,
-            lldv_nits: 96,
             // libplacebo's own default. Hable ranked closest to Dolby in the
             // C++ version's step zero, but on a stand-in source, and blew out
             // snow on the screen (2026-10-13); no curve has been chosen on
@@ -255,7 +255,8 @@ static SETTINGS: &[Setting] = &[
         kind: Kind::Int { min: 48, max: 1000 },
         apply: Apply::Restart,
         help: "The brightness, in nits, that SDR output's white stands for: HDR above it is tone-mapped. \
-               Match input.lldv_nits so a player's low-latency Dolby Vision passes one to one.",
+               Also the peak a player's low-latency Dolby Vision is mapped to, which passes one to one: set \
+               it to what the EDID upstream declares (96 for the usual low-latency Dolby Vision EDIDs).",
         get: |c| Value::Int(c.white_nits.into()),
         set: |c, v| c.white_nits = int(v) as u16,
     },
@@ -298,20 +299,9 @@ static SETTINGS: &[Setting] = &[
         kind: Kind::Choice(&["on", "off"]),
         apply: Apply::Restart,
         help: "on: YCbCr input labelled SDR BT.2020 is a player's low-latency Dolby Vision, PQ already mapped \
-               to input.lldv_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
+               to output.white_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
         get: |c| Value::Name(if c.lldv { "on" } else { "off" }.into()),
         set: |c, v| c.lldv = name(v) == "on",
-    },
-    Setting {
-        key: "input.lldv_nits",
-        kind: Kind::Int {
-            min: 48,
-            max: 10000,
-        },
-        apply: Apply::Restart,
-        help: "The peak, in nits, that low-latency Dolby Vision is mapped to: what the EDID upstream declares.",
-        get: |c| Value::Int(c.lldv_nits.into()),
-        set: |c, v| c.lldv_nits = int(v) as u16,
     },
     Setting {
         key: "tonemap.curve",
@@ -395,6 +385,14 @@ pub fn settings() -> &'static [Setting] {
     SETTINGS
 }
 
+/// Settings that were removed, and what took their place: a file still
+/// holding one is told what to do, not just that the key is unknown.
+const RETIRED: &[(&str, &str)] = &[(
+    "input.lldv_nits",
+    "merged into output.white_nits (2026-10-14), which low-latency Dolby Vision now passes through at; \
+     remove the line, and set output.white_nits if it is not 96",
+)];
+
 pub fn find(key: &str) -> Option<&'static Setting> {
     SETTINGS.iter().find(|s| s.key == key)
 }
@@ -454,7 +452,10 @@ impl fmt::Display for Error {
         match self {
             Error::Read(p, e) => write!(f, "{}: {e}", p.display()),
             Error::Parse(p, e) => write!(f, "{}: {e}", p.display()),
-            Error::UnknownKey(k) => write!(f, "no setting {k} (cinefit settings lists them)"),
+            Error::UnknownKey(k) => match RETIRED.iter().find(|(old, _)| old == k) {
+                Some((_, now)) => write!(f, "{k} is no longer a setting: {now}"),
+                None => write!(f, "no setting {k} (cinefit settings lists them)"),
+            },
             Error::Value { key, value, range } => write!(f, "{key} = {value}: must be {range}"),
         }
     }
@@ -658,6 +659,16 @@ mod tests {
         assert!(set(&mut c, &format!("slate.venue={}", "x".repeat(41))).is_err());
         assert!(parse("[slate]\nvenue = \"a\\nb\"\n", p()).is_err());
         assert!(parse("[slate]\nvenue = 3\n", p()).is_err());
+    }
+
+    #[test]
+    fn a_retired_setting_says_what_replaced_it() {
+        let e = parse("[input]\nlldv_nits = 96\n", p()).unwrap_err();
+        assert!(
+            e.to_string().contains("merged into output.white_nits"),
+            "{e}"
+        );
+        assert!(set(&mut Config::default(), "input.lldv_nits=96").is_err());
     }
 
     #[test]

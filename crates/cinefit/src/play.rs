@@ -631,11 +631,12 @@ struct Target<'a, 'p> {
     color: RgbColor,
     /// What plain RGB input's codes mean (the `input.rgb_range` setting).
     rgb_range: Levels,
-    /// HDR into SDR: what SDR white stands for, the curve, and the peak of
-    /// low-latency Dolby Vision when that input is on (the settings).
+    /// HDR into SDR: what SDR white stands for, which is also the peak
+    /// low-latency Dolby Vision is mapped to, and the curve (the settings).
     white_nits: f32,
     curve: Curve,
-    lldv_nits: Option<f32>,
+    /// Whether SDR BT.2020 input is low-latency Dolby Vision (`input.lldv`).
+    lldv: bool,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
     /// Which part of the frame is drawn and where it lands.
@@ -893,7 +894,7 @@ fn draw<'p>(
         Kind::Ycbcr(color) => {
             // Low-latency Dolby Vision is PQ under its SDR label, already
             // mapped by the player to its peak.
-            let (color, peak) = match dst.lldv_nits {
+            let (color, peak) = match dst.lldv.then_some(dst.white_nits) {
                 Some(nits) if is_lldv(kind, true) => (
                     YcbcrColor {
                         transfer: Transfer::Pq,
@@ -1139,8 +1140,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             match start_kind {
                 None => ", no source".to_string(),
                 Some(k) if is_lldv(k, opts.config.lldv) => format!(
-                    ": low-latency Dolby Vision, {} nits to white at {} nits",
-                    opts.config.lldv_nits, opts.config.white_nits
+                    ": low-latency Dolby Vision, passed through at {} nits",
+                    opts.config.white_nits
                 ),
                 Some(
                     Kind::Tunnel
@@ -1206,7 +1207,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         rgb_range: opts.config.rgb_range,
         white_nits: f32::from(opts.config.white_nits),
         curve: opts.config.curve,
-        lldv_nits: opts.config.lldv.then_some(f32::from(opts.config.lldv_nits)),
+        lldv: opts.config.lldv,
         source_peak: (opts.config.source_peak > 0).then_some(f32::from(opts.config.source_peak)),
         view,
     };
@@ -1445,7 +1446,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             peak_words(
                                 k.kind,
                                 b,
-                                opts.config.lldv.then_some(opts.config.lldv_nits)
+                                opts.config.lldv.then_some(opts.config.white_nits)
                             ),
                             shown
                                 .and_then(|v| out_nits(v, signal, opts.config.white_nits))
@@ -1514,7 +1515,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             last_key,
                             last_format,
                             dark,
-                            opts.config.lldv.then_some(opts.config.lldv_nits),
+                            opts.config.lldv.then_some(opts.config.white_nits),
                             brightest,
                         ),
                         output_section(
