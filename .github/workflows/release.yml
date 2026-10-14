@@ -1,9 +1,8 @@
 name: Release
 
 # A pushed tag vMAJOR.MINOR.PATCH publishes that release: one archive,
-# x86-64-v3 (any x86 CPU from about 2015 on), and its checksum.
-#
-#   git tag v0.1.0 && git push origin v0.1.0
+# x86-64-v3 (any x86 CPU from about 2015 on), and its checksum. Made by
+# tools/release.sh patch|minor|major, which bumps Cargo.toml to match.
 
 on:
   push:
@@ -20,13 +19,14 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      # SemVer, no leading zeros, nothing after: v0.1 or v0.01.0 is refused.
+      # The tag must name the version Cargo.toml holds at it: the binary
+      # reports Cargo.toml's.
       - id: version
         run: |
-          n='(0|[1-9][0-9]*)'
-          echo "$GITHUB_REF_NAME" | grep -Eq "^v$n\.$n\.$n\$" ||
-            { echo "$GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH"; exit 1; }
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          [ "$GITHUB_REF_NAME" = "v$v" ] ||
+            { echo "tag $GITHUB_REF_NAME, but Cargo.toml says $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       - run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
           meson ninja-build glslang-dev glslang-tools python3-jinja2
@@ -42,14 +42,15 @@ jobs:
       # What is published passed the tests, at this commit.
       - run: cargo test --workspace --locked
       - env:
-          CINEFIT_VERSION: ${{ steps.version.outputs.version }}
+          CINEFIT_RELEASE: "1"
+          VERSION: ${{ steps.version.outputs.version }}
           RUSTFLAGS: -C target-cpu=x86-64-v3
         run: |
           set -eu
           cargo build --release --locked -p cinefit
           # The binary says the version it was built as.
-          target/release/cinefit --version | grep -F "cinefit $CINEFIT_VERSION ("
-          tools/package.sh target/release/cinefit "$CINEFIT_VERSION" dist
+          target/release/cinefit --version | grep -F "cinefit $VERSION ("
+          tools/package.sh target/release/cinefit "$VERSION" dist
           (cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
       - env:
           GH_TOKEN: ${{ github.token }}

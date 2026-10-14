@@ -63,9 +63,10 @@ published build), copies it there and repoints `current`;
 `RESTART=1`: a restart is a resync on the projector, so not while someone is
 watching.
 
-Releases are SemVer from 0.1.0: push a tag on main (`git tag v0.1.0 && git
-push origin v0.1.0`) and `.github/workflows/release.yml` publishes one
-x86-64-v3 archive for it. No nightlies for now. The binary is one
+Releases are SemVer from 0.1.0, the version in `Cargo.toml`:
+`tools/release.sh patch|minor|major` bumps it, commits, tags and pushes, as
+`npm version` does, and `.github/workflows/release.yml` publishes one x86-64-v3
+archive for the tag. Builds between releases report `VERSION+dev`. No nightlies for now. The binary is one
 file: libplacebo is linked statically (LGPL-2.1, see the README).
 
 `CINEFIT_STILLS=DIR cargo test --release -p cinefit-detect --test stills` reads
