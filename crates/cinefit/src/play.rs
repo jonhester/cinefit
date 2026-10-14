@@ -1757,6 +1757,26 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
                 last_frame_at = Instant::now();
                 let k = classify(&frame, &mut last_tunnel);
+                {
+                    let info = frame.info();
+                    let first = counts.dv_flagged + counts.dv_bytes == 0;
+                    counts.dv_flagged += u64::from(info.dolby_vision_flagged);
+                    counts.dv_bytes += u64::from(info.dolby_vision_bytes.is_some());
+                    counts.lldv_labelled += u64::from(is_lldv(k.kind, cfg.lldv));
+                    if first && (info.dolby_vision_flagged || info.dolby_vision_bytes.is_some()) {
+                        info!(
+                            "{:.1} s: the card reports Dolby Vision on input: flag {}, metadata {}",
+                            run_started.elapsed().as_secs_f64(),
+                            if info.dolby_vision_flagged {
+                                "set"
+                            } else {
+                                "not set"
+                            },
+                            info.dolby_vision_bytes
+                                .map_or_else(|| "none".to_string(), |n| format!("{n} bytes"))
+                        );
+                    }
+                }
                 if Some(k) != last_key {
                     counts.format_changes += 1;
                     // Capped: a source that flaps would bury everything else.
@@ -2110,6 +2130,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         counts.unproven,
         counts.signal_losses,
     );
+    info!(
+        "Dolby Vision from the card: flag on {} frames, metadata on {} (input labelled as low-latency Dolby Vision: {} frames)",
+        counts.dv_flagged, counts.dv_bytes, counts.lldv_labelled
+    );
     match settled {
         Some((at, displaced)) => {
             let repeats = counts.repeats - at.repeats;
@@ -2200,6 +2224,14 @@ struct Counts {
     modesets: u64,
     metadata: u64,
     refused: u64,
+    /// Frames the card flagged as carrying Dolby Vision metadata, and frames
+    /// it attached any to: whether HDMI input ever does, which would tell
+    /// low-latency Dolby Vision from SDR BT.2020 for certain.
+    dv_flagged: u64,
+    dv_bytes: u64,
+    /// Frames that `input.lldv` reads as low-latency Dolby Vision: what the
+    /// two above are to be compared with.
+    lldv_labelled: u64,
 }
 
 /// An input's HDR metadata, for a log line: empty when it carries none.

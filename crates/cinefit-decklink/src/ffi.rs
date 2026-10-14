@@ -105,9 +105,10 @@ pub struct FrameInfo {
     pub min_mastering: f64,
     pub max_cll: f64,
     pub max_fall: f64,
+    pub dolby_vision_bytes: i64,
 }
 
-const _: () = assert!(size_of::<FrameInfo>() == 152);
+const _: () = assert!(size_of::<FrameInfo>() == 160);
 const _: () = assert!(offset_of!(FrameInfo, stream_time) == 0);
 const _: () = assert!(offset_of!(FrameInfo, stream_duration) == 8);
 const _: () = assert!(offset_of!(FrameInfo, row_bytes) == 16);
@@ -129,6 +130,7 @@ const _: () = assert!(offset_of!(FrameInfo, max_mastering) == 120);
 const _: () = assert!(offset_of!(FrameInfo, min_mastering) == 128);
 const _: () = assert!(offset_of!(FrameInfo, max_cll) == 136);
 const _: () = assert!(offset_of!(FrameInfo, max_fall) == 144);
+const _: () = assert!(offset_of!(FrameInfo, dolby_vision_bytes) == 152);
 
 /// Opaque `cf_dl_input`.
 #[repr(C)]

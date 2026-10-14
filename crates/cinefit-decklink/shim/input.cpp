@@ -23,7 +23,7 @@ static_assert(offsetof(cf_dl_format, detected_flags) == 28, "layout must match s
 static_assert(offsetof(cf_dl_format, enabled_mode) == 32, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_format, enabled_pixel_format) == 36, "layout must match src/ffi.rs");
 
-static_assert(sizeof(cf_dl_frame_info) == 152, "layout must match src/ffi.rs");
+static_assert(sizeof(cf_dl_frame_info) == 160, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, stream_time) == 0, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, stream_duration) == 8, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, row_bytes) == 16, "layout must match src/ffi.rs");
@@ -45,6 +45,7 @@ static_assert(offsetof(cf_dl_frame_info, max_mastering) == 120, "layout must mat
 static_assert(offsetof(cf_dl_frame_info, min_mastering) == 128, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, max_cll) == 136, "layout must match src/ffi.rs");
 static_assert(offsetof(cf_dl_frame_info, max_fall) == 144, "layout must match src/ffi.rs");
+static_assert(offsetof(cf_dl_frame_info, dolby_vision_bytes) == 152, "layout must match src/ffi.rs");
 
 namespace {
 
@@ -71,6 +72,7 @@ void read_metadata(IDeckLinkVideoInputFrame *frame, cf_dl_frame_info &info) {
                      &info.max_mastering, &info.min_mastering, &info.max_cll,
                      &info.max_fall};
     for (double *v : hdr) *v = nan;
+    info.dolby_vision_bytes = CF_DL_UNKNOWN;
 
     IDeckLinkVideoFrameMetadataExtensions *meta = nullptr;
     if (frame->QueryInterface(IID_IDeckLinkVideoFrameMetadataExtensions, (void **)&meta) != S_OK || !meta)
@@ -79,6 +81,10 @@ void read_metadata(IDeckLinkVideoInputFrame *frame, cf_dl_frame_info &info) {
     int64_t i = 0;
     if (meta->GetInt(bmdDeckLinkFrameMetadataColorspace, &i) == S_OK) info.colorspace = i;
     if (meta->GetInt(bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc, &i) == S_OK) info.eotf = i;
+    // With no buffer, GetBytes reports the size it would write.
+    uint32_t dv = 0;
+    if (meta->GetBytes(bmdDeckLinkFrameMetadataDolbyVision, nullptr, &dv) == S_OK && dv > 0)
+        info.dolby_vision_bytes = dv;
 
     // The HDR values are only meaningful on a frame flagged as carrying them.
     if (frame->GetFlags() & bmdFrameContainsHDRMetadata) {
