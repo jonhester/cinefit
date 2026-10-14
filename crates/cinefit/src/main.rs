@@ -118,7 +118,8 @@ enum Command {
     /// --compare, every frame against the C++ version's replay log. Touches no
     /// capture card or display.
     Replay {
-        /// Clip directories: ours or the C++ version's, whole or trimmed.
+        /// Clip directories: ours or the C++ version's, whole or trimmed; with
+        /// --readings, readings files.
         #[arg(required = true)]
         clips: Vec<PathBuf>,
         /// A directory of the C++ version's replay logs (<clip>.cinefit.csv)
@@ -131,6 +132,19 @@ enum Command {
         /// Summaries only, without the list of crop changes.
         #[arg(short, long)]
         quiet: bool,
+        /// Also save what the bar reader and cut detector saw on every frame
+        /// to DIR/<clip>.csv, and check that the policy replaying them gives
+        /// the same crops.
+        #[arg(long, value_name = "DIR", conflicts_with = "readings")]
+        save_readings: Option<PathBuf>,
+        /// The arguments are saved readings (ours or the C++ version's): the
+        /// policy alone over them, a whole clip in milliseconds.
+        #[arg(long)]
+        readings: bool,
+        /// A policy parameter for a --readings replay, e.g.
+        /// threshold_new=4; repeatable.
+        #[arg(long = "set", value_name = "KEY=VALUE", requires = "readings")]
+        sets: Vec<String>,
     },
     /// Compare the same content recorded twice with `capture --record`, as a
     /// Dolby Vision tunnel and as HDR10: align the recordings, render matched
@@ -198,8 +212,14 @@ fn main() -> ExitCode {
             compare,
             log,
             quiet,
+            save_readings,
+            readings,
+            sets,
         } => replay::run(replay::Options {
             pieces: clips,
+            save_readings,
+            readings,
+            sets,
             compare,
             log,
             quiet,

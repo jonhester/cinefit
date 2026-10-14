@@ -9,7 +9,7 @@
 
 use crate::Samples;
 use crate::ar_policy::{ArPolicy, Crop, Decision};
-use crate::bars::Bars;
+use crate::bars::{Bars, Observation};
 use crate::cuts::Cuts;
 
 #[derive(Default)]
@@ -26,6 +26,18 @@ impl Detector {
     /// and on signal loss; the detector resets whatever it has learned when
     /// it changes.
     pub fn push(&mut self, f: &dyn Samples, time_s: f64, epoch: u32) -> Decision {
+        self.push_reading(f, time_s, epoch).0
+    }
+
+    /// [`Self::push`], also returning what the policy was given: the bar
+    /// reader's observation and the cut flag, for saving as a
+    /// [`Reading`](crate::readings::Reading).
+    pub fn push_reading(
+        &mut self,
+        f: &dyn Samples,
+        time_s: f64,
+        epoch: u32,
+    ) -> (Decision, Observation, bool) {
         if epoch != self.epoch {
             self.cuts.reset();
             self.epoch = epoch;
@@ -35,7 +47,7 @@ impl Detector {
         // the previous frame was compared over; a crop change re-baselines it.
         let c = self.policy.crop();
         let cut = self.cuts.observe(f, c.top, c.bottom).cut;
-        self.policy.push(&o, cut, time_s, epoch)
+        (self.policy.push(&o, cut, time_s, epoch), o, cut)
     }
 
     pub fn crop(&self) -> Crop {

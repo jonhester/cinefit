@@ -12,9 +12,17 @@
 //! replay does without `--join`, and a change of frame format inside a piece
 //! is a new epoch, as in `play`.
 //!
+//! The readings tier: `--save-readings DIR` also writes what the bar reader
+//! and the cut detector saw on each frame ([`readings`]), and checks that the
+//! policy replaying them, as written, gives every frame the crop the pixels
+//! did. `--readings` then replays those files through the policy alone, a
+//! whole clip in milliseconds, with `--set KEY=VALUE` to try a policy
+//! parameter. The C++ version's saved readings replay too.
+//!
 //! Clips and anything derived from them are copyrighted footage: they stay on
-//! the machine, outside any repository. A replay is disk- and zstd-bound and
-//! takes minutes per clip; do not run one beside a recording or a benchmark.
+//! the machine, outside any repository. A pixel replay is disk- and
+//! zstd-bound and takes minutes per clip; do not run one beside a recording
+//! or a benchmark.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -23,12 +31,21 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use cinefit_detect::{Crop, Detector, V210};
+use cinefit_detect::ar_policy::{ArPolicy, Params};
+use cinefit_detect::readings::{self, Reading};
+use cinefit_detect::{Crop, Decision, Detector, V210};
 
-use crate::record::{self, ClipFrame};
+use crate::record;
 
 pub struct Options {
+    /// Clip directories, or with `readings` readings files.
     pub pieces: Vec<PathBuf>,
+    /// Also write each piece's readings to `<dir>/<piece>.csv`.
+    pub save_readings: Option<PathBuf>,
+    /// The pieces are readings files: the policy alone, no pixels.
+    pub readings: bool,
+    /// Policy parameters for a readings replay, `KEY=VALUE`.
+    pub sets: Vec<String>,
     /// A directory of the C++ version's replay logs, `<piece>.cinefit.csv`.
     pub compare: Option<PathBuf>,
     /// Write every frame's decision to `<dir>/<piece>.rust.csv`, in the C++
@@ -62,9 +79,9 @@ struct Tracker {
 }
 
 impl Tracker {
-    fn push(&mut self, f: &ClipFrame, d: &cinefit_detect::Decision) {
+    fn push(&mut self, frame: u64, time: f64, d: &Decision) {
         self.edges
-            .push((f.frame_number, d.diag.edge_top, d.diag.edge_bottom));
+            .push((frame, d.diag.edge_top, d.diag.edge_bottom));
         if d.crop == self.crop {
             return;
         }
@@ -75,12 +92,12 @@ impl Tracker {
                 self.edges
                     .iter()
                     .find(|(_, t, b)| near(*t, d.crop.top) && near(*b, d.crop.bottom))
-                    .map(|(n, _, _)| f.frame_number - n)
+                    .map(|(n, _, _)| frame - n)
             })
             .flatten();
         self.switches.push(Switch {
-            frame: f.frame_number,
-            time: f.time,
+            frame,
+            time,
             from: self.crop,
             to: d.crop,
             reason: d.diag.reason,
@@ -152,18 +169,51 @@ struct Piece {
     /// The detector's time per frame, milliseconds.
     detect_ms: Vec<f64>,
     seconds: f64,
+    /// Frames where the policy over the saved readings, as written, gave
+    /// another crop than the pixels did.
+    unfaithful: u64,
 }
 
 pub fn run(o: Options) -> Result<(), Box<dyn Error>> {
     if o.pieces.is_empty() {
         return Err("no clips given".into());
     }
-    if let Some(dir) = &o.log {
+    if !o.sets.is_empty() && !o.readings {
+        return Err(
+            "--set applies to --readings replays only: the pixel tier runs the policy as built"
+                .into(),
+        );
+    }
+    if o.readings && o.save_readings.is_some() {
+        return Err("--save-readings needs clips, not readings".into());
+    }
+    let mut params = Params::default();
+    for kv in &o.sets {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("--set {kv}: KEY=VALUE"))?;
+        params.set(k.trim(), v.trim())?;
+    }
+    for dir in [&o.log, &o.save_readings].into_iter().flatten() {
         std::fs::create_dir_all(dir)?;
     }
     let mut all = Piece::default();
     for dir in &o.pieces {
-        let p = piece(dir, &o)?;
+        let p = if o.readings {
+            // A file with no readings (a header alone) is said and passed
+            // over, as the C++ version does: one bad file in a glob should
+            // not stop the rest.
+            match replay_readings(dir, &o, params)? {
+                Some(p) => p,
+                None => {
+                    println!("{}: no readings, skipped", dir.display());
+                    continue;
+                }
+            }
+        } else {
+            piece(dir, &o)?
+        };
+        all.unfaithful += p.unfaithful;
         all.frames += p.frames;
         all.skipped += p.skipped;
         all.compared += p.compared;
@@ -193,6 +243,20 @@ pub fn run(o: Options) -> Result<(), Box<dyn Error>> {
                 all.differ, all.compared
             );
         }
+        if o.save_readings.is_some() {
+            println!(
+                "readings replay: {} frames differ from the pixel run{}",
+                all.unfaithful,
+                if all.unfaithful > 0 {
+                    "  -- NOT FAITHFUL"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    if all.unfaithful > 0 {
+        return Err("the saved readings do not reproduce the pixel run".into());
     }
     Ok(())
 }
@@ -204,37 +268,188 @@ fn name_of(dir: &Path) -> String {
     )
 }
 
+/// One piece's replay, whatever feeds it decisions: the comparison with the
+/// C++ version's log, the per-frame log, the tracker and the counts.
+struct Run {
+    name: String,
+    cpp: Option<BTreeMap<i64, (Crop, String)>>,
+    log: Option<BufWriter<File>>,
+    tracker: Tracker,
+    p: Piece,
+    first_diff: Option<(u64, Crop, String, Crop, &'static str)>,
+}
+
+impl Run {
+    fn new(name: String, o: &Options) -> Result<Self, Box<dyn Error>> {
+        let cpp = match &o.compare {
+            Some(d) => {
+                let path = d.join(format!("{name}.cinefit.csv"));
+                if path.exists() {
+                    Some(cpp_log(&path)?)
+                } else {
+                    println!("{name}: no C++ log at {}", path.display());
+                    None
+                }
+            }
+            None => None,
+        };
+        let log = match &o.log {
+            Some(d) => {
+                let mut w = BufWriter::new(File::create(d.join(format!("{name}.rust.csv")))?);
+                writeln!(
+                    w,
+                    "index,time,class,edge_top,edge_bottom,crop_top,crop_bottom,candidate_top,candidate_bottom,evidence,threshold,reason"
+                )?;
+                Some(w)
+            }
+            None => None,
+        };
+        Ok(Self {
+            name,
+            cpp,
+            log,
+            tracker: Tracker::default(),
+            p: Piece::default(),
+            first_diff: None,
+        })
+    }
+
+    /// One frame's decision.
+    fn step(&mut self, frame: u64, time: f64, d: &Decision) -> Result<(), Box<dyn Error>> {
+        self.p.frames += 1;
+        self.tracker.push(frame, time, d);
+        if let Some(cpp) = &self.cpp
+            && let Some((c, reason)) = cpp.get(&micros(time))
+        {
+            self.p.compared += 1;
+            if *c != d.crop {
+                self.p.differ += 1;
+                if self.first_diff.is_none() {
+                    self.first_diff = Some((frame, *c, reason.clone(), d.crop, d.diag.reason));
+                }
+            }
+        }
+        if let Some(w) = self.log.as_mut() {
+            let opt = |v: Option<u32>| v.map_or(-1, i64::from);
+            let c = d.diag.candidate;
+            writeln!(
+                w,
+                "{},{:.6},{},{},{},{},{},{},{},{:.3},{:.3},{}",
+                frame,
+                time,
+                d.diag.frame_class,
+                opt(d.diag.edge_top),
+                opt(d.diag.edge_bottom),
+                d.crop.top,
+                d.crop.bottom,
+                c.map_or(-1, |c| i64::from(c.crop.top)),
+                c.map_or(-1, |c| i64::from(c.crop.bottom)),
+                c.map_or(0.0, |c| c.evidence),
+                c.map_or(0.0, |c| c.threshold),
+                if d.changed { d.diag.reason } else { "" }
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The report. `span` is the piece's first and last time, `size` its
+    /// frame size, `head` what follows the frame count on the first line.
+    fn finish(
+        mut self,
+        policy: &ArPolicy,
+        span: (f64, f64),
+        size: (usize, usize),
+        head: &str,
+        quiet: bool,
+    ) -> Result<Piece, Box<dyn Error>> {
+        if let Some(mut w) = self.log.take() {
+            w.flush()?;
+        }
+        let p = &mut self.p;
+        p.seconds = span.1 - span.0;
+        p.switches = self.tracker.switches.len();
+        println!(
+            "{}: {} frames, {:.1} s of content ({:.2}-{:.2} s){head}",
+            self.name, p.frames, p.seconds, span.0, span.1
+        );
+        let (w, h) = size;
+        if !quiet {
+            for s in &self.tracker.switches {
+                println!(
+                    "  frame {} at {:.3} s: {}/{} -> {}/{} ({}), {:.3}:1{}",
+                    s.frame,
+                    s.time,
+                    s.from.top,
+                    s.from.bottom,
+                    s.to.top,
+                    s.to.bottom,
+                    s.reason,
+                    w as f64 / f64::from(s.to.active(h as u32).max(1)),
+                    s.latency.map_or_else(String::new, |l| format!(
+                        ", {l} frames after the height first showed"
+                    ))
+                );
+            }
+        }
+        let mut latencies: Vec<f64> = self
+            .tracker
+            .switches
+            .iter()
+            .filter_map(|s| s.latency.map(|l| l as f64))
+            .collect();
+        let zoom_ins = latencies.len();
+        let mut line = format!("  {} crop changes", p.switches);
+        if let Some((m, _, max)) = spread(&mut latencies) {
+            line += &format!(
+                "; {zoom_ins} zoom-ins, from the height first showing: median {m:.0}, max {max:.0} frames"
+            );
+        }
+        println!("{line}");
+        let shares: Vec<String> = policy
+            .shares()
+            .iter()
+            .map(|s| format!("{} rows {:.1} s", s.rows, s.seconds))
+            .collect();
+        if !shares.is_empty() {
+            println!("  time at each height: {}", shares.join(", "));
+        }
+        if self.cpp.is_some() {
+            print!(
+                "  against C++: {} of {} frames differ",
+                p.differ, p.compared
+            );
+            if let Some((n, c, cr, r, rr)) = &self.first_diff {
+                print!(
+                    "; first at frame {n}: C++ {}/{} ({cr}), Rust {}/{} ({rr})",
+                    c.top, c.bottom, r.top, r.bottom
+                );
+            }
+            println!();
+        }
+        Ok(self.p)
+    }
+}
+
+/// A piece's pixels through the whole detector.
 fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
     let name = name_of(dir);
     let index = record::read_index(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let cpp = match &o.compare {
+    let mut run = Run::new(name.clone(), o)?;
+    let mut saved = match &o.save_readings {
         Some(d) => {
-            let path = d.join(format!("{name}.cinefit.csv"));
-            if path.exists() {
-                Some(cpp_log(&path)?)
-            } else {
-                println!("{name}: no C++ log at {}", path.display());
-                None
-            }
-        }
-        None => None,
-    };
-    let mut log = match &o.log {
-        Some(d) => {
-            let mut w = BufWriter::new(File::create(d.join(format!("{name}.rust.csv")))?);
-            writeln!(
-                w,
-                "index,time,class,edge_top,edge_bottom,crop_top,crop_bottom,candidate_top,candidate_bottom,evidence,threshold,reason"
-            )?;
+            let mut w = BufWriter::new(File::create(d.join(format!("{name}.csv")))?);
+            writeln!(w, "{}", readings::header())?;
             Some(w)
         }
         None => None,
     };
+    // The policy alone over each reading as written, in step with the
+    // pixels: a reading that loses what the policy needs (to rounding, say)
+    // shows here as a frame whose crop differs.
+    let mut lockstep = ArPolicy::default();
 
     let mut det = Detector::default();
-    let mut tracker = Tracker::default();
-    let mut p = Piece::default();
-    let mut first_diff: Option<(u64, Crop, String, Crop, &'static str)> = None;
+    let (mut skipped, mut detect_ms, mut unfaithful) = (0u64, Vec::new(), 0u64);
     let (mut epoch, mut format) = (1u32, None);
     let started = Instant::now();
     record::for_each_frame::<Box<dyn Error>>(
@@ -251,156 +466,110 @@ fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
                 .then(|| V210::new(bytes, f.width as u32, f.height as u32, f.row_bytes))
                 .flatten();
             let Some(v) = v else {
-                p.skipped += 1;
+                skipped += 1;
                 return Ok(());
             };
             let t = Instant::now();
-            let d = det.push(&v, f.time, epoch);
-            p.detect_ms.push(t.elapsed().as_secs_f64() * 1000.0);
-            p.frames += 1;
-            tracker.push(f, &d);
-            if let Some(cpp) = &cpp
-                && let Some((c, reason)) = cpp.get(&micros(f.time))
-            {
-                p.compared += 1;
-                if *c != d.crop {
-                    p.differ += 1;
-                    if first_diff.is_none() {
-                        first_diff =
-                            Some((f.frame_number, *c, reason.clone(), d.crop, d.diag.reason));
-                    }
+            let (d, obs, cut) = det.push_reading(&v, f.time, epoch);
+            detect_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            run.step(f.frame_number, f.time, &d)?;
+            if let Some(w) = saved.as_mut() {
+                let line = readings::format(&Reading {
+                    index: f.frame_number,
+                    time: f.time,
+                    epoch,
+                    obs,
+                    cut,
+                });
+                writeln!(w, "{line}")?;
+                let back = readings::parse(&line).ok_or("a reading that does not read back")?;
+                if lockstep
+                    .push(&back.obs, back.cut, back.time, back.epoch)
+                    .crop
+                    != d.crop
+                {
+                    unfaithful += 1;
                 }
-            }
-            if let Some(w) = log.as_mut() {
-                let opt = |v: Option<u32>| v.map_or(-1, i64::from);
-                let c = d.diag.candidate;
-                writeln!(
-                    w,
-                    "{},{:.6},{},{},{},{},{},{},{},{:.3},{:.3},{}",
-                    f.frame_number,
-                    f.time,
-                    d.diag.frame_class,
-                    opt(d.diag.edge_top),
-                    opt(d.diag.edge_bottom),
-                    d.crop.top,
-                    d.crop.bottom,
-                    c.map_or(-1, |c| i64::from(c.crop.top)),
-                    c.map_or(-1, |c| i64::from(c.crop.bottom)),
-                    c.map_or(0.0, |c| c.evidence),
-                    c.map_or(0.0, |c| c.threshold),
-                    if d.changed { d.diag.reason } else { "" }
-                )?;
             }
             Ok(())
         },
     )?;
     let wall = started.elapsed().as_secs_f64();
-    if let Some(mut w) = log {
+    if let Some(mut w) = saved {
         w.flush()?;
     }
-
-    let (first, last) = (index.first(), index.last());
-    p.seconds = match (first, last) {
-        (Some(a), Some(b)) => b.time - a.time,
-        _ => 0.0,
-    };
-    p.switches = tracker.switches.len();
-    println!(
-        "{name}: {} frames, {:.1} s of content ({:.2}-{:.2} s){}",
-        p.frames,
-        p.seconds,
-        first.map_or(0.0, |f| f.time),
-        last.map_or(0.0, |f| f.time),
-        if p.skipped > 0 {
-            format!(", {} frames not v210 skipped (no adapter yet)", p.skipped)
-        } else {
-            String::new()
-        }
+    let span = (
+        index.first().map_or(0.0, |f| f.time),
+        index.last().map_or(0.0, |f| f.time),
     );
-    if !o.quiet {
-        for s in &tracker.switches {
-            let rows = |c: Crop, h: usize| c.active(h as u32);
-            let h = index.first().map_or(2160, |f| f.height);
-            let w = index.first().map_or(3840, |f| f.width);
-            println!(
-                "  frame {} at {:.3} s: {}/{} -> {}/{} ({}), {:.3}:1{}",
-                s.frame,
-                s.time,
-                s.from.top,
-                s.from.bottom,
-                s.to.top,
-                s.to.bottom,
-                s.reason,
-                w as f64 / f64::from(rows(s.to, h).max(1)),
-                s.latency.map_or_else(String::new, |l| format!(
-                    ", {l} frames after the height first showed"
-                ))
-            );
-        }
-    }
-    let mut latencies: Vec<f64> = tracker
-        .switches
-        .iter()
-        .filter_map(|s| s.latency.map(|l| l as f64))
-        .collect();
-    let zoom_ins = latencies.len();
-    let mut line = format!("  {} crop changes", p.switches);
-    if let Some((m, _, max)) = spread(&mut latencies) {
-        line += &format!(
-            "; {zoom_ins} zoom-ins, from the height first showing: median {m:.0}, max {max:.0} frames"
-        );
-    }
-    println!("{line}");
-    let shares: Vec<String> = det
-        .policy()
-        .shares()
-        .iter()
-        .map(|s| format!("{} rows {:.1} s", s.rows, s.seconds))
-        .collect();
-    if !shares.is_empty() {
-        println!("  time at each height: {}", shares.join(", "));
-    }
-    let detect_total: f64 = p.detect_ms.iter().sum::<f64>() / 1000.0;
-    if let Some((m, p95, max)) = spread(&mut p.detect_ms.clone()) {
+    let size = index.first().map_or((3840, 2160), |f| (f.width, f.height));
+    let head = if skipped > 0 {
+        format!(", {skipped} frames not v210 skipped (no adapter yet)")
+    } else {
+        String::new()
+    };
+    let frames = run.p.frames;
+    let mut p = run.finish(det.policy(), span, size, &head, o.quiet)?;
+    p.skipped = skipped;
+    p.unfaithful = unfaithful;
+    let detect_total: f64 = detect_ms.iter().sum::<f64>() / 1000.0;
+    if let Some((m, p95, max)) = spread(&mut detect_ms.clone()) {
         println!(
             "  detector: median {m:.2} ms, p95 {p95:.2}, max {max:.2} per frame; reading the clip {:.0} frames/s",
-            p.frames as f64 / (wall - detect_total).max(1e-9)
+            frames as f64 / (wall - detect_total).max(1e-9)
         );
     }
-    if cpp.is_some() {
-        print!(
-            "  against C++: {} of {} frames differ",
-            p.differ, p.compared
+    p.detect_ms = detect_ms;
+    if o.save_readings.is_some() {
+        println!(
+            "  readings replay: {unfaithful} frames differ from the pixel run{}",
+            if unfaithful > 0 {
+                "  -- NOT FAITHFUL"
+            } else {
+                ""
+            }
         );
-        if let Some((n, c, cr, r, rr)) = &first_diff {
-            print!(
-                "; first at frame {n}: C++ {}/{} ({cr}), Rust {}/{} ({rr})",
-                c.top, c.bottom, r.top, r.bottom
-            );
-        }
-        println!();
     }
     Ok(p)
+}
+
+/// A readings file through the policy alone.
+fn replay_readings(
+    path: &Path,
+    o: &Options,
+    params: Params,
+) -> Result<Option<Piece>, Box<dyn Error>> {
+    let name = path.file_stem().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let rs: Vec<Reading> = text.lines().filter_map(readings::parse).collect();
+    let (Some(first), Some(last)) = (rs.first(), rs.last()) else {
+        return Ok(None);
+    };
+    let mut run = Run::new(name, o)?;
+    let mut policy = ArPolicy::new(params);
+    let started = Instant::now();
+    for r in &rs {
+        let d = policy.push(&r.obs, r.cut, r.time, r.epoch);
+        run.step(r.index, r.time, &d)?;
+    }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    run.finish(
+        &policy,
+        (first.time, last.time),
+        (last.obs.width as usize, last.obs.height as usize),
+        &format!(", policy alone in {ms:.1} ms"),
+        o.quiet,
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cinefit_detect::{Decision, Diagnostics};
-
-    fn frame(n: u64) -> ClipFrame {
-        ClipFrame {
-            index: n,
-            offset: 0,
-            size: 0,
-            width: 3840,
-            height: 2160,
-            row_bytes: 10240,
-            pixel_format: "v210".into(),
-            frame_number: n,
-            time: n as f64 / 24.0,
-        }
-    }
+    use cinefit_detect::Diagnostics;
 
     fn decision(crop: (u32, u32), edges: Option<(u32, u32)>, reason: &'static str) -> Decision {
         Decision {
@@ -421,17 +590,19 @@ mod tests {
     #[test]
     fn a_zoom_in_counts_frames_from_the_height_first_showing() {
         let mut t = Tracker::default();
-        t.push(&frame(0), &decision((0, 0), None, ""));
-        t.push(&frame(1), &decision((0, 0), Some((140, 140)), ""));
+        let push = |t: &mut Tracker, n: u64, d: &Decision| t.push(n, n as f64 / 24.0, d);
+        push(&mut t, 0, &decision((0, 0), None, ""));
+        push(&mut t, 1, &decision((0, 0), Some((140, 140)), ""));
         // The scope height shows from frame 2, within 2 rows.
-        t.push(&frame(2), &decision((0, 0), Some((279, 281)), ""));
-        t.push(&frame(3), &decision((0, 0), Some((280, 279)), ""));
-        t.push(
-            &frame(7),
+        push(&mut t, 2, &decision((0, 0), Some((279, 281)), ""));
+        push(&mut t, 3, &decision((0, 0), Some((280, 279)), ""));
+        push(
+            &mut t,
+            7,
             &decision((280, 279), Some((280, 279)), "zoom in (new)"),
         );
         // Zooming out has no latency.
-        t.push(&frame(9), &decision((0, 0), Some((0, 0)), "zoom out"));
+        push(&mut t, 9, &decision((0, 0), Some((0, 0)), "zoom out"));
         assert_eq!(t.switches.len(), 2);
         assert_eq!(t.switches[0].latency, Some(5));
         assert_eq!(t.switches[0].reason, "zoom in (new)");
