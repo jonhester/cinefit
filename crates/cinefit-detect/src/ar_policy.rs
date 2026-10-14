@@ -103,6 +103,69 @@ impl Default for Params {
     }
 }
 
+impl Params {
+    /// The names [`Params::set`] takes: the fields'.
+    pub const KEYS: &[&str] = &[
+        "tol_ar",
+        "tol_match",
+        "tol_out",
+        "widen_max",
+        "intrude_max",
+        "recent_s",
+        "penalty_s",
+        "idle_reset_s",
+        "ui_hold_s",
+        "threshold_recent",
+        "threshold_known",
+        "threshold_new",
+        "persistence_step",
+        "persistence_max",
+        "inexact",
+        "nonstd_s",
+        "nonstd_cuts",
+    ];
+
+    /// Sets one value by its field's name, for trying a value over saved
+    /// readings (`cinefit replay --readings --set KEY=VALUE`).
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let bad = || format!("{key}: {value} is not a number of the right kind");
+        let rows = || value.parse::<u32>().map_err(|_| bad());
+        let real = || {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(bad)
+        };
+        match key {
+            "tol_ar" => self.tol_ar = rows()?,
+            "tol_match" => self.tol_match = rows()?,
+            "tol_out" => self.tol_out = rows()?,
+            "widen_max" => self.widen_max = rows()?,
+            "intrude_max" => self.intrude_max = rows()?,
+            "nonstd_cuts" => self.nonstd_cuts = rows()?,
+            "recent_s" => self.recent_s = real()?,
+            "penalty_s" => self.penalty_s = real()?,
+            "idle_reset_s" => self.idle_reset_s = real()?,
+            "ui_hold_s" => self.ui_hold_s = real()?,
+            "threshold_recent" => self.threshold_recent = real()?,
+            "threshold_known" => self.threshold_known = real()?,
+            "threshold_new" => self.threshold_new = real()?,
+            "persistence_step" => self.persistence_step = real()?,
+            "persistence_max" => self.persistence_max = real()?,
+            "inexact" => self.inexact = real()?,
+            "nonstd_s" => self.nonstd_s = real()?,
+            _ => {
+                return Err(format!(
+                    "no policy parameter {key}; one of {}",
+                    Self::KEYS.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A crop the policy is considering, and its progress.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Candidate {
@@ -735,6 +798,18 @@ mod tests {
     const H: u32 = 2160;
     const FRAME: f64 = 1.0 / 24.0;
     const FULL: Crop = Crop { top: 0, bottom: 0 };
+
+    #[test]
+    fn every_parameter_is_settable_by_name() {
+        let mut p = Params::default();
+        for k in Params::KEYS {
+            p.set(k, "3").unwrap();
+        }
+        assert_eq!((p.tol_ar, p.threshold_new, p.nonstd_s), (3, 3.0, 3.0));
+        assert!(p.set("tol_ar", "2.5").is_err());
+        assert!(p.set("threshold_new", "fast").is_err());
+        assert!(p.set("threshold_neww", "3").is_err());
+    }
     /// 2.39: 1607 rows, the odd row at the bottom.
     const SCOPE: Crop = Crop {
         top: 276,
