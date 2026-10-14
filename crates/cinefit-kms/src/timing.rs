@@ -1,6 +1,7 @@
 //! Display timing without a display: choosing a mode by its exact rate, and
 //! judging flip pacing. Pure arithmetic, so it is tested anywhere.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -115,7 +116,11 @@ pub struct Pacing {
     /// skipped vblank showed the previous frame again.
     pub missed: u64,
     pub vblanks_skipped: u64,
-    intervals: Vec<Duration>,
+    /// How many flips landed after each interval. Not a list: a service runs
+    /// for days. DRM stamps flips in whole microseconds and these intervals
+    /// are one vblank apart, so the distinct values are few, and the summary
+    /// stays exact.
+    intervals: BTreeMap<Duration, u64>,
     last: Option<(u32, Duration)>,
 }
 
@@ -131,14 +136,14 @@ impl Pacing {
             // Pacing is judged on flips that landed on consecutive vblanks;
             // a skipped vblank is counted above, not averaged in here.
             if vblanks == 1 {
-                self.intervals.push(at.saturating_sub(t));
+                *self.intervals.entry(at.saturating_sub(t)).or_default() += 1;
             }
         }
         self.last = Some((sequence, at));
     }
 
     pub fn summary(&self, period: Duration) -> String {
-        let n = self.intervals.len();
+        let n: u64 = self.intervals.values().sum();
         let mut s = format!(
             "flips: {}, missed: {} ({} vblanks skipped)\n",
             self.flips, self.missed, self.vblanks_skipped
@@ -147,15 +152,21 @@ impl Pacing {
             return s;
         }
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        let mean = self.intervals.iter().map(|d| ms(*d)).sum::<f64>() / n as f64;
-        let min = self.intervals.iter().min().map_or(0.0, |d| ms(*d));
-        let max = self.intervals.iter().max().map_or(0.0, |d| ms(*d));
-        let target = ms(period);
-        let within = self
+        let mean = self
             .intervals
             .iter()
-            .filter(|d| (ms(**d) - target).abs() <= 0.5)
-            .count();
+            .map(|(d, &c)| ms(*d) * c as f64)
+            .sum::<f64>()
+            / n as f64;
+        let min = self.intervals.keys().next().map_or(0.0, |d| ms(*d));
+        let max = self.intervals.keys().next_back().map_or(0.0, |d| ms(*d));
+        let target = ms(period);
+        let within: u64 = self
+            .intervals
+            .iter()
+            .filter(|(d, _)| (ms(**d) - target).abs() <= 0.5)
+            .map(|(_, &c)| c)
+            .sum();
         s.push_str(&format!(
             "flip interval: mean {mean:.4} ms, min {min:.4}, max {max:.4}, target {target:.4}\n\
              within 0.5 ms of target: {within} of {n} ({:.4}%)\n",
@@ -241,6 +252,27 @@ mod tests {
     }
 
     #[test]
+    fn a_day_of_flips_keeps_a_few_entries_and_an_exact_summary() {
+        // A day at 59.94 with the microsecond jitter real flips show.
+        let period = uhd_60().period();
+        let mut p = Pacing::default();
+        let mut at = Duration::ZERO;
+        for k in 0..5_200_000u32 {
+            p.on_flip(k, at);
+            let jitter = Duration::from_micros(u64::from(k % 7));
+            at += Duration::from_micros(period.as_micros() as u64) + jitter;
+            at -= Duration::from_micros(3);
+        }
+        assert!(p.intervals.len() <= 7, "{}", p.intervals.len());
+        let s = p.summary(period);
+        assert!(
+            s.contains("within 0.5 ms of target: 5199999 of 5199999"),
+            "{s}"
+        );
+        assert!(s.contains("flips: 5200000, missed: 0"), "{s}");
+    }
+
+    #[test]
     fn a_skipped_vblank_is_a_miss_not_a_long_interval() {
         let period = uhd_23976().period();
         let mut p = Pacing::default();
@@ -249,7 +281,7 @@ mod tests {
         p.on_flip(13, period * 3); // vblank 12 showed frame 11 again
         p.on_flip(14, period * 4);
         assert_eq!((p.missed, p.vblanks_skipped), (1, 1));
-        assert_eq!(p.intervals.len(), 2);
+        assert_eq!(p.intervals.values().sum::<u64>(), 2);
     }
 
     #[test]

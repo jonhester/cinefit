@@ -21,6 +21,7 @@ use crate::menu::Menu;
 use crate::osd::{BannerText, Encoding, InfoSection, InfoText};
 use crate::runlog;
 use crate::status::{self, Window};
+use crate::times::Times;
 use crate::ui::{Slate, Ui};
 use crate::web::Web;
 use cinefit_decklink::{
@@ -608,24 +609,8 @@ struct Sources<'p> {
 /// Per-stage times, milliseconds.
 #[derive(Default)]
 struct Stages {
-    unpack: Vec<f64>,
-    render: Vec<f64>,
-}
-
-impl Stages {
-    fn line(name: &str, v: &mut [f64]) -> String {
-        if v.is_empty() {
-            return format!("{name}: none\n");
-        }
-        v.sort_by(f64::total_cmp);
-        let at = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
-        format!(
-            "{name}: median {:.2} ms, p95 {:.2}, max {:.2}\n",
-            at(0.5),
-            at(0.95),
-            at(1.0)
-        )
-    }
+    unpack: Times,
+    render: Times,
 }
 
 /// Where a frame is rendered: a scanout buffer of the output's size, in the
@@ -1334,8 +1319,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     if opts.dry_run {
         info!(
             "dry run: first frame rendered into a scanout buffer ({:.2} ms unpack, {:.2} ms render)",
-            stages.unpack.first().copied().unwrap_or(0.0),
-            stages.render.first().copied().unwrap_or(0.0)
+            stages.unpack.first().unwrap_or(0.0),
+            stages.render.first().unwrap_or(0.0)
         );
         // A signal is not a picture: look at the pixels.
         let fourcc = out.export(buffers[0])?.fourcc;
@@ -1836,7 +1821,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         )?;
                         ready = Some(free);
                         ui.set_slate(None);
-                        if let Some(&r) = stages.render.last() {
+                        if let Some(r) = stages.render.last() {
                             // The frame's whole work, as it ran: detect beside
                             // the upload, then the draw.
                             window.borrow_mut().render(Instant::now(), r, ms(started));
@@ -2039,13 +2024,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     for (name, period, pacing) in &finished {
         info!("{name}: {}", pacing.summary(*period).trim_end());
     }
+    info!("{}", stages.unpack.line("unpack, with upload").trim_end());
     info!(
         "{}",
-        Stages::line("unpack, with upload", &mut stages.unpack).trim_end()
-    );
-    info!(
-        "{}",
-        Stages::line("render, with the wait for the GPU", &mut stages.render).trim_end()
+        stages
+            .render
+            .line("render, with the wait for the GPU")
+            .trim_end()
     );
     looped
 }
