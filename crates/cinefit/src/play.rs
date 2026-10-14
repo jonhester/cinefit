@@ -523,71 +523,6 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
     peak
 }
 
-/// The preview's size: a sixth of the 4096 x 2160 raster each way.
-const PREVIEW: (usize, usize) = (682, 360);
-
-/// The frame just drawn, drawn again into a small target in SDR BT.709:
-/// what the web page shows, read back later without waiting (see the
-/// caller). Its own stage times, so the run's are the frames' alone.
-#[allow(clippy::too_many_arguments)]
-fn render_preview<'p>(
-    pl: &'p Placebo,
-    tex: &mut Option<cinefit_render::Rgba16Target<'p>>,
-    info: &FrameInfo,
-    kind: Kind,
-    tunnel: Option<&Tunnel>,
-    sources: &mut Sources<'p>,
-    view: View,
-    out: (u32, u32),
-    c: &Config,
-) -> Result<(), Box<dyn Error>> {
-    let (w, h) = PREVIEW;
-    if tex.is_none() {
-        *tex = Some(pl.target_rgba16(w, h)?);
-    }
-    let t = tex.as_ref().expect("made above");
-    let (sx, sy) = (w as f32 / out.0 as f32, h as f32 / out.1 as f32);
-    let small = View {
-        src: view.src,
-        dst: view.dst.map(|r| Rect {
-            x0: r.x0 * sx,
-            y0: r.y0 * sy,
-            x1: r.x1 * sx,
-            y1: r.y1 * sy,
-        }),
-    };
-    let dst = Target {
-        tex: t.texture(),
-        color: RgbColor {
-            primaries: Primaries::Bt709,
-            transfer: Transfer::Bt1886,
-        },
-        rgb_range: c.rgb_range,
-        white_nits: f32::from(c.white_nits),
-        curve: c.curve,
-        lldv: c.lldv,
-        source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
-        view: small,
-    };
-    draw(
-        pl,
-        info,
-        kind,
-        tunnel,
-        sources,
-        &dst,
-        &mut Stages::default(),
-    )?;
-    Ok(())
-}
-
-/// A read-back preview as 8-bit RGB.
-fn preview_rgb(rgba: &[u16]) -> Vec<u8> {
-    rgba.chunks(4)
-        .flat_map(|p| [p[0] >> 8, p[1] >> 8, p[2] >> 8].map(|v| v as u8))
-        .collect()
-}
-
 /// A picture size as people say it.
 fn size_name(width: u32, height: u32) -> String {
     match (width, height) {
@@ -1441,11 +1376,6 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut wait_changed = false;
     let mut info_at: Option<Instant> = None;
     let mut read_back_logged = false;
-    // The web page's preview: its small target, made when first wanted, and
-    // when the last was made.
-    let mut preview_tex: Option<cinefit_render::Rgba16Target> = None;
-    let (mut preview_at, mut previews): (Option<Instant>, u32) = (None, 0);
-    let mut preview_busy = false;
     let mut cur_mode = mode;
     let now = Instant::now();
     match (&start_key, &start_input) {
@@ -1654,11 +1584,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let brightest = window.borrow_mut().brightest(now);
                 // The frame on screen, read back: what the projector is
                 // sent. A mapping of the buffer, so timed and logged once.
-                // Only while the panel or a page's preview is looking.
                 let read_at = Instant::now();
                 // Only while the panel is open: mapping the output buffer
-                // copies all of it off the GPU, ~13 ms (the web page's
-                // preview is a small render of its own instead).
+                // copies all of it off the GPU, ~13 ms.
                 let shown = if ui.info_open() {
                     out.read_scanout(buffers[front], |px, stride| {
                         scanout_peak(px, stride, scan_fourcc, size)
@@ -1908,62 +1836,6 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         )?;
                         ready = Some(free);
                         ui.set_slate(None);
-                        // The web page's preview, when one is due: the same
-                        // frame drawn again, small and in ordinary SDR, for
-                        // a phone. About a millisecond on the GPU and a 2 MB
-                        // download, against mapping the whole output.
-                        if let Some(wb) = &web {
-                            // The last preview's read-back, if it has come.
-                            if let Some(rgba) = preview_tex.as_mut().and_then(|t| t.take_download())
-                            {
-                                preview_busy = false;
-                                let (w, h) = PREVIEW;
-                                wb.set_preview(w as u16, h as u16, preview_rgb(&rgba));
-                            }
-                            if let Some(every) = wb.preview_every()
-                                && !preview_busy
-                                && preview_at.is_none_or(|t| t.elapsed() >= every)
-                            {
-                                let t0 = Instant::now();
-                                preview_at = Some(t0);
-                                let made = render_preview(
-                                    &pl,
-                                    &mut preview_tex,
-                                    &frame_info,
-                                    k.kind,
-                                    last_tunnel.as_ref(),
-                                    &mut sources,
-                                    view,
-                                    size,
-                                    &cfg,
-                                )
-                                .and_then(|()| {
-                                    let t = preview_tex.as_mut().expect("made by render_preview");
-                                    Ok(t.start_download()?)
-                                });
-                                match made {
-                                    Ok(started) => {
-                                        preview_busy = started;
-                                        // The first includes making the target
-                                        // and its shaders; the tenth is the
-                                        // cost that repeats.
-                                        previews += 1;
-                                        if previews == 1 || previews == 10 {
-                                            info!(
-                                                "web: preview made in {:.1} ms on the frame thread ({})",
-                                                ms(t0),
-                                                if previews == 1 {
-                                                    "the first"
-                                                } else {
-                                                    "the tenth"
-                                                }
-                                            );
-                                        }
-                                    }
-                                    Err(e) => warn!("web: no preview: {e}"),
-                                }
-                            }
-                        }
                         if let Some(&r) = stages.render.last() {
                             // The frame's whole work, as it ran: detect beside
                             // the upload, then the draw.

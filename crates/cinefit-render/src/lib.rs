@@ -460,20 +460,6 @@ pub struct Rgba16Target<'p> {
     tex: Texture<'p>,
     width: usize,
     height: usize,
-    /// The asynchronous read-back, made when first started; destroyed
-    /// before the texture (see `Drop`).
-    readback: Option<std::ptr::NonNull<ffi::Readback>>,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for Rgba16Target<'_> {
-    fn drop(&mut self) {
-        if let Some(r) = self.readback.take() {
-            // SAFETY: made by cf_pl_readback_create for this target's
-            // texture, which is still alive: fields drop after this body.
-            unsafe { ffi::cf_pl_readback_destroy(r.as_ptr()) }
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -499,45 +485,6 @@ impl<'p> Rgba16Target<'p> {
             )
         };
         if rc == 0 { Ok(out) } else { Err(Error::Render) }
-    }
-
-    /// Starts reading it back without waiting for the GPU: for a preview
-    /// made every frame. `false` while the last one is still in flight or
-    /// not yet taken.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Render`] if the read-back cannot be made or started.
-    pub fn start_download(&mut self) -> Result<bool, Error> {
-        let r = match self.readback {
-            Some(r) => r,
-            None => {
-                // SAFETY: the texture belongs to this live device.
-                let r = unsafe {
-                    ffi::cf_pl_readback_create(self.tex.pl.handle.as_ptr(), self.tex.tex.as_ptr())
-                };
-                let r = std::ptr::NonNull::new(r).ok_or(Error::Render)?;
-                self.readback = Some(r);
-                r
-            }
-        };
-        // SAFETY: a live read-back of this live texture.
-        match unsafe { ffi::cf_pl_readback_start(r.as_ptr()) } {
-            1 => Ok(true),
-            0 => Ok(false),
-            _ => Err(Error::Render),
-        }
-    }
-
-    /// The last started read-back, if it has finished: `width * height`
-    /// RGBA values, rows packed.
-    pub fn take_download(&mut self) -> Option<Vec<u16>> {
-        let r = self.readback?;
-        let mut out = vec![0u16; self.width * self.height * 4];
-        // SAFETY: `out` holds the w * h * 4 values the shim copies; a live
-        // read-back of this live texture.
-        let rc = unsafe { ffi::cf_pl_readback_take(r.as_ptr(), out.as_mut_ptr()) };
-        (rc == 1).then_some(out)
     }
 }
 
@@ -932,7 +879,6 @@ impl Placebo {
                 tex: Texture { pl: self, tex },
                 width,
                 height,
-                readback: None,
             })
             .ok_or(Error::Render)
     }

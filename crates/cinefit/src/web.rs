@@ -7,26 +7,16 @@
 //! again a second later. A change posted from the page is checked against
 //! the settings table here, so a bad value is refused at once, and queued
 //! for `play`, which applies and saves it exactly as a change from the menu
-//! ([`Web::take_changes`]). The preview is a small copy of the frame on
-//! screen, made only while a page is looking (see below); it is encoded
-//! here.
+//! ([`Web::take_changes`]). No picture of the screen: a preview is being
+//! worked out on its own branch (`preview-720`).
 //!
-//! The preview is a small render of each frame, made beside the frame on
-//! screen, in ordinary SDR BT.709 so it looks right on a phone: once a
-//! second while a page shows a still, and every frame while a page watches
-//! the stream ([`Web::preview_every`]), read back without the frame thread
-//! waiting for the GPU.
-//!
-//! Endpoints: `/` the page; `/api/state` the snapshot; `/api/preview.jpg`;
-//! `/api/stream.mjpg`, the preview as a motion-JPEG stream;
+//! Endpoints: `/` the page; `/api/state` the snapshot;
 //! `POST /api/set` with `{"key": …, "value": …}`; `/api/logs` and
 //! `/api/logs/<name>` the run logs in `~/cinefit-logs`.
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use log::{info, warn};
 use serde_json::{Value as Json, json};
@@ -37,16 +27,6 @@ use crate::config::{self, Apply, Config, Kind};
 /// The page, with its style and script, in the binary.
 const PAGE: &str = include_str!("../assets/web/index.html");
 
-/// A page that asked for the preview this recently is still watching.
-const WATCHING: Duration = Duration::from_secs(3);
-/// How often the preview is made: for a still, and while streaming (every
-/// frame).
-const STILL_EVERY: Duration = Duration::from_secs(1);
-const STREAM_EVERY: Duration = Duration::ZERO;
-
-/// A preview: its number, width, height and RGB bytes.
-type Preview = (u64, u16, u16, Vec<u8>);
-
 /// What `play` and the server share.
 #[derive(Default)]
 struct Shared {
@@ -54,14 +34,6 @@ struct Shared {
     state: Mutex<String>,
     /// The settings as they are, to check a change against.
     config: Mutex<Option<Config>>,
-    /// The last preview: its number, width, height and RGB bytes, encoded
-    /// on request; `fresh` wakes the streams when a new one comes.
-    preview: Mutex<Option<Preview>>,
-    fresh: Condvar,
-    /// Pages watching the stream.
-    streams: AtomicUsize,
-    /// When a page last asked for the preview.
-    asked: Mutex<Option<Instant>>,
     /// Changes posted from the page, for `play` to apply: key and value as
     /// typed, already checked.
     changes: Mutex<Vec<(String, String)>>,
@@ -110,26 +82,6 @@ impl Web {
         *lock(&self.shared.config) = Some(config.clone());
     }
 
-    /// How often `play` should make a preview, or `None` while no page is
-    /// looking at one.
-    pub fn preview_every(&self) -> Option<Duration> {
-        if self.shared.streams.load(Ordering::Relaxed) > 0 {
-            Some(STREAM_EVERY)
-        } else if lock(&self.shared.asked).is_some_and(|t| t.elapsed() < WATCHING) {
-            Some(STILL_EVERY)
-        } else {
-            None
-        }
-    }
-
-    /// A preview, RGB, `w` by `h`.
-    pub fn set_preview(&self, w: u16, h: u16, rgb: Vec<u8>) {
-        let mut p = lock(&self.shared.preview);
-        let n = p.as_ref().map_or(0, |x| x.0 + 1);
-        *p = Some((n, w, h, rgb));
-        self.shared.fresh.notify_all();
-    }
-
     /// Changes posted since the last call, oldest first.
     pub fn take_changes(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *lock(&self.shared.changes))
@@ -147,7 +99,7 @@ fn json_response(code: u16, body: &Json) -> Response<std::io::Cursor<Vec<u8>>> {
         .with_header(header("Cache-Control", "no-store"))
 }
 
-fn serve(s: &Arc<Shared>, mut request: tiny_http::Request) {
+fn serve(s: &Shared, mut request: tiny_http::Request) {
     let url = request.url().split('?').next().unwrap_or("").to_string();
     let reply = match (request.method(), url.as_str()) {
         (Method::Get, "/") => Response::from_string(PAGE)
@@ -159,26 +111,6 @@ fn serve(s: &Arc<Shared>, mut request: tiny_http::Request) {
                 .with_header(header("Content-Type", "application/json"))
                 .with_header(header("Cache-Control", "no-store"))
                 .boxed()
-        }
-        (Method::Get, "/api/preview.jpg") => {
-            *lock(&s.asked) = Some(Instant::now());
-            let frame = lock(&s.preview).clone();
-            match frame.and_then(|(_, w, h, rgb)| jpeg(w, h, &rgb)) {
-                Some(bytes) => Response::from_data(bytes)
-                    .with_header(header("Content-Type", "image/jpeg"))
-                    .with_header(header("Cache-Control", "no-store"))
-                    .boxed(),
-                None => Response::empty(204).boxed(),
-            }
-        }
-        (Method::Get, "/api/stream.mjpg") => {
-            // Its own thread: a stream lasts as long as the page is open,
-            // and the other requests must not wait for it.
-            let s = Arc::clone(s);
-            let _ = std::thread::Builder::new()
-                .name("web-stream".into())
-                .spawn(move || stream(&s, request));
-            return;
         }
         (Method::Post, "/api/set") => {
             let mut body = String::new();
@@ -198,74 +130,6 @@ fn serve(s: &Arc<Shared>, mut request: tiny_http::Request) {
         _ => Response::empty(404).boxed(),
     };
     let _ = request.respond(reply);
-}
-
-/// Counts a stream while it lasts, however it ends.
-struct Watching<'a>(&'a AtomicUsize);
-
-impl Drop for Watching<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// The preview as a motion-JPEG stream: each new frame as one part, until
-/// the page goes away (a write fails) or nothing new comes for a while.
-/// Written straight to the connection and flushed part by part: tiny_http's
-/// own chunked responses hold back 8 KB, which would keep each frame's tail
-/// until the next frame came.
-fn stream(s: &Shared, request: tiny_http::Request) {
-    use std::io::Write;
-    s.streams.fetch_add(1, Ordering::Relaxed);
-    let _counted = Watching(&s.streams);
-    let mut w = request.into_writer();
-    let head = "HTTP/1.1 200 OK\r\n\
-                Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\
-                Cache-Control: no-store\r\n\
-                Connection: close\r\n\r\n";
-    if w.write_all(head.as_bytes())
-        .and_then(|()| w.flush())
-        .is_err()
-    {
-        return;
-    }
-    let mut last = None;
-    while let Some(part) = next_part(s, &mut last) {
-        if w.write_all(&part).and_then(|()| w.flush()).is_err() {
-            return;
-        }
-    }
-}
-
-/// The next part of a stream: waits for a preview newer than `last`, or
-/// `None` after ten seconds without one (cinefit stopped, or no picture), and
-/// the page starts over.
-fn next_part(s: &Shared, last: &mut Option<u64>) -> Option<Vec<u8>> {
-    let mut p = lock(&s.preview);
-    loop {
-        if let Some((n, w, h, rgb)) = p.as_ref()
-            && Some(*n) != *last
-        {
-            *last = Some(*n);
-            let jpg = jpeg(*w, *h, rgb)?;
-            let mut part = format!(
-                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                jpg.len()
-            )
-            .into_bytes();
-            part.extend_from_slice(&jpg);
-            part.extend_from_slice(b"\r\n");
-            return Some(part);
-        }
-        let (guard, timeout) = s
-            .fresh
-            .wait_timeout(p, Duration::from_secs(10))
-            .unwrap_or_else(PoisonError::into_inner);
-        p = guard;
-        if timeout.timed_out() {
-            return None;
-        }
-    }
 }
 
 /// A change from the page: checked against the table now, queued for
@@ -290,15 +154,6 @@ fn set(s: &Shared, body: &str) -> (u16, Json) {
     }
     lock(&s.changes).push((key, value));
     (200, json!({"ok": true}))
-}
-
-/// The preview as a JPEG.
-fn jpeg(w: u16, h: u16, rgb: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    jpeg_encoder::Encoder::new(&mut out, 80)
-        .encode(rgb, w, h, jpeg_encoder::ColorType::Rgb)
-        .ok()?;
-    Some(out)
 }
 
 fn log_dir() -> Option<PathBuf> {
@@ -501,43 +356,7 @@ mod tests {
             web.take_changes(),
             [("detect.crop".to_string(), "off".to_string())]
         );
-        // No preview yet: empty, and the page is now watching.
-        assert!(http(port, "GET /api/preview.jpg HTTP/1.0\r\n\r\n").contains(" 204 "));
-        assert_eq!(web.preview_every(), Some(STILL_EVERY));
         assert!(http(port, "GET /nothing HTTP/1.0\r\n\r\n").contains(" 404 "));
-
-        // The stream: counted while open, and a frame arrives as a JPEG part.
-        use std::io::Write;
-        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        c.write_all(b"GET /api/stream.mjpg HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let t0 = Instant::now();
-        while web.preview_every() != Some(STREAM_EVERY) {
-            assert!(
-                t0.elapsed() < Duration::from_secs(2),
-                "the stream was not counted"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        web.set_preview(8, 8, vec![200; 8 * 8 * 3]);
-        let mut got = Vec::new();
-        let mut buf = [0u8; 4096];
-        while !got.windows(2).any(|w| w == [0xFF, 0xD9]) {
-            let n = c.read(&mut buf).unwrap();
-            assert!(n > 0, "the stream ended early");
-            got.extend_from_slice(&buf[..n]);
-        }
-        let text = String::from_utf8_lossy(&got);
-        assert!(
-            text.contains("multipart/x-mixed-replace; boundary=frame"),
-            "{text:.200}"
-        );
-        assert!(
-            text.contains("--frame\r\nContent-Type: image/jpeg"),
-            "{text:.200}"
-        );
-        drop(c);
     }
 
     #[test]
@@ -545,13 +364,5 @@ mod tests {
         for bad in ["../x.log", "a/b.log", "", "x.txt", "..log", "x .log"] {
             assert!(log_text(bad).is_none(), "{bad}");
         }
-    }
-
-    #[test]
-    fn a_preview_encodes() {
-        let (w, h) = (64u16, 36u16);
-        let rgb = vec![128u8; usize::from(w) * usize::from(h) * 3];
-        let j = jpeg(w, h, &rgb).unwrap();
-        assert_eq!(&j[..2], &[0xFF, 0xD8], "a JPEG starts with SOI");
     }
 }

@@ -58,12 +58,6 @@ pub struct Tex {
 }
 
 #[cfg(target_os = "linux")]
-#[repr(C)]
-pub struct Readback {
-    _opaque: [u8; 0],
-}
-
-#[cfg(target_os = "linux")]
 pub type LogCallback = unsafe extern "C" fn(ctx: *mut c_void, level: c_int, msg: *const c_char);
 
 #[cfg(target_os = "linux")]
@@ -174,10 +168,6 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn cf_pl_target_rgba16(pl: *mut Handle, w: c_int, h: c_int) -> *mut Tex;
     pub fn cf_pl_download_rgba16(pl: *mut Handle, tex: *mut Tex, out: *mut u16) -> c_int;
-    pub fn cf_pl_readback_create(pl: *mut Handle, tex: *mut Tex) -> *mut Readback;
-    pub fn cf_pl_readback_start(r: *mut Readback) -> c_int;
-    pub fn cf_pl_readback_take(r: *mut Readback, out: *mut u16) -> c_int;
-    pub fn cf_pl_readback_destroy(r: *mut Readback);
 }
 
 // The colour constants in `shim/placebo.h`.
