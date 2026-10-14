@@ -54,6 +54,12 @@ On the machine with the hardware:
     cinefit play -t 30                 # capture to screen: puts the input on the display
     cinefit settings [--toml]          # every setting: value, range, cost, help
 
+The installed service runs `~/cinefit-app/current play`, never a working
+tree. `tools/install.sh` builds the tree, copies it there with its libplacebo
+and repoints `current`; `--rollback` and `--cpp` switch builds. It restarts
+the service only with `RESTART=1`: a restart is a resync on the projector, so
+not while someone is watching.
+
 `CINEFIT_STILLS=DIR cargo test --release -p cinefit-detect --test stills` reads
 the stills set and must match the C++ detector's baseline exactly.
 `CINEFIT_DOVI_DUMPS=DIR cargo test -p cinefit-dovi --test dumps` decodes saved

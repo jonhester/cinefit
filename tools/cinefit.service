@@ -1,0 +1,44 @@
+# cinefit as the system's service. tools/install.sh fills in @USER@, @GROUP@
+# and @HOME@ and prints the one-time steps that install it; after that,
+# upgrading, rolling back and switching builds need no root (see install.sh).
+[Unit]
+Description=cinefit: the capture card to the projector
+# The display and the capture card have one owner at a time: another service
+# that drives them stops cinefit when it starts, and the other way round.
+Conflicts=voidvideo.service
+After=voidvideo.service
+# Restart forever: with the display or the capture card missing, cinefit exits
+# and tries again every RestartSec, and comes back by itself once they are there.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+
+# A symlink to the build to run, which only tools/install.sh writes; never a
+# working tree, where a rebuild would change what runs mid-film. Settings come
+# from ~/.config/cinefit-rs/cinefit.toml and each run's log goes to
+# ~/cinefit-logs, so there are no flags here.
+WorkingDirectory=@HOME@/cinefit-app
+ExecStart=@HOME@/cinefit-app/current play
+
+# The capture card's module loads through udev, which can lose a race with
+# early boot. Wait for its node, but start anyway if it never appears: cinefit
+# then exits and Restart= keeps trying.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/blackmagic/io0 ] && exit 0; sleep 1; done; echo "DeckLink not present after 30s; starting without it" >&2'
+
+Restart=always
+RestartSec=5
+
+# cinefit holds DRM master and handles SIGTERM: it writes its summary and lets
+# go of the display. Give it time to.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# `journalctl -u cinefit -f`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

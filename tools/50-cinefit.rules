@@ -1,0 +1,13 @@
+// Lets @USER@ stop, start and restart cinefit.service, and nothing else,
+// without a password: tools/install.sh restarts it onto a new build, and
+// switching builds is a symlink and a restart. tools/install.sh fills in
+// @USER@ and prints the one-time step that installs it.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "cinefit.service" &&
+        subject.user == "@USER@") {
+        var verb = action.lookup("verb");
+        if (verb == "start" || verb == "stop" || verb == "restart")
+            return polkit.Result.YES;
+    }
+});
