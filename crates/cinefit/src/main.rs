@@ -143,9 +143,10 @@ enum Command {
     /// frame rate, with its HDR signalling, and measure what arrived and what
     /// was shown. Needs the input and the display to itself.
     Play {
-        /// How long to run, in seconds.
-        #[arg(short = 't', long, default_value_t = 30.0)]
-        seconds: f64,
+        /// How long to run, in seconds; without it, until stopped (Ctrl-C, or
+        /// SIGTERM from a service manager).
+        #[arg(short = 't', long)]
+        seconds: Option<f64>,
         /// Which capture device, by its index in `cinefit probe`.
         #[arg(short, long, default_value_t = 0)]
         device: usize,
@@ -605,7 +606,7 @@ fn pattern(
 
 #[cfg(target_os = "linux")]
 fn play_options(
-    seconds: f64,
+    seconds: Option<f64>,
     device: usize,
     card: Option<PathBuf>,
     config: config::Config,
@@ -629,7 +630,7 @@ fn play(opts: play::Options) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(target_os = "linux"))]
 fn play_options(
-    _seconds: f64,
+    _seconds: Option<f64>,
     _device: usize,
     _card: Option<PathBuf>,
     _config: config::Config,
