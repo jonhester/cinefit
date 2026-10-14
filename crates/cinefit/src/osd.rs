@@ -615,6 +615,170 @@ pub fn info(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, text: &InfoText) {
     }
 }
 
+/// The menu's size: the banner's 60%, of the mockup's (`docs/ui/menu.png`)
+/// proportions, in its units.
+const MENU_SCALE: f32 = 0.6 * 3.256;
+
+/// The menu's box: top left inside the screen's band, like the banner.
+pub fn menu_area(size: (usize, usize), band_top: usize) -> Area {
+    let r = size.1 as f32 / 2160.0;
+    let s = r * MENU_SCALE;
+    Area {
+        x: (140.0 * r) as usize,
+        y: band_top + (95.0 * r) as usize,
+        w: ((919.0 * s) as usize).min(size.0),
+        h: (495.0 * s) as usize,
+    }
+}
+
+/// The OSD menu (#75): the pages on the left, the open page's settings on
+/// the right, what the highlighted setting costs and the keys underneath,
+/// the version at the foot of the left column.
+pub fn menu(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, m: &crate::menu::MenuText) {
+    let s = c.size().1 as f32 / 2160.0 * MENU_SCALE;
+    let px = |v: f32| (v * s) as usize;
+    let (x0, y0) = (area.x as f32, area.y as f32);
+    c.rect(area, px(18.0), palette::panel(), 0.8);
+    c.outline(area, px(18.0), px(1.5).max(1), palette::hint(), 0.35);
+    let line = |c: &mut Canvas<'_>, a: Area| c.rect(a, 0, palette::hint(), 0.3);
+    line(
+        c,
+        Area {
+            x: area.x + px(251.0),
+            y: area.y + px(20.0),
+            w: px(1.0).max(1),
+            h: px(455.0),
+        },
+    );
+    line(
+        c,
+        Area {
+            x: area.x + px(280.0),
+            y: area.y + px(385.0),
+            w: px(618.0),
+            h: px(1.0).max(1),
+        },
+    );
+    // The wordmark, "fit" in the accent.
+    let wm = Style::new(&fonts.regular, 26.0 * s, palette::text(), Align::Left);
+    let w = c.text(wm, x0 + 37.0 * s, y0 + 55.0 * s, "cine");
+    c.text(
+        Style {
+            colour: palette::accent(),
+            ..wm
+        },
+        x0 + 37.0 * s + w,
+        y0 + 55.0 * s,
+        "fit",
+    );
+    let (row_h, first, size, small) = (63.5 * s, y0 + 109.0 * s, 22.0 * s, 19.0 * s);
+    for (i, name) in m.pages.iter().enumerate() {
+        let cy = first + i as f32 * row_h;
+        let sel = i == m.page;
+        if sel {
+            // Brighter while the pages have the focus.
+            let bg = if m.in_rows { 0x1f1c2c } else { 0x2c2648 };
+            c.rect(
+                Area {
+                    x: area.x + px(18.0),
+                    y: (cy - 26.0 * s) as usize,
+                    w: px(219.0),
+                    h: px(52.0),
+                },
+                px(8.0),
+                Rgb::hex(bg),
+                0.95,
+            );
+        }
+        let (font, col) = if sel {
+            (&fonts.semibold, palette::text())
+        } else {
+            (&fonts.regular, palette::secondary())
+        };
+        c.text(
+            Style::new(font, size, col, Align::Left),
+            x0 + 39.0 * s,
+            cy + 8.0 * s,
+            name,
+        );
+        c.text(
+            Style::new(&fonts.regular, size * 0.8, palette::hint(), Align::Right),
+            x0 + 220.0 * s,
+            cy + 7.0 * s,
+            "\u{203a}",
+        );
+    }
+    c.text(
+        Style::new(&fonts.regular, small, palette::hint(), Align::Left),
+        x0 + 39.0 * s,
+        y0 + 458.0 * s,
+        &m.version,
+    );
+    let crumb = Style::new(&fonts.regular, small, palette::hint(), Align::Left);
+    let w = c.text(crumb, x0 + 280.0 * s, y0 + 53.0 * s, "Menu \u{203a} ");
+    c.text(
+        Style {
+            colour: palette::accent(),
+            ..crumb
+        },
+        x0 + 280.0 * s + w,
+        y0 + 53.0 * s,
+        &m.pages[m.page],
+    );
+    for (i, (label, value, changeable)) in m.rows.iter().enumerate() {
+        let cy = first + i as f32 * row_h;
+        let sel = m.in_rows && i == m.row;
+        if sel {
+            c.rect(
+                Area {
+                    x: area.x + px(269.0),
+                    y: (cy - 26.0 * s) as usize,
+                    w: px(629.0),
+                    h: px(52.0),
+                },
+                px(8.0),
+                Rgb::hex(0x1b1a22),
+                0.95,
+            );
+        }
+        c.text(
+            Style::new(&fonts.regular, size, palette::text(), Align::Left),
+            x0 + 294.0 * s,
+            cy + 8.0 * s,
+            label,
+        );
+        // Read-only rows have no arrows: nothing to change here.
+        let (v, col) = match (changeable, sel) {
+            (false, _) => (value.clone(), palette::secondary()),
+            (true, true) => (format!("\u{2039} {value} \u{203a}"), palette::accent()),
+            (true, false) => (format!("{value} \u{203a}"), palette::secondary()),
+        };
+        c.text(
+            Style::new(&fonts.regular, size, col, Align::Right),
+            x0 + 875.0 * s,
+            cy + 8.0 * s,
+            &v,
+        );
+    }
+    c.text(
+        Style::new(&fonts.regular, small, palette::secondary(), Align::Left),
+        x0 + 294.0 * s,
+        y0 + 422.0 * s,
+        &m.cost,
+    );
+    let keys = if m.in_rows {
+        "\u{2191}\u{2193} choose \u{b7} \u{2190}\u{2192} change \u{b7} Back keeps it, up a level"
+    } else {
+        "\u{2191}\u{2193} choose \u{b7} \u{2192} open \u{b7} Back closes"
+    };
+    c.text(
+        Style::new(&fonts.regular, small, palette::hint(), Align::Left),
+        x0 + 294.0 * s,
+        y0 + 458.0 * s,
+        keys,
+    );
+}
+
 /// For `cinefit pattern --slate`: the slate, a banner, and grey steps at
 /// known fractions of UI white, to judge on the screen that the overlay
 /// shows, and that SDR and HDR10 give it the same light.

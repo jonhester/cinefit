@@ -6,6 +6,8 @@ mod compare;
 mod config;
 mod follow;
 #[cfg(target_os = "linux")]
+mod menu;
+#[cfg(target_os = "linux")]
 mod osd;
 #[cfg(target_os = "linux")]
 mod play;
@@ -293,11 +295,23 @@ fn main() -> ExitCode {
             sets,
             no_pstate,
             dry_run,
-        } => load_config(config.as_deref(), &sets).and_then(|config| {
-            play(play_options(
-                seconds, device, card, config, !no_pstate, dry_run,
-            ))
-        }),
+        } => {
+            let file = config.clone().unwrap_or_else(config::default_path);
+            load_config(config.as_deref(), &sets).and_then(|config| {
+                // The file as it is, without --set: what a change made in
+                // the menu is saved over, so a one-run override never is.
+                let saved = config::load(&file)?;
+                play(play_options(
+                    seconds,
+                    device,
+                    card,
+                    config,
+                    (file, saved),
+                    !no_pstate,
+                    dry_run,
+                ))
+            })
+        }
         Command::Keys { seconds } => keys(seconds),
         Command::Settings { config, toml } => settings(config.as_deref(), toml),
     };
@@ -711,6 +725,7 @@ fn play_options(
     device: usize,
     card: Option<PathBuf>,
     config: config::Config,
+    file: (PathBuf, config::Config),
     pstate: bool,
     dry_run: bool,
 ) -> play::Options {
@@ -719,6 +734,7 @@ fn play_options(
         device,
         card,
         config,
+        file,
         pstate,
         dry_run,
     }
@@ -735,6 +751,7 @@ fn play_options(
     _device: usize,
     _card: Option<PathBuf>,
     _config: config::Config,
+    _file: (PathBuf, config::Config),
     _pstate: bool,
     _dry_run: bool,
 ) {

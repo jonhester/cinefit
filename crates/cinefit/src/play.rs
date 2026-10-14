@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, OutputMode};
+use crate::config::{self, Config, OutputMode};
 use crate::follow;
+use crate::menu::Menu;
 use crate::osd::{BannerText, Encoding, InfoSection, InfoText};
 use crate::runlog;
 use crate::status::{self, Window};
@@ -70,9 +71,11 @@ pub struct Options {
     pub seconds: Option<f64>,
     pub device: usize,
     pub card: Option<PathBuf>,
-    /// The settings: the panel's size (the output runs at it, at the
-    /// source's rate) and the RGB input range.
+    /// The settings this run starts with: the file's, with any --set.
     pub config: crate::config::Config,
+    /// The settings file and its settings as they are, without --set: a
+    /// change made in the menu is applied to both and saved there.
+    pub file: (PathBuf, crate::config::Config),
     pub pstate: bool,
     /// Everything up to the modeset (pre-roll, mode, signalling, the first
     /// render into a scanout buffer), then stop: the display is not touched.
@@ -631,11 +634,12 @@ struct Target<'a, 'p> {
     color: RgbColor,
     /// What plain RGB input's codes mean (the `input.rgb_range` setting).
     rgb_range: Levels,
-    /// HDR into SDR: what SDR white stands for, the curve, and the peak of
-    /// low-latency Dolby Vision when that input is on (the settings).
+    /// HDR into SDR: what SDR white stands for, which is also the peak
+    /// low-latency Dolby Vision is mapped to, and the curve (the settings).
     white_nits: f32,
     curve: Curve,
-    lldv_nits: Option<f32>,
+    /// Whether SDR BT.2020 input is low-latency Dolby Vision (`input.lldv`).
+    lldv: bool,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
     /// Which part of the frame is drawn and where it lands.
@@ -666,6 +670,27 @@ fn view_for(
     View {
         src: Some(rect(p.src)),
         dst: Some(rect(p.dst)),
+    }
+}
+
+/// What a frame renders into, by the settings as they are now: they can
+/// change mid-run, from the menu.
+fn target<'a, 'p>(
+    targets: &'a [Texture<'p>],
+    b: usize,
+    color: RgbColor,
+    view: View,
+    c: &Config,
+) -> Target<'a, 'p> {
+    Target {
+        tex: &targets[b],
+        color,
+        rgb_range: c.rgb_range,
+        white_nits: f32::from(c.white_nits),
+        curve: c.curve,
+        lldv: c.lldv,
+        source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
+        view,
     }
 }
 
@@ -893,7 +918,7 @@ fn draw<'p>(
         Kind::Ycbcr(color) => {
             // Low-latency Dolby Vision is PQ under its SDR label, already
             // mapped by the player to its peak.
-            let (color, peak) = match dst.lldv_nits {
+            let (color, peak) = match dst.lldv.then_some(dst.white_nits) {
                 Some(nits) if is_lldv(kind, true) => (
                     YcbcrColor {
                         transfer: Transfer::Pq,
@@ -991,6 +1016,10 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
 }
 
 fn play(opts: Options) -> Result<(), Box<dyn Error>> {
+    // The settings as they are now: the menu changes them mid-run, and what
+    // reads them reads this, each time.
+    let mut cfg = opts.config.clone();
+    let (file_path, mut file_cfg) = opts.file.clone();
     let run_for = match opts.seconds {
         None => None,
         Some(s) => Some(
@@ -1099,11 +1128,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     info!("output: {}", out.describe());
     let modes = out.modes();
     let want = cinefit_kms::ModeRequest {
-        width: opts.config.width,
-        height: opts.config.height,
+        width: cfg.width,
+        height: cfg.height,
         refresh_hz: start
             .as_ref()
-            .map_or(opts.config.wait_hz, |s| s.2.frames_per_second()),
+            .map_or(cfg.wait_hz, |s| s.2.frames_per_second()),
     };
     let Some(index) = cinefit_kms::choose_mode(&modes, &want) else {
         info!("progressive modes offered:");
@@ -1120,8 +1149,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     info!("mode: {mode}");
     let (hdr, mut out_color) = match &start {
         Some((key, first, _)) => output_in(
-            opts.config.mode,
-            opts.config.lldv,
+            cfg.mode,
+            cfg.lldv,
             key.kind,
             first.info().color.hdr.as_ref(),
             last_tunnel.as_ref(),
@@ -1138,9 +1167,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             "signalling SDR BT.2020{}",
             match start_kind {
                 None => ", no source".to_string(),
-                Some(k) if is_lldv(k, opts.config.lldv) => format!(
-                    ": low-latency Dolby Vision, {} nits to white at {} nits",
-                    opts.config.lldv_nits, opts.config.white_nits
+                Some(k) if is_lldv(k, cfg.lldv) => format!(
+                    ": low-latency Dolby Vision, passed through at {} nits",
+                    cfg.white_nits
                 ),
                 Some(
                     Kind::Tunnel
@@ -1150,8 +1179,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     }),
                 ) => format!(
                     ": HDR tone-mapped ({}) to white at {} nits",
-                    opts.config.curve.name(),
-                    opts.config.white_nits
+                    cfg.curve.name(),
+                    cfg.white_nits
                 ),
                 _ => String::new(),
             }
@@ -1200,34 +1229,24 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // first frame is the source's.
     let mut sources = Sources::default();
     let mut stages = Stages::default();
-    let target = |b: usize, color: RgbColor, view: View| Target {
-        tex: &targets[b],
-        color,
-        rgb_range: opts.config.rgb_range,
-        white_nits: f32::from(opts.config.white_nits),
-        curve: opts.config.curve,
-        lldv_nits: opts.config.lldv.then_some(f32::from(opts.config.lldv_nits)),
-        source_peak: (opts.config.source_peak > 0).then_some(f32::from(opts.config.source_peak)),
-        view,
-    };
 
     // The bar detector reads each YCbCr frame on this thread (about 8 ms at
     // 2160p) and its crop goes to the geometry: the picture at constant
     // image height in the screen's band of the raster. Other formats, which
     // have no adapter yet, keep the last crop.
-    let win = geo::screen_window(size.0, size.1, opts.config.screen_ar);
-    if opts.config.crop {
+    let mut win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
+    if cfg.crop {
         info!(
             "crop: on; screen {:.2}:1 is rows {}-{} of the raster, fill up to {:.2}:1",
-            opts.config.screen_ar,
+            cfg.screen_ar,
             win.y,
             win.y + win.h,
-            opts.config.fill_max_ar
+            cfg.fill_max_ar
         );
     }
     let mut finder = CropFinder {
         det: Detector::default(),
-        on: opts.config.crop,
+        on: cfg.crop,
         crops: 0,
     };
     // For the info panel: the last ten seconds' timings, and when and why
@@ -1275,7 +1294,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 size,
                 win,
                 source,
-                opts.config.fill_max_ar,
+                cfg.fill_max_ar.value(),
             );
             if !uploaded {
                 return Err("the first frame could not be rendered".into());
@@ -1286,7 +1305,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 key.kind,
                 last_tunnel.as_ref(),
                 &mut sources,
-                &target(0, out_color, view),
+                &target(&targets, 0, out_color, view, &cfg),
                 &mut stages,
             )?;
             let place = view
@@ -1296,7 +1315,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         }
         None => {
             pl.clear_black(&targets[0])?;
-            let none = if opts.config.crop {
+            let none = if cfg.crop {
                 geo::Source::Rows { top: 0, bottom: 0 }
             } else {
                 geo::Source::Whole
@@ -1333,12 +1352,25 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         index,
         size,
         (win.y, win.h),
-        &opts.config.venue,
-        opts.config.banners,
+        &cfg.venue,
+        cfg.banners,
     );
     let mut enc = encoding_for(signal_of(hdr));
     // The remote and keyboards, read on their own thread.
     let keys = KeyReader::start(Path::new("/dev/input"), |line| info!("{line}"));
+    // The menu, with the rates the display offers at the panel's size for
+    // the rate while waiting.
+    let mut rates: Vec<f64> = modes
+        .iter()
+        .filter(|m| !m.interlaced && (m.width, m.height) == (cfg.width, cfg.height))
+        .map(|m| (m.refresh_hz() * 1000.0).round() / 1000.0)
+        .collect();
+    rates.sort_by(f64::total_cmp);
+    rates.dedup();
+    let mut menu = Menu::new(rates, crate::VERSION.split(' ').next().unwrap_or("?"));
+    // A rate-while-waiting change made while waiting: the output follows it
+    // (a modeset) until a source comes.
+    let mut wait_changed = false;
     let mut info_at: Option<Instant> = None;
     let mut read_back_logged = false;
     let mut cur_mode = mode;
@@ -1442,13 +1474,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     match (last_key.filter(|_| !dark), brightest) {
                         (Some(k), Some(b)) => format!(
                             "; in {}, out {}",
-                            peak_words(
-                                k.kind,
-                                b,
-                                opts.config.lldv.then_some(opts.config.lldv_nits)
-                            ),
+                            peak_words(k.kind, b, cfg.lldv.then_some(cfg.white_nits)),
                             shown
-                                .and_then(|v| out_nits(v, signal, opts.config.white_nits))
+                                .and_then(|v| out_nits(v, signal, cfg.white_nits))
                                 .map_or_else(|| "-".into(), |n| format!("brightest {n:.0} nits"))
                         ),
                         _ => String::new(),
@@ -1473,19 +1501,62 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     run_started.elapsed().as_secs_f64(),
                     a.name()
                 );
+                // While the menu is open it takes every key but Info.
+                if a == Action::Menu || (menu.is_open() && a != Action::Info) {
+                    let Some((key, value)) = menu.key(a, &cfg, Instant::now()) else {
+                        continue;
+                    };
+                    let setting = config::find(key).expect("the menu's rows are settings");
+                    if let Err(e) = setting.put(&mut cfg, &value) {
+                        warn!("menu: {key} = {value} refused: {e}");
+                        continue;
+                    }
+                    // Saved over the file as it is, without --set.
+                    let _ = setting.put(&mut file_cfg, &value);
+                    let saved = match config::save(&file_cfg, &file_path) {
+                        Ok(()) => "saved".to_string(),
+                        Err(e) => format!("not saved: {e}"),
+                    };
+                    info!(
+                        "{:.1} s: menu: {key} = {value} ({}, {saved})",
+                        run_started.elapsed().as_secs_f64(),
+                        setting.apply
+                    );
+                    // What reads it each frame needs nothing; the rest is
+                    // told here.
+                    match key {
+                        "detect.crop" => finder.on = cfg.crop,
+                        "geometry.screen_ar" => {
+                            win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
+                            ui.set_band((win.y, win.h));
+                        }
+                        "osd.banners" => ui.set_banners(cfg.banners),
+                        "output.wait_hz" => wait_changed = dark,
+                        _ => {}
+                    }
+                    continue;
+                }
                 match a {
                     Action::Info => ui.toggle_info(Instant::now()),
                     Action::Back => ui.close_info(),
-                    // The menu (#75) comes later.
                     _ => {}
                 }
+            }
+            ui.set_menu(menu.view(&cfg, Instant::now()));
+            // Waiting, with the rate changed: ask for it on every pass, as
+            // the policy wants a change held before it modesets.
+            if wait_changed && dark {
+                latest_want = Some(follow::Want {
+                    rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
+                    signal: follow::Signal::Sdr,
+                });
             }
             if !ui.info_open() {
                 info_at = None;
             } else if info_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
                 let now = Instant::now();
                 info_at = Some(now);
-                let rows = opts.config.crop.then_some(match last_source {
+                let rows = cfg.crop.then_some(match last_source {
                     geo::Source::Rows { top, bottom } => (top, bottom),
                     _ => (0, 0),
                 });
@@ -1514,17 +1585,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             last_key,
                             last_format,
                             dark,
-                            opts.config.lldv.then_some(opts.config.lldv_nits),
+                            cfg.lldv.then_some(cfg.white_nits),
                             brightest,
                         ),
                         output_section(
                             last_key,
                             dark,
-                            opts.config.lldv,
+                            cfg.lldv,
                             policy.committed().signal,
                             cur_mode,
                             shown,
-                            opts.config.white_nits,
+                            cfg.white_nits,
                         ),
                         status::crop_section(
                             last_key.filter(|_| !dark).map(|k| (k.width, k.height)),
@@ -1564,6 +1635,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     returns += 1;
                     info!("{:.1} s: signal back", run_started.elapsed().as_secs_f64());
                     dark = false;
+                    wait_changed = false;
                 }
                 last_frame_at = Instant::now();
                 let k = classify(&frame, &mut last_tunnel);
@@ -1629,8 +1701,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         && let Some(f) = *format.lock().unwrap_or_else(PoisonError::into_inner)
                     {
                         let (hdr, _) = output_in(
-                            opts.config.mode,
-                            opts.config.lldv,
+                            cfg.mode,
+                            cfg.lldv,
                             k.kind,
                             frame.info().color.hdr.as_ref(),
                             last_tunnel.as_ref(),
@@ -1682,7 +1754,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         size,
                         win,
                         source,
-                        opts.config.fill_max_ar,
+                        cfg.fill_max_ar.value(),
                     );
                     // Rendered into the output as it stands, which libplacebo maps
                     // to, until the policy moves the output.
@@ -1693,7 +1765,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             k.kind,
                             last_tunnel.as_ref(),
                             &mut sources,
-                            &target(free, out_color, view),
+                            &target(&targets, free, out_color, view, &cfg),
                             &mut stages,
                         )?;
                         ready = Some(free);
@@ -1726,8 +1798,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             match latest_want.take().and_then(|w| policy.next(&w, now)) {
                 Some(a @ follow::Action::Modeset(w)) => {
                     let request = cinefit_kms::ModeRequest {
-                        width: opts.config.width,
-                        height: opts.config.height,
+                        width: cfg.width,
+                        height: cfg.height,
                         refresh_hz: f64::from(w.rate_mhz) / 1000.0,
                     };
                     let hdr = match w.signal {
@@ -1879,7 +1951,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         "followed the source: {} modesets, {} metadata updates without one, {} refused",
         counts.modesets, counts.metadata, counts.refused
     );
-    if opts.config.crop {
+    if cfg.crop {
         let shares: Vec<String> = finder
             .det
             .policy()

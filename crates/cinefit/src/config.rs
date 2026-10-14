@@ -44,15 +44,16 @@ pub struct Config {
     /// Vision is never passed through.
     pub mode: OutputMode,
     /// The brightness, in nits, that the SDR output's white stands for: what
-    /// HDR is mapped down to.
+    /// HDR is mapped down to, and the peak a player's low-latency Dolby
+    /// Vision is taken to be mapped to, so that it passes one to one. One
+    /// setting for both: two that must be equal could drift apart.
     pub white_nits: u16,
     /// The output's rate, in hertz, while there is no source to follow:
     /// the rate the sources start in saves a resync when one comes on.
     pub wait_hz: f64,
     /// Whether YCbCr input labelled SDR BT.2020 is a player's low-latency
-    /// Dolby Vision: PQ already mapped by the player to `lldv_nits`.
+    /// Dolby Vision: PQ already mapped by the player to `white_nits`.
     pub lldv: bool,
-    pub lldv_nits: u16,
     /// The tone curve for HDR into the SDR output.
     pub curve: Curve,
     /// The HDR10 source's peak for the curve, in nits, in place of its
@@ -64,14 +65,55 @@ pub struct Config {
     /// constant image height; off, every frame fills the raster as it came.
     pub crop: bool,
     /// The screen's aspect: the band of the raster that lands on it.
-    pub screen_ar: f64,
+    pub screen_ar: Ratio,
     /// Content wider than this is trimmed at the sides to fill the screen's
-    /// height rather than letterboxed inside it.
-    pub fill_max_ar: f64,
+    /// height rather than letterboxed inside it; 0 is off.
+    pub fill_max_ar: Ratio,
     /// The theater's name, on the waiting slate; empty for none.
     pub venue: String,
     /// A banner on each change of picture type.
     pub banners: bool,
+}
+
+/// An aspect ratio as it was written: `"16:9"` keeps its two sides, so it
+/// is exact and is written back the same way; a plain number is `n:1`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ratio {
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Ratio {
+    pub const fn of(n: f64) -> Self {
+        Self { w: n, h: 1.0 }
+    }
+
+    pub fn value(self) -> f64 {
+        self.w / self.h
+    }
+
+    /// `"16:9"` or `"1.85"`, `"2.39:1"`: anything else is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let num = |t: &str| t.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+        let r = match text.split_once(':') {
+            Some((w, h)) => Self {
+                w: num(w)?,
+                h: num(h)?,
+            },
+            None => Self::of(num(text)?),
+        };
+        (r.h > 0.0 && r.w >= 0.0).then_some(r)
+    }
+}
+
+impl fmt::Display for Ratio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.h == 1.0 {
+            write!(f, "{}", self.w)
+        } else {
+            write!(f, "{}:{}", self.w, self.h)
+        }
+    }
 }
 
 /// What the output sends.
@@ -96,7 +138,6 @@ impl Default for Config {
             white_nits: 96,
             wait_hz: 23.976,
             lldv: true,
-            lldv_nits: 96,
             // libplacebo's own default. Hable ranked closest to Dolby in the
             // C++ version's step zero, but on a stand-in source, and blew out
             // snow on the screen (2026-10-13); no curve has been chosen on
@@ -104,29 +145,28 @@ impl Default for Config {
             curve: Curve::Spline,
             source_peak: 0,
             crop: true,
-            screen_ar: 2.35,
-            fill_max_ar: 2.40,
+            screen_ar: Ratio::of(2.35),
+            fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
             banners: true,
         }
     }
 }
 
-/// What it costs to apply a change: a UI has to show it, because a modeset
-/// blanks the projector for 2-6 s, and it is the contract the code keeps: a
-/// `Live` setting that causes a commit is a bug.
+/// What it costs to apply a change, inside the running process: a UI has to
+/// show it, because a modeset blanks the projector for 2-6 s, and it is the
+/// contract the code keeps: a `Live` setting that causes a commit is a bug.
+/// cinefit never restarts itself for a setting: it cannot know how it is
+/// run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Apply {
-    /// Renderer state only; no commit.
+    /// The next frame uses it; no commit.
     Live,
-    /// An atomic modeset: the projector resyncs.
-    #[expect(
-        dead_code,
-        reason = "no setting costs a modeset yet; the cost belongs in the vocabulary"
-    )]
+    /// An atomic modeset in the same run: the projector resyncs.
     Modeset,
-    /// Read only at startup.
-    Restart,
+    /// Read when cinefit starts. Only the panel's size, which would mean
+    /// rebuilding every output buffer: set once, at installation.
+    Start,
 }
 
 impl fmt::Display for Apply {
@@ -134,7 +174,7 @@ impl fmt::Display for Apply {
         f.write_str(match self {
             Apply::Live => "live",
             Apply::Modeset => "modeset",
-            Apply::Restart => "restart",
+            Apply::Start => "start",
         })
     }
 }
@@ -150,6 +190,9 @@ pub enum Kind {
     Float { min: f64, max: f64 },
     /// Free text, up to this many characters.
     Text { max: usize },
+    /// An aspect ratio, `W:H` or a number, in `min..=max`; with `off`, 0
+    /// too, meaning off.
+    Ratio { min: f64, max: f64, off: bool },
 }
 
 /// One row of the table.
@@ -203,6 +246,23 @@ fn float(v: &Value) -> f64 {
     }
 }
 
+/// A ratio's value as the file writes it: a number, or `"W:H"` as given.
+fn ratio_value(r: Ratio) -> Value {
+    if r.h == 1.0 {
+        Value::Float(r.w)
+    } else {
+        Value::Name(r.to_string())
+    }
+}
+
+fn ratio(v: &Value) -> Ratio {
+    match v {
+        Value::Name(t) => Ratio::parse(t).unwrap_or(Ratio::of(0.0)),
+        Value::Float(x) => Ratio::of(*x),
+        Value::Int(n) => Ratio::of(*n as f64),
+    }
+}
+
 static SETTINGS: &[Setting] = &[
     Setting {
         key: "output.width",
@@ -210,7 +270,7 @@ static SETTINGS: &[Setting] = &[
             min: 640,
             max: 8192,
         },
-        apply: Apply::Restart,
+        apply: Apply::Start,
         help: "The panel's width in pixels: the output's size. 4096 for a 17:9 4K projector.",
         get: |c| Value::Int(c.width.into()),
         set: |c, v| c.width = int(v) as u16,
@@ -221,7 +281,7 @@ static SETTINGS: &[Setting] = &[
             min: 480,
             max: 4320,
         },
-        apply: Apply::Restart,
+        apply: Apply::Start,
         help: "The panel's height in pixels.",
         get: |c| Value::Int(c.height.into()),
         set: |c, v| c.height = int(v) as u16,
@@ -229,7 +289,7 @@ static SETTINGS: &[Setting] = &[
     Setting {
         key: "output.mode",
         kind: Kind::Choice(&["sdr2020", "passthrough"]),
-        apply: Apply::Restart,
+        apply: Apply::Modeset,
         help: "sdr2020: SDR in a BT.2020 container, HDR tone-mapped down to output.white_nits; set the display \
                to an SDR BT.2020 mode. passthrough: HDR10 goes out as HDR10, for the display to map. Dolby \
                Vision always goes out as SDR BT.2020.",
@@ -253,9 +313,10 @@ static SETTINGS: &[Setting] = &[
     Setting {
         key: "output.white_nits",
         kind: Kind::Int { min: 48, max: 1000 },
-        apply: Apply::Restart,
+        apply: Apply::Live,
         help: "The brightness, in nits, that SDR output's white stands for: HDR above it is tone-mapped. \
-               Match input.lldv_nits so a player's low-latency Dolby Vision passes one to one.",
+               Also the peak a player's low-latency Dolby Vision is mapped to, which passes one to one: set \
+               it to what the EDID upstream declares (96 for the usual low-latency Dolby Vision EDIDs).",
         get: |c| Value::Int(c.white_nits.into()),
         set: |c, v| c.white_nits = int(v) as u16,
     },
@@ -265,7 +326,7 @@ static SETTINGS: &[Setting] = &[
             min: 23.0,
             max: 61.0,
         },
-        apply: Apply::Restart,
+        apply: Apply::Modeset,
         help: "The output's rate while no source is playing, with black on screen. A source that starts at the same rate (and SDR) comes up without a resync: 23.976 for an Apple TV set to 23.976, 59.94 for a player whose menus are 59.94.",
         get: |c| Value::Float(c.wait_hz),
         set: |c, v| c.wait_hz = float(v),
@@ -296,27 +357,16 @@ static SETTINGS: &[Setting] = &[
     Setting {
         key: "input.lldv",
         kind: Kind::Choice(&["on", "off"]),
-        apply: Apply::Restart,
+        apply: Apply::Live,
         help: "on: YCbCr input labelled SDR BT.2020 is a player's low-latency Dolby Vision, PQ already mapped \
-               to input.lldv_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
+               to output.white_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
         get: |c| Value::Name(if c.lldv { "on" } else { "off" }.into()),
         set: |c, v| c.lldv = name(v) == "on",
     },
     Setting {
-        key: "input.lldv_nits",
-        kind: Kind::Int {
-            min: 48,
-            max: 10000,
-        },
-        apply: Apply::Restart,
-        help: "The peak, in nits, that low-latency Dolby Vision is mapped to: what the EDID upstream declares.",
-        get: |c| Value::Int(c.lldv_nits.into()),
-        set: |c, v| c.lldv_nits = int(v) as u16,
-    },
-    Setting {
         key: "tonemap.curve",
         kind: Kind::Choice(CURVES),
-        apply: Apply::Restart,
+        apply: Apply::Live,
         help: "The tone curve for HDR into SDR output: libplacebo's, by name.",
         get: |c| Value::Name(c.curve.name().into()),
         set: |c, v| c.curve = Curve::from_name(name(v)).unwrap_or(Curve::Spline),
@@ -324,7 +374,7 @@ static SETTINGS: &[Setting] = &[
     Setting {
         key: "tonemap.source_peak",
         kind: Kind::Int { min: 0, max: 10000 },
-        apply: Apply::Restart,
+        apply: Apply::Live,
         help: "The HDR10 source's peak, in nits, that the curve maps from, in place of its MaxCLL or \
                mastering peak; 0 uses the metadata.",
         get: |c| Value::Int(c.source_peak.into()),
@@ -333,7 +383,7 @@ static SETTINGS: &[Setting] = &[
     Setting {
         key: "detect.crop",
         kind: Kind::Choice(&["on", "off"]),
-        apply: Apply::Restart,
+        apply: Apply::Live,
         help: "on: find the black bars and crop them out, the picture placed at constant image height in the \
                screen's band of the raster. off: every frame fills the raster as it came.",
         get: |c| Value::Name(if c.crop { "on" } else { "off" }.into()),
@@ -341,27 +391,35 @@ static SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "geometry.screen_ar",
-        kind: Kind::Float { min: 1.0, max: 3.0 },
-        apply: Apply::Restart,
+        kind: Kind::Ratio {
+            min: 1.0,
+            max: 3.0,
+            off: false,
+        },
+        apply: Apply::Live,
         help: "The screen's aspect ratio: with the lens set so the raster's width fills the screen, the band of \
-               the raster that lands on it. 2.35 for a 2.35:1 screen.",
-        get: |c| Value::Float(c.screen_ar),
-        set: |c, v| c.screen_ar = float(v),
+               the raster that lands on it. 2.35 for a 2.35:1 screen; a ratio may be written \"16:9\".",
+        get: |c| ratio_value(c.screen_ar),
+        set: |c, v| c.screen_ar = ratio(v),
     },
     Setting {
         key: "geometry.fill_max_ar",
-        kind: Kind::Float { min: 1.0, max: 3.0 },
-        apply: Apply::Restart,
+        kind: Kind::Ratio {
+            min: 1.0,
+            max: 3.0,
+            off: true,
+        },
+        apply: Apply::Live,
         help: "Content wider than the screen but no wider than this fills the screen's height, losing a \
                sliver at each side (2.39 and 2.40 on a 2.35 screen give up about 1% a side and show no bars). \
                Wider content (2.55, 2.76) keeps its full width with thin bars inside the screen. 0 is off.",
-        get: |c| Value::Float(c.fill_max_ar),
-        set: |c, v| c.fill_max_ar = float(v),
+        get: |c| ratio_value(c.fill_max_ar),
+        set: |c, v| c.fill_max_ar = ratio(v),
     },
     Setting {
         key: "slate.venue",
         kind: Kind::Text { max: 40 },
-        apply: Apply::Restart,
+        apply: Apply::Live,
         help: "The theater's name, shown on the waiting slate above what cinefit is waiting for. Empty: no \
                name, only the state.",
         get: |c| Value::Name(c.venue.clone()),
@@ -370,7 +428,7 @@ static SETTINGS: &[Setting] = &[
     Setting {
         key: "osd.banners",
         kind: Kind::Choice(&["on", "off"]),
-        apply: Apply::Restart,
+        apply: Apply::Live,
         help: "on: a short banner when the picture type changes (Dolby Vision, HDR10, SDR), saying what came in \
                and what happens to it; after the projector's resync when the change needs one.",
         get: |c| Value::Name(if c.banners { "on" } else { "off" }.into()),
@@ -395,6 +453,14 @@ pub fn settings() -> &'static [Setting] {
     SETTINGS
 }
 
+/// Settings that were removed, and what took their place: a file still
+/// holding one is told what to do, not just that the key is unknown.
+const RETIRED: &[(&str, &str)] = &[(
+    "input.lldv_nits",
+    "merged into output.white_nits (2026-10-14), which low-latency Dolby Vision now passes through at; \
+     remove the line, and set output.white_nits if it is not 96",
+)];
+
 pub fn find(key: &str) -> Option<&'static Setting> {
     SETTINGS.iter().find(|s| s.key == key)
 }
@@ -411,11 +477,14 @@ impl Setting {
             Kind::Choice(names) => names.join(" | "),
             Kind::Float { min, max } => format!("{min}-{max}"),
             Kind::Text { max } => format!("text, up to {max} characters"),
+            Kind::Ratio { min, max, off } => {
+                format!("{}{min}-{max}, or W:H", if off { "0 (off), " } else { "" })
+            }
         }
     }
 
     /// Checks `v` and sets it.
-    fn put(&self, c: &mut Config, v: &Value) -> Result<(), Error> {
+    pub fn put(&self, c: &mut Config, v: &Value) -> Result<(), Error> {
         let bad = || Error::Value {
             key: self.key.to_string(),
             value: v.to_string(),
@@ -430,6 +499,15 @@ impl Setting {
             // Control characters would draw as nothing, or break the file.
             (Kind::Text { max }, Value::Name(t))
                 if t.chars().count() <= max && !t.chars().any(char::is_control) => {}
+            (Kind::Ratio { min, max, off }, v)
+                if {
+                    let r = match v {
+                        Value::Name(t) => Ratio::parse(t),
+                        Value::Float(x) => Some(Ratio::of(*x)),
+                        Value::Int(n) => Some(Ratio::of(*n as f64)),
+                    };
+                    r.is_some_and(|r| (min..=max).contains(&r.value()) || (off && r.value() == 0.0))
+                } => {}
             _ => return Err(bad()),
         }
         (self.set)(c, v);
@@ -454,7 +532,10 @@ impl fmt::Display for Error {
         match self {
             Error::Read(p, e) => write!(f, "{}: {e}", p.display()),
             Error::Parse(p, e) => write!(f, "{}: {e}", p.display()),
-            Error::UnknownKey(k) => write!(f, "no setting {k} (cinefit settings lists them)"),
+            Error::UnknownKey(k) => match RETIRED.iter().find(|(old, _)| old == k) {
+                Some((_, now)) => write!(f, "{k} is no longer a setting: {now}"),
+                None => write!(f, "no setting {k} (cinefit settings lists them)"),
+            },
             Error::Value { key, value, range } => write!(f, "{key} = {value}: must be {range}"),
         }
     }
@@ -520,7 +601,7 @@ pub fn set(c: &mut Config, assignment: &str) -> Result<(), Error> {
             value: text.to_string(),
             range: s.range(),
         })?),
-        Kind::Choice(_) | Kind::Text { .. } => Value::Name(text.to_string()),
+        Kind::Choice(_) | Kind::Text { .. } | Kind::Ratio { .. } => Value::Name(text.to_string()),
         Kind::Float { .. } => Value::Float(text.parse().map_err(|_| Error::Value {
             key: s.key.to_string(),
             value: text.to_string(),
@@ -558,6 +639,43 @@ pub fn render(c: &Config) -> String {
         }
     }
     out
+}
+
+/// The settings that differ from the defaults, as TOML, each with its help:
+/// what a change made while running saves, so the file holds only what was
+/// chosen and stays short enough to read.
+pub fn render_changed(c: &Config) -> String {
+    let d = Config::default();
+    let mut out = String::from(
+        "# cinefit's settings that differ from the defaults; `cinefit settings` lists them all.\n",
+    );
+    let mut section = "";
+    for s in SETTINGS.iter().filter(|s| s.get(c) != s.get(&d)) {
+        let (sec, name) = s.key.split_once('.').expect("keys are section.name");
+        if sec != section {
+            out.push_str(&format!("\n[{sec}]\n"));
+            section = sec;
+        }
+        out.push_str(&format!("# {}\n", s.help));
+        match s.get(c) {
+            Value::Int(v) => out.push_str(&format!("{name} = {v}\n")),
+            Value::Name(n) => out.push_str(&format!("{name} = \"{}\"\n", toml_escape(&n))),
+            Value::Float(v) => out.push_str(&format!("{name} = {v:?}\n")),
+        }
+    }
+    out
+}
+
+/// Writes [`render_changed`] to `path`, through a file beside it renamed
+/// over the old one: a crash mid-write leaves the old file, never half of
+/// one that would stop cinefit at its next start.
+pub fn save(c: &Config, path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("toml.new");
+    std::fs::write(&tmp, render_changed(c))?;
+    std::fs::rename(&tmp, path)
 }
 
 /// `text` inside a TOML basic string: quotes and backslashes escaped.
@@ -622,7 +740,7 @@ mod tests {
         let mut c = Config::default();
         set(&mut c, "geometry.screen_ar=2.4").unwrap();
         set(&mut c, "geometry.fill_max_ar = 2").unwrap();
-        assert_eq!((c.screen_ar, c.fill_max_ar), (2.4, 2.0));
+        assert_eq!((c.screen_ar.value(), c.fill_max_ar.value()), (2.4, 2.0));
         assert!(set(&mut c, "geometry.screen_ar=0.5").is_err());
         assert!(set(&mut c, "geometry.screen_ar=wide").is_err());
         let text = render(&c);
@@ -632,9 +750,49 @@ mod tests {
         );
         assert_eq!(parse(&text, p()).unwrap(), c);
         assert_eq!(
-            parse("[geometry]\nscreen_ar = 2\n", p()).unwrap().screen_ar,
+            parse("[geometry]\nscreen_ar = 2\n", p())
+                .unwrap()
+                .screen_ar
+                .value(),
             2.0
         );
+    }
+
+    #[test]
+    fn a_ratio_is_kept_as_written() {
+        let c = parse("[geometry]\nscreen_ar = \"16:9\"\n", p()).unwrap();
+        assert_eq!(c.screen_ar, Ratio { w: 16.0, h: 9.0 });
+        assert_eq!(c.screen_ar.value(), 16.0 / 9.0);
+        // Written back as given, and read back the same.
+        let text = render(&c);
+        assert!(text.contains("screen_ar = \"16:9\"\n"), "{text}");
+        assert_eq!(parse(&text, p()).unwrap(), c);
+        let mut c = Config::default();
+        set(&mut c, "geometry.screen_ar=2.39:1").unwrap();
+        assert_eq!(c.screen_ar.value(), 2.39);
+        // The fill limit can be off; the screen ratio cannot.
+        set(&mut c, "geometry.fill_max_ar=0").unwrap();
+        assert_eq!(c.fill_max_ar.value(), 0.0);
+        assert!(set(&mut c, "geometry.screen_ar=0").is_err());
+        assert!(set(&mut c, "geometry.screen_ar=16:0").is_err());
+        assert!(set(&mut c, "geometry.screen_ar=4:9").is_err());
+    }
+
+    #[test]
+    fn what_is_saved_is_only_what_differs_and_reads_back() {
+        assert!(!render_changed(&Config::default()).contains(" = "));
+        let mut c = Config::default();
+        set(&mut c, "slate.venue=The Back Room").unwrap();
+        set(&mut c, "geometry.screen_ar=16:9").unwrap();
+        let text = render_changed(&c);
+        assert_eq!(text.matches(" = ").count(), 2, "{text}");
+        assert_eq!(parse(&text, p()).unwrap(), c);
+        let dir = std::env::temp_dir().join(format!("cinefit-save-{}", std::process::id()));
+        let path = dir.join("cinefit.toml");
+        save(&c, &path).unwrap();
+        assert_eq!(load(&path).unwrap(), c);
+        assert!(!path.with_extension("toml.new").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -658,6 +816,16 @@ mod tests {
         assert!(set(&mut c, &format!("slate.venue={}", "x".repeat(41))).is_err());
         assert!(parse("[slate]\nvenue = \"a\\nb\"\n", p()).is_err());
         assert!(parse("[slate]\nvenue = 3\n", p()).is_err());
+    }
+
+    #[test]
+    fn a_retired_setting_says_what_replaced_it() {
+        let e = parse("[input]\nlldv_nits = 96\n", p()).unwrap_err();
+        assert!(
+            e.to_string().contains("merged into output.white_nits"),
+            "{e}"
+        );
+        assert!(set(&mut Config::default(), "input.lldv_nits=96").is_err());
     }
 
     #[test]
