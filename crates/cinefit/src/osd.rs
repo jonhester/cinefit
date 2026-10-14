@@ -422,6 +422,9 @@ const BANNER_TITLE: f32 = 86.0;
 const BANNER_DETAIL: f32 = 64.0;
 const BANNER_PAD: f32 = 104.0;
 const BANNER_H: f32 = 345.0;
+/// The banner's size against the mockup's, which drew it for a screen seen
+/// from a page: at the screen it was too big (2026-10-14).
+const BANNER_SCALE: f32 = 0.6;
 
 /// The banner's box: top left inside the band, as wide as its text needs.
 pub fn banner_area(
@@ -431,16 +434,18 @@ pub fn banner_area(
     text: &BannerText,
 ) -> Area {
     let (w, h) = size;
-    let s = h as f32 / 2160.0;
+    let r = h as f32 / 2160.0;
+    let s = r * BANNER_SCALE;
     let text_w = measure(&fonts.semibold, BANNER_TITLE * s, &text.title).max(measure(
         &fonts.regular,
         BANNER_DETAIL * s,
         &text.detail,
     ));
-    let x = (BANNER_X * s) as usize;
+    // Where it sits is the raster's, not scaled with it.
+    let x = (BANNER_X * r) as usize;
     Area {
         x,
-        y: band_top + (BANNER_DY * s) as usize,
+        y: band_top + (BANNER_DY * r) as usize,
         w: ((text_w + 1.8 * BANNER_PAD * s) as usize).min(w - x),
         h: (BANNER_H * s) as usize,
     }
@@ -450,7 +455,7 @@ pub fn banner_area(
 /// the picture type over a quiet line about it, filling `area` (from
 /// [`banner_area`]).
 pub fn banner(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, text: &BannerText) {
-    let s = c.size().1 as f32 / 2160.0;
+    let s = c.size().1 as f32 / 2160.0 * BANNER_SCALE;
     let px = |v: f32| (v * s) as usize;
     c.rect(area, px(39.0), palette::panel(), 0.8);
     c.rect(
