@@ -39,8 +39,14 @@ const STABLE_FRAMES: usize = 12;
 /// (2026-10-13, S&M montage). Plain 10-bit RGB is rare from this chain, so
 /// waiting for it costs little.
 const TUNNEL_GRACE: usize = 48;
-/// Give up waiting for stable input after this long.
-const PRE_ROLL_LIMIT: Duration = Duration::from_secs(15);
+/// How long to wait for stable input before starting without it. A source
+/// that is on settles in well under a second (a tunnel, in two); past this
+/// the display is opened at `output.wait_hz` with black, so it shows neither
+/// the console nor a stale picture, and the source is followed when it comes.
+const PRE_ROLL_WAIT: Duration = Duration::from_secs(4);
+/// No frame for this long is no signal: black, not the last frame held. The
+/// C++ version's figure; a frame at 24p is 42 ms, so two missed frames.
+const NO_SIGNAL: Duration = Duration::from_millis(100);
 /// Startup is excluded from the run's verdict: the first seconds always
 /// include the resync.
 const SETTLE: Duration = Duration::from_secs(5);
@@ -54,7 +60,9 @@ const LOGGED_CHANGES: u64 = 50;
 const BUFFERS: usize = 3;
 
 pub struct Options {
-    pub seconds: f64,
+    /// How long to run; `None` until stopped (Ctrl-C, or SIGTERM from a
+    /// service manager).
+    pub seconds: Option<f64>,
     pub device: usize,
     pub card: Option<PathBuf>,
     /// The settings: the panel's size (the output runs at it, at the
@@ -605,10 +613,15 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
 }
 
 fn play(opts: Options) -> Result<(), Box<dyn Error>> {
-    let run_for = Duration::try_from_secs_f64(opts.seconds)
-        .ok()
-        .filter(|d| !d.is_zero())
-        .ok_or("--seconds must be a positive number")?;
+    let run_for = match opts.seconds {
+        None => None,
+        Some(s) => Some(
+            Duration::try_from_secs_f64(s)
+                .ok()
+                .filter(|d| !d.is_zero())
+                .ok_or("--seconds must be a positive number")?,
+        ),
+    };
 
     // Capture first: the output is chosen from what arrives.
     let devices = cinefit_decklink::devices()?;
@@ -642,16 +655,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             .is_some()
     };
     while stable < key.map_or(STABLE_FRAMES, frames_to_trust) || !has_format() {
-        if started.elapsed() > PRE_ROLL_LIMIT {
-            return Err(format!(
-                "no stable input after {} s: {} frames with a signal, {} without",
-                PRE_ROLL_LIMIT.as_secs(),
-                captured.load(Ordering::Relaxed),
-                no_input.load(Ordering::Relaxed)
-            )
-            .into());
+        if started.elapsed() > PRE_ROLL_WAIT {
+            break;
         }
-        let Some(frame) = mailbox.take_wait(Duration::from_millis(500)) else {
+        let Some(frame) = mailbox.take_wait(Duration::from_millis(100)) else {
             continue;
         };
         let k = classify(&frame, &mut last_tunnel);
@@ -663,20 +670,50 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         }
         first = Some(frame);
     }
-    let key = key.expect("pre-roll ends with a key");
-    let first = first.expect("pre-roll ends with a frame");
-    let input = format
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .expect("pre-roll waits for the format");
-    info!(
-        "input: {input}, as {}; stable after {:.1} s",
-        describe(key.kind),
-        started.elapsed().as_secs_f64()
-    );
-    if let Kind::Unsupported(f) = key.kind {
-        return Err(format!("{f}: no render path").into());
-    }
+    let reported = *format.lock().unwrap_or_else(PoisonError::into_inner);
+    // The source to start from, if one held still: without one the output
+    // starts at output.wait_hz with black, and follows the source when it comes.
+    let start = match (key, first, reported) {
+        (Some(key), Some(first), Some(input))
+            if stable >= frames_to_trust(key) && !matches!(key.kind, Kind::Unsupported(_)) =>
+        {
+            info!(
+                "input: {input}, as {}; stable after {:.1} s",
+                describe(key.kind),
+                started.elapsed().as_secs_f64()
+            );
+            Some((key, first, input))
+        }
+        (key, _, reported) => {
+            let what = match (key, reported) {
+                (
+                    Some(Key {
+                        kind: Kind::Unsupported(f),
+                        ..
+                    }),
+                    _,
+                ) => format!("{f}, which nothing renders"),
+                (Some(k), Some(f)) => format!("{f}, as {}, not yet steady", describe(k.kind)),
+                _ => format!(
+                    "no signal ({} frames with one, {} without)",
+                    captured.load(Ordering::Relaxed),
+                    no_input.load(Ordering::Relaxed)
+                ),
+            };
+            if opts.dry_run {
+                return Err(format!(
+                    "no stable input after {} s: {what}",
+                    PRE_ROLL_WAIT.as_secs()
+                )
+                .into());
+            }
+            info!(
+                "input after {} s: {what}; starting with black, to follow the source when it comes",
+                PRE_ROLL_WAIT.as_secs()
+            );
+            None
+        }
+    };
 
     // The output: the panel at the source's own rate, signalling chosen from
     // the source, in one commit.
@@ -686,7 +723,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let want = cinefit_kms::ModeRequest {
         width: opts.config.width,
         height: opts.config.height,
-        refresh_hz: input.frames_per_second(),
+        refresh_hz: start
+            .as_ref()
+            .map_or(opts.config.wait_hz, |s| s.2.frames_per_second()),
     };
     let Some(index) = cinefit_kms::choose_mode(&modes, &want) else {
         info!("progressive modes offered:");
@@ -694,20 +733,24 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             info!("  {m}{}", if m.preferred { " (preferred)" } else { "" });
         }
         return Err(format!(
-            "no {}x{} mode within 0.01 Hz of the source's {:.3}",
+            "no {}x{} mode within 0.01 Hz of {:.3}",
             want.width, want.height, want.refresh_hz
         )
         .into());
     };
     let mode = modes[index];
     info!("mode: {mode}");
-    let (hdr, mut out_color) = output_in(
-        opts.config.mode,
-        opts.config.lldv,
-        key.kind,
-        first.info().color.hdr.as_ref(),
-        last_tunnel.as_ref(),
-    );
+    let (hdr, mut out_color) = match &start {
+        Some((key, first, _)) => output_in(
+            opts.config.mode,
+            opts.config.lldv,
+            key.kind,
+            first.info().color.hdr.as_ref(),
+            last_tunnel.as_ref(),
+        ),
+        None => (None, SDR_BT2020),
+    };
+    let start_kind = start.as_ref().map(|s| s.0.kind);
     match &hdr {
         Some(h) => info!(
             "signalling {:?}: MaxCLL {}, MaxFALL {}, mastering {:.4}-{:.0} nits",
@@ -715,16 +758,19 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         ),
         None => info!(
             "signalling SDR BT.2020{}",
-            match key.kind {
-                k if is_lldv(k, opts.config.lldv) => format!(
+            match start_kind {
+                None => ", no source".to_string(),
+                Some(k) if is_lldv(k, opts.config.lldv) => format!(
                     ": low-latency Dolby Vision, {} nits to white at {} nits",
                     opts.config.lldv_nits, opts.config.white_nits
                 ),
-                Kind::Tunnel
-                | Kind::Ycbcr(YcbcrColor {
-                    transfer: Transfer::Pq,
-                    ..
-                }) => format!(
+                Some(
+                    Kind::Tunnel
+                    | Kind::Ycbcr(YcbcrColor {
+                        transfer: Transfer::Pq,
+                        ..
+                    }),
+                ) => format!(
                     ": HDR tone-mapped ({}) to white at {} nits",
                     opts.config.curve.name(),
                     opts.config.white_nits
@@ -830,27 +876,50 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             bottom: c.bottom,
         }
     };
-    let first_info = *first.info();
-    let first_source = detect(&first, key.kind, 0.0, 1);
-    let first_view = view_for(
-        (first_info.width, first_info.height),
-        size,
-        win,
-        first_source,
-        opts.config.fill_max_ar,
-    );
-    if !render(
-        &pl,
-        &first,
-        key.kind,
-        last_tunnel.as_ref(),
-        &mut sources,
-        &target(0, out_color, first_view),
-        &mut stages,
-    )? {
-        return Err("the first frame could not be rendered".into());
-    }
-    drop(first);
+    let (first_source, first_place) = match &start {
+        Some((key, first, _)) => {
+            let first_info = *first.info();
+            let source = detect(first, key.kind, 0.0, 1);
+            let view = view_for(
+                (first_info.width, first_info.height),
+                size,
+                win,
+                source,
+                opts.config.fill_max_ar,
+            );
+            if !render(
+                &pl,
+                first,
+                key.kind,
+                last_tunnel.as_ref(),
+                &mut sources,
+                &target(0, out_color, view),
+                &mut stages,
+            )? {
+                return Err("the first frame could not be rendered".into());
+            }
+            let place = view
+                .dst
+                .unwrap_or_else(|| Rect::fit(first_info.width, first_info.height, size.0, size.1));
+            (source, place)
+        }
+        None => {
+            pl.clear_black(&targets[0])?;
+            let none = if opts.config.crop {
+                geo::Source::Rows { top: 0, bottom: 0 }
+            } else {
+                geo::Source::Whole
+            };
+            (none, Rect::fit(size.0, size.1, size.0, size.1))
+        }
+    };
+    let (start_key, start_input) = match start {
+        Some((key, first, input)) => {
+            drop(first);
+            (Some(key), Some(input))
+        }
+        None => (None, None),
+    };
     if opts.dry_run {
         info!(
             "dry run: first frame rendered into a scanout buffer ({:.2} ms unpack, {:.2} ms render)",
@@ -859,11 +928,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         );
         // A signal is not a picture: look at the pixels.
         let fourcc = out.export(buffers[0])?.fourcc;
-        let place = first_view
-            .dst
-            .unwrap_or_else(|| Rect::fit(first_info.width, first_info.height, size.0, size.1));
         let report = out.read_scanout(buffers[0], |px, stride| {
-            look(px, stride, fourcc, size, place)
+            look(px, stride, fourcc, size, first_place)
         })?;
         info!("{report}");
         info!("stopping before the modeset");
@@ -874,7 +940,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     out.modeset(index, buffers[0])?;
     info!("after modeset: {}", out.hdr_state());
     let mut policy = follow::Policy::new(follow::Want {
-        rate_mhz: rate_mhz(&input),
+        rate_mhz: start_input
+            .as_ref()
+            .map_or_else(|| (mode.refresh_hz() * 1000.0).round() as u32, rate_mhz),
         signal: signal_of(hdr),
     });
 
@@ -907,17 +975,20 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut ready: Option<usize> = None;
     let mut counts = Counts::default();
     // The input as last seen, and for how many frames in a row.
-    let (mut last_key, mut held) = (key, frames_to_trust(key));
+    let (mut last_key, mut held) = (start_key, start_key.map_or(0, frames_to_trust));
     let mut settled: Option<(Counts, u64)> = None;
     // What the card last reported, to log when it reports something else.
-    let mut last_format = Some(input);
+    let mut last_format = start_input;
+    // Black is on screen for want of a signal, and since when frames last
+    // came. Each return of the signal is a new epoch for the detector.
+    let (mut dark, mut last_frame_at, mut returns) = (start_key.is_none(), Instant::now(), 0u32);
     let mut next_status = STATUS_EVERY;
     let mut last_source = first_source;
     let run_started = Instant::now();
     // The loop's errors are held until the summary is written: a run that
     // fails at minute 40 needs its summary more than one that ends on time.
     let mut run_loop = || -> Result<(), Box<dyn Error>> {
-        while run_started.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
+        while run_for.is_none_or(|d| run_started.elapsed() < d) && !stop.load(Ordering::Relaxed) {
             if settled.is_none() && run_started.elapsed() >= SETTLE {
                 settled = Some((counts, mailbox.displaced()));
             }
@@ -936,11 +1007,36 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     }
                 );
             }
-            if ready.is_none()
-                && let Some(frame) = mailbox.take_wait(take_timeout)
-            {
+            let taken = if ready.is_none() {
+                mailbox.take_wait(take_timeout)
+            } else {
+                None
+            };
+            if taken.is_none() && ready.is_none() && !dark && last_frame_at.elapsed() >= NO_SIGNAL {
+                // The signal is gone: black, in the mode as it stands. A blip
+                // costs no resync; the source is followed when it is back.
+                let free = (0..BUFFERS)
+                    .find(|&b| b != front && b != pending)
+                    .expect("three buffers, two in use");
+                pl.clear_black(&targets[free])?;
+                ready = Some(free);
+                dark = true;
+                counts.signal_losses += 1;
+                info!(
+                    "{:.1} s: no signal for {} ms: black",
+                    run_started.elapsed().as_secs_f64(),
+                    last_frame_at.elapsed().as_millis()
+                );
+            }
+            if let Some(frame) = taken {
+                if dark {
+                    returns += 1;
+                    info!("{:.1} s: signal back", run_started.elapsed().as_secs_f64());
+                    dark = false;
+                }
+                last_frame_at = Instant::now();
                 let k = classify(&frame, &mut last_tunnel);
-                if k != last_key {
+                if Some(k) != last_key {
                     counts.format_changes += 1;
                     // Capped: a source that flaps would bury everything else.
                     if counts.format_changes <= LOGGED_CHANGES {
@@ -955,7 +1051,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     } else if counts.format_changes == LOGGED_CHANGES + 1 {
                         info!("further input changes are counted, not logged");
                     }
-                    last_key = k;
+                    last_key = Some(k);
                     held = 0;
                 }
                 let reported = *format.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1014,7 +1110,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         &frame,
                         k.kind,
                         run_started.elapsed().as_secs_f64(),
-                        counts.format_changes as u32 + 1,
+                        counts.format_changes as u32 + returns + 1,
                     );
                     last_source = source;
                     let view = view_for(
@@ -1037,7 +1133,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     )? {
                         ready = Some(free);
                     } else {
+                        // Nothing renders this format: black, not the last
+                        // picture held over it.
                         counts.unrendered += 1;
+                        pl.clear_black(&targets[free])?;
+                        ready = Some(free);
                     }
                 }
             }
@@ -1163,7 +1263,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         info!("stopped early by an error, reported after the summary");
     }
     info!(
-        "ran {:.1} s: captured {} frames with a signal ({} without), shown {}, replaced unseen {}, vblanks repeated {}, unrendered {}, input format changes {}, RGB held back as a possible tunnel {}, failed restarts {failed_restarts}",
+        "ran {:.1} s: captured {} frames with a signal ({} without), shown {}, replaced unseen {}, vblanks repeated {}, unrendered {}, input format changes {}, RGB held back as a possible tunnel {}, signal lost {} times, failed restarts {failed_restarts}",
         ran.as_secs_f64(),
         captured.load(Ordering::Relaxed),
         no_input.load(Ordering::Relaxed),
@@ -1173,6 +1273,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         counts.unrendered,
         counts.format_changes,
         counts.unproven,
+        counts.signal_losses,
     );
     match settled {
         Some((at, displaced)) => {
@@ -1257,6 +1358,8 @@ struct Counts {
     format_changes: u64,
     /// Frames of RGB held back while it might still be a tunnel.
     unproven: u64,
+    /// Times the signal went away for longer than [`NO_SIGNAL`].
+    signal_losses: u64,
     modesets: u64,
     metadata: u64,
     refused: u64,
