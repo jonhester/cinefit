@@ -1442,7 +1442,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // The web page's preview: its small target, made when first wanted, and
     // when the last was made.
     let mut preview_tex: Option<cinefit_render::Rgba16Target> = None;
-    let (mut preview_at, mut preview_logged): (Option<Instant>, bool) = (None, false);
+    let (mut preview_at, mut previews): (Option<Instant>, u32) = (None, 0);
     let mut cur_mode = mode;
     let now = Instant::now();
     match (&start_key, &start_input) {
@@ -1906,11 +1906,19 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             );
                             match made {
                                 Ok((w, h, rgb)) => {
-                                    if !preview_logged {
-                                        preview_logged = true;
+                                    // The first includes making the target
+                                    // and its shaders; the tenth is the cost
+                                    // that repeats.
+                                    previews += 1;
+                                    if previews == 1 || previews == 10 {
                                         info!(
-                                            "web: preview {w} x {h} made in {:.1} ms",
-                                            ms(preview_at.unwrap_or_else(Instant::now))
+                                            "web: preview {w} x {h} made in {:.1} ms ({})",
+                                            ms(preview_at.unwrap_or_else(Instant::now)),
+                                            if previews == 1 {
+                                                "the first"
+                                            } else {
+                                                "the tenth"
+                                            }
                                         );
                                     }
                                     if let Some(wb) = &web {

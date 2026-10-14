@@ -532,8 +532,11 @@ cf_pl_tex *cf_pl_target_rgba16(cf_pl *pl, int w, int h) {
         log_err(pl, "no rgba16 texture format");
         return NULL;
     }
+    // Blittable as well: a render that leaves part of the target uncovered
+    // clears that part, which libplacebo does as a blit.
     return wrap_tex(pl_tex_create(pl->vk->gpu, pl_tex_params(
-        .w = w, .h = h, .format = fmt, .renderable = true, .host_readable = true)));
+        .w = w, .h = h, .format = fmt, .renderable = true, .host_readable = true,
+        .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0)));
 }
 
 int cf_pl_download_rgba16(cf_pl *pl, cf_pl_tex *t, uint16_t *out) {
