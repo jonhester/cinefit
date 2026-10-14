@@ -18,6 +18,9 @@ pub struct Window {
     flips: VecDeque<(Instant, bool)>,
     render: VecDeque<(Instant, f64)>,
     detect: VecDeque<(Instant, f64)>,
+    /// Each rendered frame's whole work on the frame thread: detect, unpack
+    /// and render, which run one after the other.
+    work: VecDeque<(Instant, f64)>,
 }
 
 fn prune<T>(q: &mut VecDeque<(Instant, T)>, now: Instant) {
@@ -44,9 +47,12 @@ impl Window {
         prune(&mut self.flips, now);
     }
 
-    pub fn render(&mut self, now: Instant, ms: f64) {
+    /// A rendered frame: its render time, and its whole work.
+    pub fn render(&mut self, now: Instant, ms: f64, work_ms: f64) {
         self.render.push_back((now, ms));
+        self.work.push_back((now, work_ms));
         prune(&mut self.render, now);
+        prune(&mut self.work, now);
     }
 
     pub fn detect(&mut self, now: Instant, ms: f64) {
@@ -54,23 +60,25 @@ impl Window {
         prune(&mut self.detect, now);
     }
 
-    /// LAST 10 S: frames shown and repeated, and the stages' medians against
-    /// the frame period.
+    /// LAST 10 S: frames shown and repeated, and the median frame's whole
+    /// work against the frame period, with render's and detect's part.
     pub fn section(&mut self, now: Instant, period: Duration) -> InfoSection {
         prune(&mut self.flips, now);
         prune(&mut self.render, now);
         prune(&mut self.detect, now);
+        prune(&mut self.work, now);
         let shown = self.flips.iter().filter(|(_, n)| *n).count();
         let repeated = self.flips.len() - shown;
-        let ms = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.1} ms"));
+        let ms = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
         InfoSection {
             label: "LAST 10 S".into(),
             line: format!("{shown} shown \u{b7} {repeated} repeated"),
             detail: format!(
-                "render {} \u{b7} detect {} of {:.1}",
+                "frame work {} ms of {:.1} (render {}, detect {})",
+                ms(median(&self.work)),
+                period.as_secs_f64() * 1000.0,
                 ms(median(&self.render)),
-                ms(median(&self.detect)),
-                period.as_secs_f64() * 1000.0
+                ms(median(&self.detect))
             ),
         }
     }
@@ -138,18 +146,21 @@ mod tests {
         for i in 0..12 * 24u32 {
             let t = t0 + Duration::from_millis(u64::from(i) * 1000 / 24);
             w.flip(t, i % 24 != 0);
-            w.render(t, 5.0 + f64::from(i % 3));
+            w.render(t, 5.0 + f64::from(i % 3), 7.0 + f64::from(i % 3));
             w.detect(t, 1.25);
         }
         let s = w.section(t0 + Duration::from_secs(12), Duration::from_micros(41_708));
         // Ten seconds of 24: 240 flips, 10 of them repeats.
         assert_eq!(s.line, "230 shown \u{b7} 10 repeated", "{s:?}");
-        assert_eq!(s.detail, "render 6.0 ms \u{b7} detect 1.2 ms of 41.7");
+        assert_eq!(
+            s.detail,
+            "frame work 8.0 ms of 41.7 (render 6.0, detect 1.2)"
+        );
         assert_eq!(
             Window::default()
                 .section(t0, Duration::from_millis(40))
                 .detail,
-            "render - \u{b7} detect - of 40.0"
+            "frame work - ms of 40.0 (render -, detect -)"
         );
     }
 

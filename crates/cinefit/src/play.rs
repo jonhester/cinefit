@@ -1023,18 +1023,23 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // the crop last changed.
     let window = RefCell::new(Window::default());
     let crop_change: Cell<Option<(Instant, &'static str)>> = Cell::new(None);
+    // This frame's detector time, 0 when it did not run, for the frame's
+    // whole work below.
+    let detect_ms = Cell::new(0.0);
     let mut detect = |frame: &Frame, kind: Kind, t: f64, epoch: u32| -> geo::Source {
         if !opts.config.crop {
             return geo::Source::Whole;
         }
         let info = frame.info();
+        detect_ms.set(0.0);
         if matches!(kind, Kind::Ycbcr(_))
             && let Some(px) = frame.pixels()
             && let Some(v) = V210::new(px.bytes(), info.width, info.height, info.row_bytes)
         {
             let t0 = Instant::now();
             let d = det.push(&v, t, epoch);
-            window.borrow_mut().detect(Instant::now(), ms(t0));
+            detect_ms.set(ms(t0));
+            window.borrow_mut().detect(Instant::now(), detect_ms.get());
             if d.changed {
                 crops += 1;
                 crop_change.set(Some((Instant::now(), d.diag.reason)));
@@ -1422,8 +1427,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     )? {
                         ready = Some(free);
                         ui.set_slate(None);
-                        if let Some(&r) = stages.render.last() {
-                            window.borrow_mut().render(Instant::now(), r);
+                        if let (Some(&u), Some(&r)) = (stages.unpack.last(), stages.render.last()) {
+                            // Detect, unpack and render run one after the
+                            // other on this thread.
+                            window
+                                .borrow_mut()
+                                .render(Instant::now(), r, detect_ms.get() + u + r);
                         }
                     } else {
                         // Nothing renders this format: black, not the last

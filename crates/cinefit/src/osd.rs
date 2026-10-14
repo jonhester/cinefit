@@ -911,7 +911,7 @@ mod preview {
                 sec(
                     "LAST 10 S",
                     "240 shown \u{b7} 0 repeated",
-                    "render 5.4 ms \u{b7} detect 1.2 ms of 41.7",
+                    "frame work 7.9 ms of 41.7 (render 5.4, detect 1.2)",
                 ),
             ],
         };
