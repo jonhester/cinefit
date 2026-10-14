@@ -1,13 +1,17 @@
 use std::process::Command;
 
 fn main() {
-    // What `cinefit --version` and every play log say this build is. The
-    // release workflow sets CINEFIT_VERSION from the tag; any other build is
-    // `0.0.0-dev`. The commit and its date come from git, so a build says
-    // which source it is; "-dev" builds may carry uncommitted changes the
-    // hash does not show.
-    println!("cargo::rerun-if-env-changed=CINEFIT_VERSION");
-    let version = std::env::var("CINEFIT_VERSION").unwrap_or_else(|_| "0.0.0-dev".into());
+    // What `cinefit --version` and every play log say this build is: the
+    // version in Cargo.toml, the last release. Only the release workflow's
+    // build (CINEFIT_RELEASE=1) is that release; any other is `+dev`, that
+    // release plus whatever came after. The commit and its date come from
+    // git, so a build says which source it is; a `+dev` build may carry
+    // uncommitted changes the hash does not show.
+    println!("cargo::rerun-if-env-changed=CINEFIT_RELEASE");
+    let mut version = std::env::var("CARGO_PKG_VERSION").expect("set by cargo");
+    if std::env::var("CINEFIT_RELEASE").as_deref() != Ok("1") {
+        version.push_str("+dev");
+    }
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)
