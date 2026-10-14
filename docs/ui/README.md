@@ -15,4 +15,5 @@ screen mockup shows the whole 4096 x 2160 panel; the dashed lines mark the
 | [banner.png](banner.png) | The banner on a change of picture type, and when it shows | #77 |
 | [info.png](info.png) | The info overlay | #72 |
 | [menu.png](menu.png) | The OSD menu: pages on the left, settings on the right | #75 |
+| [menu-output.png](menu-output.png), [menu-picture.png](menu-picture.png), [menu-input.png](menu-input.png) | The menu as cinefit's own OSD code draws it (2026-10-14), at the banner's 60% scale over a stand-in picture: Output is HDR10 (to the projector, or tone-mapped to SDR BT.2020) and the rate while waiting; Picture is crop, fill limit and banners; Input is RGB range, Dolby Vision low latency and the capture device. The brightness and tone-curve settings live on the web page | #75 |
 | [web.png](web.png) | The web page on a phone | #74 |
