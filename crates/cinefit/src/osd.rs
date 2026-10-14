@@ -201,21 +201,37 @@ impl<'a> Canvas<'a> {
     pub fn rect(&mut self, area: Area, radius: usize, colour: Rgb, alpha: f32) {
         let Area { x, y, w, h } = area;
         let code = colour.encode(self.enc);
-        let r = radius as f32;
         let (rw, rh) = self.raster;
         for yy in y..(y + h).min(rh) {
             for xx in x..(x + w).min(rw) {
-                // Distance outside the rounded corner, for a soft edge.
-                let (dx, dy) = (
-                    (r - (xx - x) as f32 - 0.5).max((xx - x) as f32 + 0.5 - (w as f32 - r)),
-                    (r - (yy - y) as f32 - 0.5).max((yy - y) as f32 + 0.5 - (h as f32 - r)),
-                );
-                let cover = if dx > 0.0 && dy > 0.0 {
-                    (r + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
+                self.blend(xx, yy, code, alpha * cover(area, radius, xx, yy));
+            }
+        }
+    }
+
+    /// A line `width` wide just inside `area`'s rounded edge.
+    pub fn outline(&mut self, area: Area, radius: usize, width: usize, colour: Rgb, alpha: f32) {
+        let Area { x, y, w, h } = area;
+        let inner = Area {
+            x: x + width,
+            y: y + width,
+            w: w.saturating_sub(2 * width),
+            h: h.saturating_sub(2 * width),
+        };
+        let r_in = radius.saturating_sub(width);
+        let code = colour.encode(self.enc);
+        let (rw, rh) = self.raster;
+        for yy in y..(y + h).min(rh) {
+            for xx in x..(x + w).min(rw) {
+                let inside = (inner.x..inner.x + inner.w).contains(&xx)
+                    && (inner.y..inner.y + inner.h).contains(&yy);
+                let c_in = if inside {
+                    cover(inner, r_in, xx, yy)
                 } else {
-                    1.0
+                    0.0
                 };
-                self.blend(xx, yy, code, alpha * cover);
+                let c = (cover(area, radius, xx, yy) - c_in).max(0.0);
+                self.blend(xx, yy, code, alpha * c);
             }
         }
     }
@@ -254,6 +270,23 @@ impl<'a> Canvas<'a> {
             prev = Some(c);
         }
         width
+    }
+}
+
+/// How much of pixel (`xx`, `yy`) of `area` its rounded shape covers: 1
+/// inside, a soft edge at the corners.
+fn cover(area: Area, radius: usize, xx: usize, yy: usize) -> f32 {
+    let Area { x, y, w, h } = area;
+    let r = radius as f32;
+    // Distance into the corner squares, for a soft edge.
+    let (dx, dy) = (
+        (r - (xx - x) as f32 - 0.5).max((xx - x) as f32 + 0.5 - (w as f32 - r)),
+        (r - (yy - y) as f32 - 0.5).max((yy - y) as f32 + 0.5 - (h as f32 - r)),
+    );
+    if dx > 0.0 && dy > 0.0 {
+        (r + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }
 
@@ -492,6 +525,94 @@ pub fn banner(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, text: &BannerText) 
         area.y as f32 + 270.0 * s,
         &text.detail,
     );
+}
+
+/// What the info overlay says: sections, each a label, a line and a quieter
+/// line under it (`docs/ui/info.png`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfoText {
+    pub sections: Vec<InfoSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfoSection {
+    /// In capitals, in the accent: IN, OUT, CROP.
+    pub label: String,
+    pub line: String,
+    pub detail: String,
+}
+
+/// Sizes and places in pixels of a 2160-row raster, as the mockup draws
+/// them, scaled down as the banner is.
+const INFO_W: f32 = 1625.0;
+const INFO_RIGHT: f32 = 78.0;
+const INFO_DY: f32 = 72.0;
+const INFO_PAD: f32 = 94.0;
+const INFO_SECTION: f32 = 355.0;
+const INFO_LABEL: f32 = 56.0;
+const INFO_LINE: f32 = 68.0;
+const INFO_DETAIL: f32 = 55.0;
+const INFO_SCALE: f32 = BANNER_SCALE;
+
+/// The info panel's box: the right of the screen's band (rows `band`),
+/// below its top edge, as tall as its sections need and never past the
+/// band.
+pub fn info_area(size: (usize, usize), band: (usize, usize), text: &InfoText) -> Area {
+    let (w, h) = size;
+    let r = h as f32 / 2160.0;
+    let s = r * INFO_SCALE;
+    let pw = ((INFO_W * s) as usize).min(w);
+    let ph = ((2.0 * INFO_PAD + INFO_SECTION * text.sections.len() as f32 - 0.25 * INFO_SECTION)
+        * s) as usize;
+    let y = band.0 + (INFO_DY * r) as usize;
+    Area {
+        x: w.saturating_sub(pw + (INFO_RIGHT * r) as usize),
+        y,
+        w: pw,
+        h: ph.min((band.0 + band.1).saturating_sub(y)),
+    }
+}
+
+/// The info overlay (#72): a dark panel, 80% opaque, with a quiet edge;
+/// each section a label in the accent, a line, and a quieter line.
+pub fn info(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, text: &InfoText) {
+    let s = c.size().1 as f32 / 2160.0 * INFO_SCALE;
+    let px = |v: f32| (v * s) as usize;
+    c.rect(area, px(58.0), palette::panel(), 0.8);
+    c.outline(area, px(58.0), px(5.0).max(1), palette::hint(), 0.35);
+    let x = area.x as f32 + INFO_PAD * s;
+    let mut y = area.y as f32 + INFO_PAD * s;
+    for sec in &text.sections {
+        c.text(
+            Style::new(
+                &fonts.semibold,
+                INFO_LABEL * s,
+                palette::accent(),
+                Align::Left,
+            ),
+            x,
+            y + 0.73 * INFO_LABEL * s,
+            &sec.label,
+        );
+        c.text(
+            Style::new(&fonts.regular, INFO_LINE * s, palette::text(), Align::Left),
+            x,
+            y + 2.0 * INFO_LINE * s,
+            &sec.line,
+        );
+        c.text(
+            Style::new(
+                &fonts.regular,
+                INFO_DETAIL * s,
+                palette::secondary(),
+                Align::Left,
+            ),
+            x,
+            y + 3.25 * INFO_LINE * s,
+            &sec.detail,
+        );
+        y += INFO_SECTION * s;
+    }
 }
 
 /// For `cinefit pattern --slate`: the slate, a banner, and grey steps at
@@ -762,6 +883,40 @@ mod preview {
             &text,
         );
         let path = std::path::Path::new(&dir).join(format!("banner-{w}x{h}.bgra"));
+        std::fs::write(path, &px).expect("write");
+        let mut px = vec![0u8; w * 4 * h];
+        let mut c = Canvas::new(&mut px, w * 4, w, h, Encoding::Sdr);
+        let sec = |label: &str, line: &str, detail: &str| InfoSection {
+            label: label.into(),
+            line: line.into(),
+            detail: detail.into(),
+        };
+        let text = InfoText {
+            sections: vec![
+                sec(
+                    "IN",
+                    "Dolby Vision \u{b7} low latency",
+                    "3840 \u{d7} 2160 \u{b7} 23.976 \u{b7} YCbCr 4:2:2 10-bit",
+                ),
+                sec(
+                    "OUT",
+                    "SDR BT.2020 \u{b7} unchanged from the player",
+                    "4096 \u{d7} 2160 \u{b7} 23.976",
+                ),
+                sec(
+                    "CROP",
+                    "2.40 : 1 \u{b7} 280 / 279 rows",
+                    "zoom in (recent), 12 s ago",
+                ),
+                sec(
+                    "LAST 10 S",
+                    "240 shown \u{b7} 0 repeated",
+                    "render 5.4 ms \u{b7} detect 1.2 ms of 41.7",
+                ),
+            ],
+        };
+        info(&mut c, &fonts, info_area((w, h), band, &text), &text);
+        let path = std::path::Path::new(&dir).join(format!("info-{w}x{h}.bgra"));
         std::fs::write(path, &px).expect("write");
 
         let (w, h) = (2048, 1080);

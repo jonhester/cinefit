@@ -1,0 +1,14 @@
+[package]
+name = "cinefit-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Keyboards read straight from /dev/input: no libinput, no terminal.
+evdev = "0.13"
+
+[lints]
+workspace = true

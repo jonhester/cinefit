@@ -7,23 +7,26 @@
 //! commit, so the display resyncs once. Changes of input format during the
 //! run are counted, not followed yet.
 
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::os::fd::AsFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, OutputMode};
 use crate::follow;
-use crate::osd::{BannerText, Encoding};
+use crate::osd::{BannerText, Encoding, InfoSection, InfoText};
 use crate::runlog;
+use crate::status::{self, Window};
 use crate::ui::{Slate, Ui};
 use cinefit_decklink::{
     Colorspace, Eotf, Frame, FrameInfo, Handler, HdrMetadata, InputFormat, Mailbox, PixelFormat,
 };
 use cinefit_detect::{Detector, V210};
 use cinefit_geometry as geo;
+use cinefit_input::{Action, KeyReader};
 use cinefit_render::{
     Curve, DoviColor, GpuPlanes, GpuRgb, Levels, Mapping, Matrix, Placebo, Primaries, Rect,
     RgbColor, RgbSourceColor, Texture, Transfer, View, YcbcrColor, rgb,
@@ -389,6 +392,95 @@ fn encoding_for(signal: follow::Signal) -> Encoding {
 /// to change.
 fn cant_show(f: PixelFormat) -> String {
     format!("{f} \u{b7} set the player to YCbCr")
+}
+
+/// What the info panel says about the input: its picture type, then size,
+/// rate and sampling as the card reports them.
+fn input_section(
+    key: Option<Key>,
+    format: Option<InputFormat>,
+    dark: bool,
+    lldv: bool,
+) -> InfoSection {
+    let label = "IN".to_string();
+    let Some(k) = key.filter(|_| !dark) else {
+        return InfoSection {
+            label,
+            line: "No signal".into(),
+            detail: "waiting for a source".into(),
+        };
+    };
+    let line = match k.kind {
+        Kind::Tunnel => "Dolby Vision \u{b7} tunnel".into(),
+        kind if is_lldv(kind, lldv) => "Dolby Vision \u{b7} low latency".into(),
+        Kind::Ycbcr(c) if c.transfer == Transfer::Pq => "HDR10".into(),
+        Kind::Ycbcr(c) if c.transfer == Transfer::Hlg => "HLG".into(),
+        Kind::Ycbcr(c) if c.primaries == Primaries::Bt2020 => "SDR BT.2020".into(),
+        Kind::Ycbcr(_) => "SDR".into(),
+        Kind::Rgb(_) => "RGB".into(),
+        Kind::Unsupported(f) => format!("{f}: nothing renders it"),
+    };
+    let mut detail = format!("{} \u{d7} {}", k.width, k.height);
+    if let Some(f) = format {
+        detail += &format!(" \u{b7} {}", rate_name(rate_mhz(&f)));
+        detail += match f.sampling {
+            cinefit_decklink::Sampling::Ycbcr422 => " \u{b7} YCbCr 4:2:2",
+            cinefit_decklink::Sampling::Rgb444 => " \u{b7} RGB 4:4:4",
+        };
+        if let Some(d) = f.bit_depth {
+            detail += &format!(" {d}-bit");
+        }
+    }
+    InfoSection {
+        label,
+        line,
+        detail,
+    }
+}
+
+/// What the info panel says about the output: what it signals and what
+/// happened to the picture on the way, then the mode.
+fn output_section(
+    key: Option<Key>,
+    dark: bool,
+    lldv: bool,
+    signal: follow::Signal,
+    mode: cinefit_kms::ModeTiming,
+) -> InfoSection {
+    let (name, hdr) = match signal {
+        follow::Signal::Sdr => ("SDR BT.2020", None),
+        follow::Signal::Hdr(h) if h.eotf == cinefit_kms::Eotf::Hlg => ("HLG", None),
+        follow::Signal::Hdr(h) => ("HDR10", Some(h)),
+    };
+    let what = match key.filter(|_| !dark).map(|k| k.kind) {
+        None => "black, waiting",
+        Some(Kind::Tunnel) => "cinefit\u{2019}s own mapping",
+        Some(k) if is_lldv(k, lldv) => "unchanged from the player",
+        Some(Kind::Ycbcr(c)) if matches!(c.transfer, Transfer::Pq | Transfer::Hlg) => {
+            if hdr.is_some() || name == "HLG" {
+                "passed through"
+            } else {
+                "tone-mapped by cinefit"
+            }
+        }
+        Some(Kind::Ycbcr(c)) if c.primaries == Primaries::Bt709 => "BT.709 placed in BT.2020",
+        Some(Kind::Unsupported(_)) => "black: nothing renders the input",
+        Some(_) => "unchanged",
+    };
+    let mut detail = format!(
+        "{} \u{d7} {} \u{b7} {}",
+        mode.width,
+        mode.height,
+        rate_name((mode.refresh_hz() * 1000.0).round() as u32)
+    );
+    if let Some(h) = hdr {
+        detail += &format!(" \u{b7} MaxCLL {:.0}", h.max_cll);
+    }
+    InfoSection {
+        label: "OUT".into(),
+        line: format!("{name} \u{b7} {what}"),
+        detail,
+    }
 }
 
 /// A picture size as people say it.
@@ -927,6 +1019,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     }
     let mut det = Detector::default();
     let mut crops = 0u64;
+    // For the info panel: the last ten seconds' timings, and when and why
+    // the crop last changed.
+    let window = RefCell::new(Window::default());
+    let crop_change: Cell<Option<(Instant, &'static str)>> = Cell::new(None);
     let mut detect = |frame: &Frame, kind: Kind, t: f64, epoch: u32| -> geo::Source {
         if !opts.config.crop {
             return geo::Source::Whole;
@@ -936,9 +1032,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             && let Some(px) = frame.pixels()
             && let Some(v) = V210::new(px.bytes(), info.width, info.height, info.row_bytes)
         {
+            let t0 = Instant::now();
             let d = det.push(&v, t, epoch);
+            window.borrow_mut().detect(Instant::now(), ms(t0));
             if d.changed {
                 crops += 1;
+                crop_change.set(Some((Instant::now(), d.diag.reason)));
                 let c = d.crop;
                 info!(
                     "{t:.1} s: crop {}/{} ({}): picture {} x {} rows, {:.3}:1",
@@ -1027,6 +1126,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         opts.config.banners,
     );
     let mut enc = encoding_for(signal_of(hdr));
+    // The remote and keyboards, read on their own thread.
+    let keys = KeyReader::start(Path::new("/dev/input"), |line| info!("{line}"));
+    let mut info_at: Option<Instant> = None;
+    let mut cur_mode = mode;
     let now = Instant::now();
     match (&start_key, &start_input) {
         (Some(key), Some(input)) => {
@@ -1124,6 +1227,47 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         _ => "off".into(),
                     }
                 );
+            }
+            for a in keys.drain() {
+                info!(
+                    "{:.1} s: key {}",
+                    run_started.elapsed().as_secs_f64(),
+                    a.name()
+                );
+                match a {
+                    Action::Info => ui.toggle_info(Instant::now()),
+                    Action::Back => ui.close_info(),
+                    // The menu (#75) comes later.
+                    _ => {}
+                }
+            }
+            if !ui.info_open() {
+                info_at = None;
+            } else if info_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                let now = Instant::now();
+                info_at = Some(now);
+                let rows = opts.config.crop.then_some(match last_source {
+                    geo::Source::Rows { top, bottom } => (top, bottom),
+                    _ => (0, 0),
+                });
+                ui.set_info(InfoText {
+                    sections: vec![
+                        input_section(last_key, last_format, dark, opts.config.lldv),
+                        output_section(
+                            last_key,
+                            dark,
+                            opts.config.lldv,
+                            policy.committed().signal,
+                            cur_mode,
+                        ),
+                        status::crop_section(
+                            last_key.filter(|_| !dark).map(|k| (k.width, k.height)),
+                            rows,
+                            crop_change.get().map(|(at, why)| (now - at, why)),
+                        ),
+                        window.borrow_mut().section(now, period),
+                    ],
+                });
             }
             let taken = if ready.is_none() {
                 mailbox.take_wait(take_timeout)
@@ -1278,6 +1422,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     )? {
                         ready = Some(free);
                         ui.set_slate(None);
+                        if let Some(&r) = stages.render.last() {
+                            window.borrow_mut().render(Instant::now(), r);
+                        }
                     } else {
                         // Nothing renders this format: black, not the last
                         // picture held over it.
@@ -1348,6 +1495,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 std::mem::take(&mut pacing),
                             ));
                             period = modes[i].period();
+                            cur_mode = modes[i];
                             take_timeout = period.mul_f64(0.8).min(Duration::from_millis(35));
                             out_color = color_for(w.signal);
                             enc = encoding_for(w.signal);
@@ -1391,10 +1539,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 Some(b) => {
                     counts.shown += 1;
                     pending = b;
+                    window.borrow_mut().flip(Instant::now(), true);
                 }
                 None => {
                     counts.repeats += 1;
                     pending = front;
+                    window.borrow_mut().flip(Instant::now(), false);
                 }
             }
             ui.update(&mut out, enc, Instant::now());
@@ -1753,6 +1903,41 @@ mod tests {
         );
         assert_eq!(rate_name(50000), "50");
         assert_eq!(size_name(2560, 1440), "2560 \u{d7} 1440");
+    }
+
+    #[test]
+    fn the_info_panel_says_what_comes_in_and_goes_out() {
+        let key = |kind| Key {
+            width: 3840,
+            height: 2160,
+            kind,
+        };
+        let lldv = Some(key(ycbcr(Transfer::Bt1886)));
+        let s = input_section(lldv, None, false, true);
+        assert_eq!(
+            (s.line.as_str(), s.detail.as_str()),
+            ("Dolby Vision \u{b7} low latency", "3840 \u{d7} 2160")
+        );
+        assert_eq!(input_section(lldv, None, true, true).line, "No signal");
+        assert_eq!(input_section(None, None, false, true).line, "No signal");
+        // 4096x2160 at 23.976: 296,703 kHz over 5500 x 2250.
+        let mode = cinefit_kms::ModeTiming {
+            width: 4096,
+            height: 2160,
+            clock_khz: 296_703,
+            htotal: 5500,
+            vtotal: 2250,
+            interlaced: false,
+            preferred: false,
+        };
+        let out = output_section(lldv, false, true, follow::Signal::Sdr, mode);
+        assert_eq!(out.line, "SDR BT.2020 \u{b7} unchanged from the player");
+        assert_eq!(out.detail, "4096 \u{d7} 2160 \u{b7} 23.976");
+        let pq = Some(key(ycbcr(Transfer::Pq)));
+        let mapped = output_section(pq, false, true, follow::Signal::Sdr, mode);
+        assert_eq!(mapped.line, "SDR BT.2020 \u{b7} tone-mapped by cinefit");
+        let waiting = output_section(None, false, true, follow::Signal::Sdr, mode);
+        assert_eq!(waiting.line, "SDR BT.2020 \u{b7} black, waiting");
     }
 
     #[test]

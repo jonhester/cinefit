@@ -17,6 +17,7 @@ It is developed and tested with a JVC RS3000 (a 4096x2160 panel).
 | `cinefit-dovi` | tunneled Dolby Vision metadata from pixel parity (ETSI GS CCM 001 §6) | anything but bytes |
 | `cinefit-detect` | the bar detector: rows of luma and chroma in, rows of bar out | capture, GPU, display |
 | `cinefit-geometry` | constant-image-height geometry: the screen window, placements, crops from measured rows | anything but arithmetic |
+| `cinefit-input` | the remote and keyboards from `/dev/input` (evdev), as actions | everything else |
 | `cinefit-kms` | KMS output: modesetting, flips, HDR signalling, GBM scanout buffers | libplacebo, Vulkan |
 | `cinefit-render` | libplacebo on Vulkan through a C shim; holds the GPU's clocks | KMS, capture |
 
@@ -55,6 +56,7 @@ On the machine with the hardware:
     cinefit play --dry-run             # capture, mode, signalling, first render; display untouched
     cinefit play -t 30                 # capture to screen: puts the input on the display
     cinefit settings [--toml]          # every setting: value, range, cost, help
+    cinefit keys [-t 30]               # what each remote button means; takes the keyboards while it runs
 
 The installed service runs `~/cinefit-app/current play`, never a working
 tree. `tools/install.sh` builds the tree (or with `--release` downloads a

@@ -1,20 +1,27 @@
-//! What the overlay shows during `play`: the waiting slate (#76) while there
-//! is no picture, and a banner (#77) when the picture type changes. They
-//! never share the screen: a slate means there is no picture to label.
+//! What the overlay shows during `play`: the info panel (#72) while it is
+//! open, the waiting slate (#76) while there is no picture, and a banner
+//! (#77) when the picture type changes. One at a time, in that order.
 //!
 //! `play` says what is happening ([`Ui::set_slate`], [`Ui::picture`],
-//! [`Ui::resynced`]) and calls [`Ui::update`] before every flip and modeset,
-//! so a change rides the commit that shows the frame it belongs with: the
-//! picture's first frame takes the slate down. Drawing happens only when
-//! the content changes (minutes apart on a slate, once a banner); a fade is
+//! [`Ui::resynced`], [`Ui::toggle_info`]) and calls [`Ui::update`] before
+//! every flip and modeset, so a change rides the commit that shows the frame
+//! it belongs with: the picture's first frame takes the slate down. A fade is
 //! the plane's own opacity, a property in the commit.
+//!
+//! Drawing is on a thread of its own: text at 4K takes milliseconds, which
+//! the frame loop cannot spare at 60 Hz. The loop asks for a picture, and
+//! copies it into the overlay buffer once it is ready, a frame or two later;
+//! taking something down needs no drawing and happens at once.
 
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use cinefit_kms::Output;
 use log::{info, warn};
 
-use crate::osd::{self, Area, BannerText, Canvas, Corner, Encoding, Fonts, SlateText, Tone};
+use crate::osd::{
+    self, Area, BannerText, Canvas, Corner, Encoding, Fonts, InfoText, SlateText, Tone,
+};
 
 /// How long the slate stays in one corner, so nothing sits in one place on
 /// the screen for hours.
@@ -81,6 +88,10 @@ fn ago(d: Duration) -> String {
     }
 }
 
+/// The info panel closes by itself after this, so it is never left over a
+/// film by mistake.
+const INFO_FOR: Duration = Duration::from_secs(30);
+
 /// A banner waiting to be shown.
 enum Waiting {
     /// From this moment.
@@ -94,15 +105,81 @@ enum Waiting {
 enum Content {
     Slate(SlateText, Corner),
     Banner(BannerText),
+    Info(InfoText),
+}
+
+/// A picture asked of the drawing thread.
+struct Job {
+    content: Content,
+    enc: Encoding,
+}
+
+/// A picture the drawing thread made: `px` covers `area` of the raster.
+struct Painted {
+    content: Content,
+    enc: Encoding,
+    area: Area,
+    px: Vec<u8>,
+    ms: f64,
+}
+
+/// The drawing thread: jobs in, pictures out. Only the newest job is drawn;
+/// any queued behind it are skipped.
+struct Painter {
+    jobs: Sender<Job>,
+    done: Receiver<Painted>,
+}
+
+impl Painter {
+    fn start(raster: (usize, usize), band: (usize, usize)) -> Option<Self> {
+        let (jobs, job_rx) = channel::<Job>();
+        let (done_tx, done) = channel();
+        std::thread::Builder::new()
+            .name("osd".into())
+            .spawn(move || {
+                let fonts = Fonts::load();
+                while let Ok(mut job) = job_rx.recv() {
+                    while let Ok(newer) = job_rx.try_recv() {
+                        job = newer;
+                    }
+                    if done_tx.send(paint(&fonts, raster, band, job)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { jobs, done })
+    }
+}
+
+/// Draws one picture, off the overlay's memory.
+fn paint(fonts: &Fonts, raster: (usize, usize), band: (usize, usize), job: Job) -> Painted {
+    let started = Instant::now();
+    let area = match &job.content {
+        Content::Slate(_, corner) => osd::slate_area(raster, band, *corner),
+        Content::Banner(text) => osd::banner_area(raster, band.0, fonts, text),
+        Content::Info(text) => osd::info_area(raster, band, text),
+    };
+    let mut px = vec![0u8; area.w * 4 * area.h];
+    let mut c = Canvas::window(&mut px, area.w * 4, area, raster, job.enc);
+    match &job.content {
+        Content::Slate(text, corner) => osd::slate(&mut c, fonts, area, *corner, text),
+        Content::Banner(text) => osd::banner(&mut c, fonts, area, text),
+        Content::Info(text) => osd::info(&mut c, fonts, area, text),
+    }
+    Painted {
+        content: job.content,
+        enc: job.enc,
+        area,
+        px,
+        ms: started.elapsed().as_secs_f64() * 1000.0,
+    }
 }
 
 pub struct Ui {
-    fonts: Fonts,
+    painter: Option<Painter>,
     venue: String,
     banners: bool,
-    raster: (usize, usize),
-    /// The screen's band of the raster: top row and height.
-    band: (usize, usize),
     /// Two overlay buffers, drawn alternately so a redraw never shows half
     /// done; `None` without an overlay plane, when nothing is shown.
     buffers: Option<[usize; 2]>,
@@ -110,6 +187,10 @@ pub struct Ui {
     drawn: [Option<Area>; 2],
     /// The buffer on screen, what it holds, and in which encoding.
     shown: Option<(usize, Content, Encoding)>,
+    /// The picture last asked of the drawing thread.
+    asked: Option<(Content, Encoding)>,
+    /// The info panel: opened when, and what it says.
+    info: Option<(Instant, Option<InfoText>)>,
     fades: bool,
     started: Instant,
     slate: Option<Slate>,
@@ -149,15 +230,18 @@ impl Ui {
         if buffers.is_some() && !fades {
             info!("osd: the overlay plane has no opacity property: banners appear without fades");
         }
+        let raster = (raster.0 as usize, raster.1 as usize);
+        let band = (band.0 as usize, band.1 as usize);
+        let painter = buffers.and_then(|_| Painter::start(raster, band));
         Self {
-            fonts: Fonts::load(),
+            painter,
             venue: venue.to_string(),
             banners,
-            raster: (raster.0 as usize, raster.1 as usize),
-            band: (band.0 as usize, band.1 as usize),
             buffers,
             drawn: [None; 2],
             shown: None,
+            asked: None,
+            info: None,
             fades,
             started: Instant::now(),
             slate: None,
@@ -201,6 +285,31 @@ impl Ui {
         self.waiting = Some((text, when));
     }
 
+    /// The remote's Info button: opens the panel, or closes it.
+    pub fn toggle_info(&mut self, now: Instant) {
+        self.info = match self.info {
+            Some(_) => None,
+            None => Some((now, None)),
+        };
+    }
+
+    /// The remote's Back: closes the panel.
+    pub fn close_info(&mut self) {
+        self.info = None;
+    }
+
+    /// Whether the panel is open, so `play` gives it what to say.
+    pub fn info_open(&self) -> bool {
+        self.info.is_some()
+    }
+
+    /// What the open panel says; `play` refreshes it about once a second.
+    pub fn set_info(&mut self, text: InfoText) {
+        if let Some((_, t)) = self.info.as_mut() {
+            *t = Some(text);
+        }
+    }
+
     /// The output has just changed mode: a banner waiting for it shows
     /// [`AFTER_RESYNC`] from now.
     pub fn resynced(&mut self, now: Instant) {
@@ -213,41 +322,77 @@ impl Ui {
     /// before every flip and modeset, with the encoding that commit's output
     /// will have.
     pub fn update(&mut self, out: &mut Output, enc: Encoding, now: Instant) {
-        let Some(buffers) = self.buffers else {
+        let (Some(buffers), true) = (self.buffers, self.painter.is_some()) else {
             return;
         };
         let (content, alpha) = self.want(now);
         let Some(content) = content else {
+            // Down at once: nothing to draw.
             if self.shown.take().is_some() {
                 out.set_overlay(None);
             }
+            self.asked = None;
             return;
         };
-        if self
+        let up_to_date = self
             .shown
             .as_ref()
-            .is_none_or(|(_, c, e)| *c != content || *e != enc)
-        {
-            // The buffer not on screen: the last commit has completed, so
-            // nothing scans it out.
-            let i = match &self.shown {
-                Some((b, ..)) if *b == buffers[0] => 1,
-                _ => 0,
-            };
-            if let Err(e) = self.draw(out, buffers[i], i, &content, enc) {
-                warn!("osd: drawing failed, so no slate or banners from now: {e}");
-                self.buffers = None;
-                out.set_overlay(None);
-                return;
+            .is_some_and(|(_, c, e)| *c == content && *e == enc);
+        if !up_to_date {
+            let painter = self.painter.as_ref().expect("checked above");
+            let wanted = (content, enc);
+            if self.asked.as_ref() != Some(&wanted) {
+                let job = Job {
+                    content: wanted.0.clone(),
+                    enc,
+                };
+                if painter.jobs.send(job).is_err() {
+                    warn!("osd: the drawing thread is gone, so no overlay from now");
+                    self.buffers = None;
+                    out.set_overlay(None);
+                    return;
+                }
+                self.asked = Some(wanted);
             }
-            out.set_overlay(Some(buffers[i]));
-            self.shown = Some((buffers[i], content, enc));
+            // The newest picture ready, if it is the one wanted now.
+            let mut ready = None;
+            while let Ok(p) = painter.done.try_recv() {
+                ready = Some(p);
+            }
+            if let Some(p) = ready
+                && self
+                    .asked
+                    .as_ref()
+                    .is_some_and(|(c, e)| *c == p.content && *e == p.enc)
+            {
+                // The buffer not on screen: the last commit has completed,
+                // so nothing scans it out.
+                let i = match &self.shown {
+                    Some((b, ..)) if *b == buffers[0] => 1,
+                    _ => 0,
+                };
+                if let Err(e) = self.blit(out, buffers[i], i, &p) {
+                    warn!("osd: copying into the overlay failed, so no overlay from now: {e}");
+                    self.buffers = None;
+                    out.set_overlay(None);
+                    return;
+                }
+                out.set_overlay(Some(buffers[i]));
+                self.shown = Some((buffers[i], p.content, p.enc));
+            }
         }
         out.set_overlay_alpha((alpha * 65535.0).round() as u16);
     }
 
     /// What should show now, and at what opacity.
     fn want(&mut self, now: Instant) -> (Option<Content>, f32) {
+        if let Some((opened, text)) = &self.info {
+            if now - *opened >= INFO_FOR {
+                self.info = None;
+            } else if let Some(t) = text {
+                return (Some(Content::Info(t.clone())), 1.0);
+            }
+        }
         if let Some(slate) = &self.slate {
             let turns = (now - self.started).as_secs() / CORNER_EVERY.as_secs();
             let corner = [
@@ -289,28 +434,17 @@ impl Ui {
         (Some(Content::Banner(text.clone())), alpha.clamp(0.0, 1.0))
     }
 
-    /// Draws `content` into overlay buffer `buffer` (slot `slot`): off the
-    /// overlay's memory, which is slow to read, then copied in, clearing
-    /// what was drawn there before.
-    fn draw(
+    /// Copies a drawn picture into overlay buffer `buffer` (slot `slot`),
+    /// clearing what was drawn there before.
+    fn blit(
         &mut self,
         out: &mut Output,
         buffer: usize,
         slot: usize,
-        content: &Content,
-        enc: Encoding,
+        p: &Painted,
     ) -> Result<(), cinefit_kms::Error> {
         let started = Instant::now();
-        let area = match content {
-            Content::Slate(_, corner) => osd::slate_area(self.raster, self.band, *corner),
-            Content::Banner(text) => osd::banner_area(self.raster, self.band.0, &self.fonts, text),
-        };
-        let mut px = vec![0u8; area.w * 4 * area.h];
-        let mut c = Canvas::window(&mut px, area.w * 4, area, self.raster, enc);
-        match content {
-            Content::Slate(text, corner) => osd::slate(&mut c, &self.fonts, area, *corner, text),
-            Content::Banner(text) => osd::banner(&mut c, &self.fonts, area, text),
-        }
+        let area = p.area;
         let old = self.drawn[slot].replace(area);
         out.draw_overlay(buffer, |dst, pitch| {
             if let Some(o) = old {
@@ -322,18 +456,20 @@ impl Ui {
                 .chunks_mut(pitch)
                 .skip(area.y)
                 .take(area.h)
-                .zip(px.chunks(area.w * 4))
+                .zip(p.px.chunks(area.w * 4))
             {
                 row[area.x * 4..(area.x + area.w) * 4].copy_from_slice(src);
             }
         })?;
-        let what = match content {
+        let what = match &p.content {
             Content::Slate(t, _) => format!("slate \"{}\"", t.state),
             Content::Banner(t) => format!("banner \"{} / {}\"", t.title, t.detail),
+            Content::Info(_) => "info".to_string(),
         };
         if what != self.logged {
             info!(
-                "osd: {what} drawn in {:.1} ms",
+                "osd: {what} drawn in {:.1} ms off the frame loop, copied in {:.1} ms",
+                p.ms,
                 started.elapsed().as_secs_f64() * 1000.0
             );
             self.logged = what;
@@ -349,14 +485,14 @@ mod tests {
     /// A UI with no output, to test what it wants shown when.
     fn bare(banners: bool) -> Ui {
         Ui {
-            fonts: Fonts::load(),
+            painter: None,
             venue: "The Screening Room".into(),
             banners,
-            raster: (4096, 2160),
-            band: (209, 1742),
             buffers: None,
             drawn: [None; 2],
             shown: None,
+            asked: None,
+            info: None,
             fades: true,
             started: Instant::now(),
             slate: None,
@@ -447,6 +583,41 @@ mod tests {
         ui.set_slate(None);
         ui.picture(text("Dolby Vision"), false, later);
         assert!(ui.want(later).0.is_none());
+    }
+
+    #[test]
+    fn info_opens_and_closes_and_comes_before_the_rest() {
+        let mut ui = bare(true);
+        let t0 = Instant::now();
+        let text = InfoText {
+            sections: vec![osd::InfoSection {
+                label: "IN".into(),
+                line: "HDR10".into(),
+                detail: String::new(),
+            }],
+        };
+        ui.set_slate(Some(Slate::NoSignal));
+        ui.toggle_info(t0);
+        assert!(ui.info_open());
+        // Open but with nothing to say yet: the slate stays.
+        assert!(matches!(ui.want(t0).0, Some(Content::Slate(..))));
+        ui.set_info(text.clone());
+        assert_eq!(ui.want(t0 + MS).0, Some(Content::Info(text.clone())));
+        // Info again closes it; so does Back.
+        ui.toggle_info(t0 + MS);
+        assert!(!ui.info_open() && matches!(ui.want(t0 + MS).0, Some(Content::Slate(..))));
+        ui.toggle_info(t0);
+        ui.close_info();
+        assert!(!ui.info_open());
+        // Left open, it closes by itself.
+        ui.toggle_info(t0);
+        ui.set_info(text);
+        assert!(matches!(
+            ui.want(t0 + INFO_FOR - MS).0,
+            Some(Content::Info(_))
+        ));
+        assert!(matches!(ui.want(t0 + INFO_FOR).0, Some(Content::Slate(..))));
+        assert!(!ui.info_open());
     }
 
     #[test]
