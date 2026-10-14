@@ -14,8 +14,8 @@
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 16px/1.4 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
   main { max-width: 1500px; margin: 0 auto; padding: 18px; display: grid; gap: 18px; }
-  /* A desktop or tablet: the picture and status take the wider column,
-     the settings sit beside them and scroll on their own. */
+  /* A desktop or tablet: the status takes the wider column, the settings
+     sit beside it and scroll on their own. */
   @media (min-width: 900px) {
     main { grid-template-columns: 3fr 2fr; align-items: start; padding: 28px; gap: 28px; }
     #settings { max-height: calc(100vh - 120px); overflow-y: auto; position: sticky; top: 28px; }
@@ -26,10 +26,6 @@
   .pill { background: #24203a; color: var(--accent); border-radius: 999px; padding: 4px 14px; font-weight: 600; }
   .pill.attention { color: var(--attention); } .pill.error { color: var(--error); }
   .card { background: var(--card); border-radius: 14px; padding: 14px 16px; }
-  .preview { position: relative; padding: 8px; border: 1px solid var(--line); }
-  .preview img { display: block; width: 100%; aspect-ratio: 17 / 9; background: #000; border-radius: 6px; object-fit: contain; }
-  .live { position: absolute; top: 14px; left: 14px; background: #000a; border-radius: 999px; padding: 2px 10px; font-size: 13px; }
-  .live::before { content: "\25CF  "; color: var(--error); }
   .now div { display: grid; grid-template-columns: 5.5em 1fr; margin: 6px 0; }
   .label { color: var(--accent); font-weight: 600; font-size: 13px; letter-spacing: 1px; padding-top: 2px; }
   .detail { color: var(--hint); font-size: 14px; }
@@ -55,8 +51,7 @@
 <main>
   <header><div class="wordmark">cine<span>fit</span></div><div id="pill" class="pill">…</div></header>
   <section>
-    <div class="card preview"><img id="preview" alt="The screen as shown"><div class="live" id="live">LIVE</div></div>
-    <div class="card now" id="now" style="margin-top:18px"></div>
+    <div class="card now" id="now"></div>
     <h2 style="margin-top:22px">RECENT RUNS AND LOGS</h2>
     <div class="card logs" id="logs"></div>
   </section>
@@ -148,35 +143,6 @@ async function poll() {
   catch (e) { document.getElementById("pill").textContent = "No answer"; }
 }
 
-// The preview: a motion-JPEG stream (every frame), shown
-// as the image's source, which browsers play natively. Stopped while the
-// tab is hidden, so a forgotten tab costs cinefit nothing. If the stream
-// fails, a still once a second instead.
-const img = () => document.getElementById("preview");
-let streaming = true, shown;
-function startStream() { img().src = "/api/stream.mjpg?t=" + Date.now(); }
-function stopStream() { img().src = ""; }
-async function still() {
-  if (streaming || document.visibilityState !== "visible") return;
-  try {
-    const r = await fetch("/api/preview.jpg", { cache: "no-store" });
-    if (r.status !== 200) return;
-    const url = URL.createObjectURL(await r.blob());
-    img().src = url;
-    if (shown) URL.revokeObjectURL(shown);
-    shown = url;
-  } catch (e) {}
-}
-img().addEventListener("error", () => {
-  if (!streaming || !img().src.includes("stream")) return;
-  streaming = false;
-  document.getElementById("live").textContent = "LIVE · 1/s";
-});
-document.addEventListener("visibilitychange", () => {
-  if (!streaming) return;
-  document.visibilityState === "visible" ? startStream() : stopStream();
-});
-
 async function logs() {
   const list = document.getElementById("logs"); list.replaceChildren();
   try {
@@ -187,9 +153,8 @@ async function logs() {
   } catch (e) {}
 }
 
-poll(); logs(); startStream();
+poll(); logs();
 setInterval(poll, 1000);
-setInterval(still, 1000);
 setInterval(logs, 30000);
 </script>
 </body>
