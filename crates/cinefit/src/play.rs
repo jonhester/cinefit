@@ -1426,6 +1426,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     geo::Source::Rows { top, bottom } => (top, bottom),
                     _ => (0, 0),
                 });
+                // Read first: the window is borrowed again for LAST 10 S
+                // below, and two borrows in one statement panic.
+                let brightest = window.borrow_mut().brightest(now);
                 ui.set_info(InfoText {
                     sections: vec![
                         input_section(
@@ -1433,7 +1436,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             last_format,
                             dark,
                             opts.config.lldv.then_some(opts.config.lldv_nits),
-                            window.borrow_mut().brightest(now),
+                            brightest,
                         ),
                         output_section(
                             last_key,
