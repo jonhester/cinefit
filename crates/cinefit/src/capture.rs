@@ -485,6 +485,7 @@ mod tests {
             has_input: true,
             color: NO_COLOR,
             dolby_vision_flagged: false,
+            dolby_vision_bytes: None,
         }
     }
 

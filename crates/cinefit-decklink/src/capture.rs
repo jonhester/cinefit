@@ -202,6 +202,9 @@ pub struct FrameInfo {
     /// The card's own Dolby Vision flag. The SDK documents Dolby Vision
     /// metadata for output only; this records whether input ever sets it.
     pub dolby_vision_flagged: bool,
+    /// Bytes of Dolby Vision metadata attached to the frame, if any: asked
+    /// of every frame, flagged or not.
+    pub dolby_vision_bytes: Option<u32>,
 }
 
 impl From<&ffi::FrameInfo> for FrameInfo {
@@ -217,6 +220,7 @@ impl From<&ffi::FrameInfo> for FrameInfo {
             has_input: raw.flags & FRAME_HAS_NO_INPUT_SOURCE == 0,
             color: ColorInfo::from(raw),
             dolby_vision_flagged: raw.flags & FRAME_CONTAINS_DOLBY_VISION_METADATA != 0,
+            dolby_vision_bytes: known(raw.dolby_vision_bytes).and_then(|n| u32::try_from(n).ok()),
         }
     }
 }

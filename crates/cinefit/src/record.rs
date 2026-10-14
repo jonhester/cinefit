@@ -417,6 +417,7 @@ mod tests {
                 hdr: None,
             },
             dolby_vision_flagged: false,
+            dolby_vision_bytes: None,
         }
     }
 

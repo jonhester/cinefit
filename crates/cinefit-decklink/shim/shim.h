@@ -109,6 +109,10 @@ typedef struct {
     double   min_mastering;         /* cd/m2 */
     double   max_cll;               /* cd/m2 */
     double   max_fall;              /* cd/m2 */
+    /* Bytes of Dolby Vision metadata the card attaches, or CF_DL_UNKNOWN for
+     * none. Asked of every frame, flagged or not: whether HDMI input ever
+     * carries any is what is being found out. */
+    int64_t  dolby_vision_bytes;
 } cf_dl_frame_info;
 
 /* Both callbacks run on the SDK's thread and must return quickly: stalling

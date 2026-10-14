@@ -221,6 +221,7 @@ pub(crate) mod tests {
             min_mastering: f64::NAN,
             max_cll: f64::NAN,
             max_fall: f64::NAN,
+            dolby_vision_bytes: ffi::UNKNOWN,
         }
     }
 
