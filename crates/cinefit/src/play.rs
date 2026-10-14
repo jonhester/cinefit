@@ -954,7 +954,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         // A second press is the way out of a run that hangs, so it exits on
         // the spot; the log says so, rather than just stopping.
         if presses > 1 {
-            warn!("second Ctrl-C: exiting at once, without the summary");
+            warn!("second Ctrl-C or SIGTERM: exiting at once, without the summary");
             std::process::exit(130);
         }
         flag.store(true, Ordering::Relaxed);
@@ -1256,8 +1256,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let failed_restarts = capture.failed_restarts();
     drop(capture);
 
+    // The handler cannot tell which signal it was: the service stops with
+    // SIGTERM, and the journal should not claim someone pressed Ctrl-C.
     if stop.load(Ordering::Relaxed) {
-        info!("stopped early by Ctrl-C");
+        info!("stopped by Ctrl-C or SIGTERM");
     }
     if looped.is_err() {
         info!("stopped early by an error, reported after the summary");

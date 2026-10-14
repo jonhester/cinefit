@@ -384,7 +384,7 @@ fn capture(
     drop(running);
 
     if interrupted {
-        println!("stopped early by Ctrl-C");
+        println!("stopped by Ctrl-C or SIGTERM");
     }
     print!("{}", capture::lock(&stats).summary(ran, failed_restarts));
     if let Some(clip) = &clip {
@@ -652,7 +652,7 @@ fn pattern(run: PatternRun) -> Result<(), Box<dyn std::error::Error>> {
     println!("{restored}; now: {}", out.hdr_state());
 
     if stop.load(Ordering::Relaxed) {
-        println!("stopped early by Ctrl-C");
+        println!("stopped by Ctrl-C or SIGTERM");
     }
     println!("ran {:.1} s", started.elapsed().as_secs_f64());
     print!("{}", pacing.summary(mode.period()));
