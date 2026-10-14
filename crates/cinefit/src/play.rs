@@ -482,26 +482,23 @@ fn output_section(
     if let Some(h) = hdr {
         detail += &format!(" \u{b7} MaxCLL {:.0}", h.max_cll);
     }
-    // What went out, read back from the frame on screen: SDR through its
-    // gamma to cinefit's white, PQ as light. HLG has no absolute level.
-    if let Some(v) = shown {
-        match signal {
-            follow::Signal::Sdr => {
-                detail += &format!(
-                    " \u{b7} brightest {:.0} nits",
-                    v.powf(2.4) * f64::from(white_nits)
-                );
-            }
-            follow::Signal::Hdr(h) if h.eotf == cinefit_kms::Eotf::Pq => {
-                detail += &format!(" \u{b7} brightest {:.0} nits", pq_nits(v));
-            }
-            follow::Signal::Hdr(_) => {}
-        }
+    if let Some(n) = shown.and_then(|v| out_nits(v, signal, white_nits)) {
+        detail += &format!(" \u{b7} brightest {n:.0} nits");
     }
     InfoSection {
         label: "OUT".into(),
         line: format!("{name} \u{b7} {what}"),
         detail,
+    }
+}
+
+/// A level read back from the output (0-1) as light: SDR through its gamma
+/// to cinefit's white, PQ as it is. HLG has no absolute level.
+fn out_nits(v: f64, signal: follow::Signal, white_nits: u16) -> Option<f64> {
+    match signal {
+        follow::Signal::Sdr => Some(v.powf(2.4) * f64::from(white_nits)),
+        follow::Signal::Hdr(h) if h.eotf == cinefit_kms::Eotf::Pq => Some(pq_nits(v)),
+        follow::Signal::Hdr(_) => None,
     }
 }
 
@@ -1430,8 +1427,35 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             }
             if run_started.elapsed() >= next_status {
                 next_status += STATUS_EVERY;
+                // The input's brightest of the last ten seconds against what
+                // went out on this frame: whether the renderer passes it
+                // through or maps it down, without the panel open.
+                let levels = {
+                    let brightest = window.borrow_mut().brightest(Instant::now());
+                    let shown = out
+                        .read_scanout(buffers[front], |px, stride| {
+                            scanout_peak(px, stride, scan_fourcc, size)
+                        })
+                        .ok()
+                        .flatten();
+                    let signal = policy.committed().signal;
+                    match (last_key.filter(|_| !dark), brightest) {
+                        (Some(k), Some(b)) => format!(
+                            "; in {}, out {}",
+                            peak_words(
+                                k.kind,
+                                b,
+                                opts.config.lldv.then_some(opts.config.lldv_nits)
+                            ),
+                            shown
+                                .and_then(|v| out_nits(v, signal, opts.config.white_nits))
+                                .map_or_else(|| "-".into(), |n| format!("brightest {n:.0} nits"))
+                        ),
+                        _ => String::new(),
+                    }
+                };
                 info!(
-                    "{:.0} s: shown {}, vblanks repeated {}, replaced unseen {}, unrendered {}; crop {}",
+                    "{:.0} s: shown {}, vblanks repeated {}, replaced unseen {}, unrendered {}; crop {}{levels}",
                     run_started.elapsed().as_secs_f64(),
                     counts.shown,
                     counts.repeats,
