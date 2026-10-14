@@ -7,7 +7,9 @@
 //! offers no per-plane colour conversion, so its code values must already
 //! mean the right light for what the output signals: a gamma of 2.4 for SDR,
 //! absolute light through PQ for HDR10. UI shades are given as a fraction of
-//! UI white, which is SDR white, or [`UI_WHITE_NITS`] under PQ.
+//! UI white, which is SDR white, or [`UI_WHITE_NITS`] under PQ. The output
+//! is BT.2020 in both (SDR is signalled as BT.2020 too), so the palette's
+//! colours, picked on BT.709 screens, are converted to its primaries.
 //!
 //! Text is Inter (SIL Open Font License, `assets/fonts/OFL-Inter.txt`),
 //! rasterised by fontdue.
@@ -36,6 +38,66 @@ pub fn encode(level: f32, enc: Encoding) -> u8 {
         Encoding::Pq => pq(l * UI_WHITE_NITS),
     };
     (v * 255.0).round() as u8
+}
+
+/// A UI colour: linear light in BT.709 primaries, each a fraction of UI
+/// white.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rgb(pub f32, pub f32, pub f32);
+
+impl Rgb {
+    pub const fn grey(level: f32) -> Self {
+        Self(level, level, level)
+    }
+
+    /// A palette colour as written, `#rrggbb`: code values as a gamma-2.4
+    /// screen shows them, so a grey comes out with the same code in SDR.
+    pub fn hex(rgb: u32) -> Self {
+        let c = |shift: u32| (((rgb >> shift) & 0xff) as f32 / 255.0).powf(2.4);
+        Self(c(16), c(8), c(0))
+    }
+
+    /// As 8-bit code values for `enc`, red first: in BT.2020 primaries,
+    /// then encoded. Greys are unchanged by the conversion.
+    pub fn encode(self, enc: Encoding) -> [u8; 3] {
+        // BT.2087's BT.709-to-BT.2020 matrix, on linear light.
+        let Rgb(r, g, b) = self;
+        [
+            0.6274 * r + 0.3293 * g + 0.0433 * b,
+            0.0691 * r + 0.9195 * g + 0.0114 * b,
+            0.0164 * r + 0.0880 * g + 0.8956 * b,
+        ]
+        .map(|l| encode(l, enc))
+    }
+}
+
+/// The palette (#72): text in three tiers, the accent, and two status
+/// colours that tint words only.
+pub mod palette {
+    use super::Rgb;
+
+    pub fn text() -> Rgb {
+        Rgb::hex(0xece8e1)
+    }
+    pub fn secondary() -> Rgb {
+        Rgb::hex(0xb3aec2)
+    }
+    pub fn hint() -> Rgb {
+        Rgb::hex(0x9f99b2)
+    }
+    pub fn accent() -> Rgb {
+        Rgb::hex(0xb9a6ff)
+    }
+    pub fn attention() -> Rgb {
+        Rgb::hex(0xf6b26b)
+    }
+    pub fn error() -> Rgb {
+        Rgb::hex(0xf2666b)
+    }
+    /// The banner's panel, behind its text at 80% opacity.
+    pub fn panel() -> Rgb {
+        Rgb::hex(0x0b0b10)
+    }
 }
 
 /// SMPTE ST 2084's inverse EOTF: nits to a signal value in 0..1.
@@ -67,60 +129,82 @@ impl Fonts {
 pub enum Align {
     Left,
     Centre,
+    Right,
 }
 
-/// An overlay buffer to draw into: BGRA bytes, premultiplied alpha.
+/// An overlay buffer to draw into: BGRA bytes, premultiplied alpha. It may
+/// hold only a window of the raster ([`Canvas::window`]); coordinates are
+/// always the raster's.
 pub struct Canvas<'a> {
     px: &'a mut [u8],
     pitch: usize,
-    w: usize,
-    h: usize,
+    /// The part of the raster `px` holds.
+    win: Area,
+    /// The whole raster's size, which sizes the type.
+    raster: (usize, usize),
     enc: Encoding,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(px: &'a mut [u8], pitch: usize, w: usize, h: usize, enc: Encoding) -> Self {
+        Self::window(px, pitch, Area { x: 0, y: 0, w, h }, (w, h), enc)
+    }
+
+    /// A canvas holding only `win` of a `raster`-sized overlay: drawing is
+    /// clipped to it. For drawing off the overlay's own memory, which is
+    /// slow to read, and copying in the result.
+    pub fn window(
+        px: &'a mut [u8],
+        pitch: usize,
+        win: Area,
+        raster: (usize, usize),
+        enc: Encoding,
+    ) -> Self {
         Self {
             px,
             pitch,
-            w,
-            h,
+            win,
+            raster,
             enc,
         }
     }
 
+    /// The raster's size.
     pub fn size(&self) -> (usize, usize) {
-        (self.w, self.h)
+        self.raster
     }
 
     /// Everything transparent.
     pub fn clear(&mut self) {
-        for row in self.px.chunks_mut(self.pitch).take(self.h) {
-            row[..self.w * 4].fill(0);
+        for row in self.px.chunks_mut(self.pitch).take(self.win.h) {
+            row[..self.win.w * 4].fill(0);
         }
     }
 
-    /// One pixel of grey `level` at coverage `a`, over what is there.
-    fn blend(&mut self, x: usize, y: usize, code: u8, a: f32) {
-        if x >= self.w || y >= self.h || a <= 0.0 {
+    /// One pixel of `rgb` (code values, red first) at coverage `a`, over
+    /// what is there.
+    fn blend(&mut self, x: usize, y: usize, rgb: [u8; 3], a: f32) {
+        let Area { x: x0, y: y0, w, h } = self.win;
+        if x < x0 || y < y0 || x >= x0 + w || y >= y0 + h || a <= 0.0 {
             return;
         }
-        let o = y * self.pitch + x * 4;
+        let o = (y - y0) * self.pitch + (x - x0) * 4;
         let p = &mut self.px[o..o + 4];
-        let src = f32::from(code) * a;
-        for c in &mut p[..3] {
-            *c = (src + f32::from(*c) * (1.0 - a)).round() as u8;
+        // BGRA in memory.
+        for (c, code) in p[..3].iter_mut().zip([rgb[2], rgb[1], rgb[0]]) {
+            *c = (f32::from(code) * a + f32::from(*c) * (1.0 - a)).round() as u8;
         }
         p[3] = (255.0 * a + f32::from(p[3]) * (1.0 - a)).round() as u8;
     }
 
-    /// `area` in grey `level` at opacity `alpha`, corners rounded by `radius`.
-    pub fn rect(&mut self, area: Area, radius: usize, level: f32, alpha: f32) {
+    /// `area` in `colour` at opacity `alpha`, corners rounded by `radius`.
+    pub fn rect(&mut self, area: Area, radius: usize, colour: Rgb, alpha: f32) {
         let Area { x, y, w, h } = area;
-        let code = encode(level, self.enc);
+        let code = colour.encode(self.enc);
         let r = radius as f32;
-        for yy in y..(y + h).min(self.h) {
-            for xx in x..(x + w).min(self.w) {
+        let (rw, rh) = self.raster;
+        for yy in y..(y + h).min(rh) {
+            for xx in x..(x + w).min(rw) {
                 // Distance outside the rounded corner, for a soft edge.
                 let (dx, dy) = (
                     (r - (xx - x) as f32 - 0.5).max((xx - x) as f32 + 0.5 - (w as f32 - r)),
@@ -142,15 +226,16 @@ impl<'a> Canvas<'a> {
         let Style {
             font,
             size,
-            level,
+            colour,
             align,
         } = style;
         let width = measure(font, size, text);
         let mut pen = match align {
             Align::Left => x,
             Align::Centre => x - width / 2.0,
+            Align::Right => x - width,
         };
-        let code = encode(level, self.enc);
+        let code = colour.encode(self.enc);
         let mut prev = None;
         for c in text.chars() {
             if let Some(p) = prev {
@@ -181,22 +266,21 @@ pub struct Area {
     pub h: usize,
 }
 
-/// How a line of text is set: font, size in pixels, grey (a fraction of UI
-/// white) and alignment.
+/// How a line of text is set: font, size in pixels, colour and alignment.
 #[derive(Clone, Copy)]
 pub struct Style<'f> {
     pub font: &'f Font,
     pub size: f32,
-    pub level: f32,
+    pub colour: Rgb,
     pub align: Align,
 }
 
 impl<'f> Style<'f> {
-    pub fn new(font: &'f Font, size: f32, level: f32, align: Align) -> Self {
+    pub fn new(font: &'f Font, size: f32, colour: Rgb, align: Align) -> Self {
         Self {
             font,
             size,
-            level,
+            colour,
             align,
         }
     }
@@ -216,48 +300,193 @@ pub fn measure(font: &Font, size: f32, text: &str) -> f32 {
     w
 }
 
-/// The waiting slate: a state in plain words and a line of detail, centred
-/// at `(cx, cy)`, dim. The caller moves the centre slowly over time.
-pub fn slate(c: &mut Canvas<'_>, fonts: &Fonts, cx: f32, cy: f32, state: &str, detail: &str) {
-    let s = c.size().1 as f32 / 2160.0;
-    let centred = |font, size, level| Style::new(font, size * s, level, Align::Centre);
-    c.text(
-        centred(&fonts.semibold, 34.0, 0.10),
-        cx,
-        cy - 70.0 * s,
-        "CINEFIT",
-    );
-    c.text(
-        centred(&fonts.regular, 88.0, 0.22),
-        cx,
-        cy + 20.0 * s,
-        state,
-    );
-    c.text(
-        centred(&fonts.regular, 40.0, 0.08),
-        cx,
-        cy + 90.0 * s,
-        detail,
-    );
+/// How a slate's state reads: plain, or tinted for attention or an error.
+/// The tint is on the words only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Plain,
+    Attention,
+    Error,
 }
 
-/// A banner: a title and a line of detail on a dark translucent panel, its
-/// top-left corner at `(x, y)`.
-pub fn banner(c: &mut Canvas<'_>, fonts: &Fonts, x: usize, y: usize, title: &str, detail: &str) {
+/// The four corners of the screen's band the slate moves between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corner {
+    BottomLeft,
+    BottomRight,
+    TopRight,
+    TopLeft,
+}
+
+/// What the slate says: the theater's name (empty for none), the state,
+/// and a line of detail (empty for none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlateText {
+    pub venue: String,
+    pub state: String,
+    pub detail: String,
+    pub tone: Tone,
+}
+
+/// Sizes and places, in pixels of a 2160-row raster (the mockups' 4096 x
+/// 2160, `docs/ui/slate.png`).
+const SLATE_MARGIN: f32 = 190.0;
+const SLATE_NAME: f32 = 120.0;
+const SLATE_STATE: f32 = 88.0;
+const SLATE_DETAIL: f32 = 72.0;
+/// Baselines below the name's: the state's and the detail's.
+const SLATE_STATE_DY: f32 = 162.0;
+const SLATE_DETAIL_DY: f32 = 290.0;
+/// The block's distance from the band's edge, cap height to descender.
+const SLATE_INSET: f32 = 140.0;
+
+/// The slate's box on the canvas for `corner`, with the screen's band at
+/// rows `band` (top, height): where [`slate`] draws, so that only it need be
+/// cleared or copied. Half the width, on the corner's side.
+pub fn slate_area(size: (usize, usize), band: (usize, usize), corner: Corner) -> Area {
+    let (w, h) = size;
+    let s = h as f32 / 2160.0;
+    let block = ((SLATE_DETAIL_DY + SLATE_NAME) * s + 2.0 * SLATE_INSET * s) as usize;
+    let block = block.min(band.1);
+    let y = match corner {
+        Corner::TopLeft | Corner::TopRight => band.0,
+        Corner::BottomLeft | Corner::BottomRight => band.0 + band.1 - block,
+    };
+    let x = match corner {
+        Corner::BottomLeft | Corner::TopLeft => 0,
+        Corner::BottomRight | Corner::TopRight => w / 2,
+    };
+    Area {
+        x,
+        y,
+        w: w - w / 2,
+        h: block,
+    }
+}
+
+/// The waiting slate, the quiet corner (#76): the theater's name, a notch
+/// larger, with the state and its detail beneath, small and dim, in `area`
+/// (from [`slate_area`]). The name sits at a fixed place and the lines below
+/// have their space kept, so a line coming or going never moves it; without a
+/// name the state keeps its own place.
+pub fn slate(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, corner: Corner, text: &SlateText) {
     let s = c.size().1 as f32 / 2160.0;
-    let title_style = Style::new(&fonts.semibold, 56.0 * s, 0.85, Align::Left);
-    let detail_style = Style::new(&fonts.regular, 38.0 * s, 0.55, Align::Left);
-    let pad = (40.0 * s) as usize;
-    let w = measure(title_style.font, title_style.size, title).max(measure(
-        detail_style.font,
-        detail_style.size,
-        detail,
-    )) as usize
-        + 2 * pad;
-    let h = (200.0 * s) as usize;
-    c.rect(Area { x, y, w, h }, (24.0 * s) as usize, 0.0, 0.6);
-    c.text(title_style, (x + pad) as f32, y as f32 + 92.0 * s, title);
-    c.text(detail_style, (x + pad) as f32, y as f32 + 152.0 * s, detail);
+    let right = matches!(corner, Corner::BottomRight | Corner::TopRight);
+    let (x, align) = if right {
+        ((area.x + area.w) as f32 - SLATE_MARGIN * s, Align::Right)
+    } else {
+        (area.x as f32 + SLATE_MARGIN * s, Align::Left)
+    };
+    // The name's cap height is about 0.73 of its size.
+    let name_y = area.y as f32 + SLATE_INSET * s + 0.73 * SLATE_NAME * s;
+    if !text.venue.is_empty() {
+        c.text(
+            Style::new(&fonts.semibold, SLATE_NAME * s, palette::hint(), align),
+            x,
+            name_y,
+            &text.venue,
+        );
+    }
+    let (font, colour) = match text.tone {
+        Tone::Plain => (&fonts.regular, palette::secondary()),
+        Tone::Attention => (&fonts.semibold, palette::attention()),
+        Tone::Error => (&fonts.semibold, palette::error()),
+    };
+    c.text(
+        Style::new(font, SLATE_STATE * s, colour, align),
+        x,
+        name_y + SLATE_STATE_DY * s,
+        &text.state,
+    );
+    if !text.detail.is_empty() {
+        c.text(
+            Style::new(&fonts.regular, SLATE_DETAIL * s, palette::hint(), align),
+            x,
+            name_y + SLATE_DETAIL_DY * s,
+            &text.detail,
+        );
+    }
+}
+
+/// What a banner says: the picture type, and a quiet line about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BannerText {
+    pub title: String,
+    pub detail: String,
+}
+
+const BANNER_X: f32 = 140.0;
+/// Below the band's top edge.
+const BANNER_DY: f32 = 95.0;
+const BANNER_TITLE: f32 = 86.0;
+const BANNER_DETAIL: f32 = 64.0;
+const BANNER_PAD: f32 = 104.0;
+const BANNER_H: f32 = 345.0;
+
+/// The banner's box: top left inside the band, as wide as its text needs.
+pub fn banner_area(
+    size: (usize, usize),
+    band_top: usize,
+    fonts: &Fonts,
+    text: &BannerText,
+) -> Area {
+    let (w, h) = size;
+    let s = h as f32 / 2160.0;
+    let text_w = measure(&fonts.semibold, BANNER_TITLE * s, &text.title).max(measure(
+        &fonts.regular,
+        BANNER_DETAIL * s,
+        &text.detail,
+    ));
+    let x = (BANNER_X * s) as usize;
+    Area {
+        x,
+        y: band_top + (BANNER_DY * s) as usize,
+        w: ((text_w + 1.8 * BANNER_PAD * s) as usize).min(w - x),
+        h: (BANNER_H * s) as usize,
+    }
+}
+
+/// A banner (#77): a dark panel, 80% opaque, a lavender edge on its left,
+/// the picture type over a quiet line about it, filling `area` (from
+/// [`banner_area`]).
+pub fn banner(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, text: &BannerText) {
+    let s = c.size().1 as f32 / 2160.0;
+    let px = |v: f32| (v * s) as usize;
+    c.rect(area, px(39.0), palette::panel(), 0.8);
+    c.rect(
+        Area {
+            x: area.x + px(10.0),
+            y: area.y + px(68.0),
+            w: px(13.0).max(2),
+            h: px(205.0),
+        },
+        px(6.0),
+        palette::accent(),
+        1.0,
+    );
+    let x = area.x as f32 + BANNER_PAD * s;
+    c.text(
+        Style::new(
+            &fonts.semibold,
+            BANNER_TITLE * s,
+            palette::text(),
+            Align::Left,
+        ),
+        x,
+        area.y as f32 + 150.0 * s,
+        &text.title,
+    );
+    c.text(
+        Style::new(
+            &fonts.regular,
+            BANNER_DETAIL * s,
+            palette::secondary(),
+            Align::Left,
+        ),
+        x,
+        area.y as f32 + 270.0 * s,
+        &text.detail,
+    );
 }
 
 /// For `cinefit pattern --slate`: the slate, a banner, and grey steps at
@@ -268,39 +497,44 @@ pub fn test_card(c: &mut Canvas<'_>, fonts: &Fonts, enc: Encoding) {
     let s = h as f32 / 2160.0;
     let px = |v: f32| (v * s) as usize;
     c.clear();
-    // The 2.35 band of a 17:9 raster is where the screen is.
+    // The 2.35 band of the raster is where the screen is.
+    let band_h = ((w as f64 / 2.35).round() as usize).min(h);
+    let band = ((h - band_h) / 2, band_h);
     c.rect(
         Area {
             x: 0,
-            y: px(380.0),
+            y: band.0,
             w,
-            h: px(1400.0),
+            h: band.1,
         },
         0,
-        0.0,
+        Rgb::grey(0.0),
         0.85,
     );
-    banner(
-        c,
-        fonts,
-        px(160.0),
-        px(440.0),
-        "Dolby Vision \u{b7} low latency",
-        "3840 \u{d7} 2160 \u{b7} 23.976 \u{b7} SDR BT.2020 out",
-    );
+    let text = BannerText {
+        title: "Dolby Vision".into(),
+        detail: "4K 23.976 \u{b7} mapped by the player, shown as is".into(),
+    };
+    let area = banner_area((w, h), band.0, fonts, &text);
+    banner(c, fonts, area, &text);
+    let corner = Corner::BottomLeft;
     slate(
         c,
         fonts,
-        w as f32 / 2.0,
-        h as f32 / 2.0,
-        "No signal",
-        "Overlay test card",
+        slate_area((w, h), band, corner),
+        corner,
+        &SlateText {
+            venue: "The Screening Room".into(),
+            state: "Signal lost".into(),
+            detail: "Overlay test card".into(),
+            tone: Tone::Attention,
+        },
     );
     let steps = [0.05, 0.1, 0.25, 0.5, 0.75, 1.0];
     let (sw, sh) = (px(260.0), px(110.0));
     let x0 = w / 2 - steps.len() * sw / 2;
-    let y0 = px(1500.0);
-    let label = Style::new(&fonts.regular, 32.0 * s, 0.5, Align::Centre);
+    let y0 = px(1100.0);
+    let label = Style::new(&fonts.regular, 32.0 * s, Rgb::grey(0.5), Align::Centre);
     for (i, &l) in steps.iter().enumerate() {
         c.rect(
             Area {
@@ -310,7 +544,7 @@ pub fn test_card(c: &mut Canvas<'_>, fonts: &Fonts, enc: Encoding) {
                 h: sh,
             },
             0,
-            l,
+            Rgb::grey(l),
             1.0,
         );
         let text = format!("{:.0}%", l * 100.0);
@@ -356,7 +590,7 @@ mod tests {
         let mut px = vec![0u8; w * 4 * h];
         let mut c = Canvas::new(&mut px, w * 4, w, h, Encoding::Sdr);
         let width = c.text(
-            Style::new(&fonts.regular, 40.0, 1.0, Align::Centre),
+            Style::new(&fonts.regular, 40.0, Rgb::grey(1.0), Align::Centre),
             200.0,
             80.0,
             "No signal",
@@ -388,11 +622,68 @@ mod tests {
                 h: 1,
             },
             0,
-            1.0,
+            Rgb::grey(1.0),
             0.5,
         );
         // Premultiplied: half-opaque white is 128 in every channel.
         assert_eq!(&px[..4], &[128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn palette_colours_go_out_in_bt2020_and_bgra_order() {
+        // A grey is the same code in SDR as written: the conversion keeps it.
+        assert_eq!(Rgb::hex(0x808080).encode(Encoding::Sdr), [128, 128, 128]);
+        // Saturated BT.709 red is inside BT.2020: less red, some green.
+        let [r, g, b] = Rgb::hex(0xff0000).encode(Encoding::Sdr);
+        assert!(r < 255 && r > 200 && g > 50 && b > 0, "{r} {g} {b}");
+        // The apricot's red channel lands in the R byte of BGRA.
+        let (w, h) = (1, 1);
+        let mut px = vec![0u8; 4];
+        let mut c = Canvas::new(&mut px, w * 4, w, h, Encoding::Sdr);
+        let full = Area { x: 0, y: 0, w, h };
+        c.rect(full, 0, palette::attention(), 1.0);
+        let [r, g, b] = palette::attention().encode(Encoding::Sdr);
+        assert_eq!(px, [b, g, r, 255]);
+        assert!(r > g && g > b);
+    }
+
+    #[test]
+    fn a_window_draws_what_the_whole_canvas_draws_there() {
+        let fonts = Fonts::load();
+        let (w, h) = (640, 360);
+        let text = SlateText {
+            venue: "The Screening Room".into(),
+            state: "Can't show this format".into(),
+            detail: "8-bit RGB 4:4:4 \u{b7} set the player to YCbCr".into(),
+            tone: Tone::Error,
+        };
+        let band = (50, 260);
+        for corner in [Corner::BottomLeft, Corner::TopRight] {
+            let area = slate_area((w, h), band, corner);
+            let mut whole = vec![0u8; w * 4 * h];
+            let mut c = Canvas::new(&mut whole, w * 4, w, h, Encoding::Pq);
+            slate(&mut c, &fonts, area, corner, &text);
+            let mut part = vec![0u8; area.w * 4 * area.h];
+            let mut c = Canvas::window(&mut part, area.w * 4, area, (w, h), Encoding::Pq);
+            slate(&mut c, &fonts, area, corner, &text);
+            // Everything drawn is inside the area, and the window holds it.
+            let mut inside = 0;
+            for y in 0..h {
+                for x in 0..w {
+                    let p = &whole[(y * w + x) * 4..][..4];
+                    let within = (area.x..area.x + area.w).contains(&x)
+                        && (area.y..area.y + area.h).contains(&y);
+                    if within {
+                        let q = &part[((y - area.y) * area.w + x - area.x) * 4..][..4];
+                        assert_eq!(p, q, "{corner:?} at {x},{y}");
+                        inside += usize::from(p[3] > 0);
+                    } else {
+                        assert_eq!(p[3], 0, "{corner:?}: drawn outside the area at {x},{y}");
+                    }
+                }
+            }
+            assert!(inside > 100, "{corner:?}: nothing drawn");
+        }
     }
 }
 
@@ -409,6 +700,65 @@ mod preview {
             return;
         };
         let fonts = Fonts::load();
+        // The slate and the banner at full size, as the overlay holds them.
+        let (w, h) = (4096, 2160);
+        let band = (209, 1742);
+        let states = [
+            ("No signal", "", Tone::Plain, "The Screening Room"),
+            ("No signal", "", Tone::Plain, ""),
+            (
+                "Signal lost",
+                "12 min ago \u{b7} waiting for the source",
+                Tone::Attention,
+                "The Screening Room",
+            ),
+            (
+                "Can\u{2019}t show this format",
+                "pixel format 0x00000007 \u{b7} set the player to YCbCr",
+                Tone::Error,
+                "The Screening Room",
+            ),
+        ];
+        for (i, (state, detail, tone, venue)) in states.into_iter().enumerate() {
+            let mut px = vec![0u8; w * 4 * h];
+            let corner = [
+                Corner::BottomLeft,
+                Corner::BottomRight,
+                Corner::TopRight,
+                Corner::TopLeft,
+            ][i];
+            let mut c = Canvas::new(&mut px, w * 4, w, h, Encoding::Sdr);
+            let text = SlateText {
+                venue: venue.into(),
+                state: state.into(),
+                detail: detail.into(),
+                tone,
+            };
+            slate(
+                &mut c,
+                &fonts,
+                slate_area((w, h), band, corner),
+                corner,
+                &text,
+            );
+            let path = std::path::Path::new(&dir).join(format!("slate-{i}-{w}x{h}.bgra"));
+            std::fs::write(path, &px).expect("write");
+        }
+        let mut px = vec![0u8; w * 4 * h];
+        let mut c = Canvas::new(&mut px, w * 4, w, h, Encoding::Sdr);
+        let text = BannerText {
+            title: "Dolby Vision".into(),
+            detail: "4K 23.976 \u{b7} mapped by the player, shown as is".into(),
+        };
+        banner(
+            &mut c,
+            &fonts,
+            banner_area((w, h), band.0, &fonts, &text),
+            &text,
+        );
+        let path = std::path::Path::new(&dir).join(format!("banner-{w}x{h}.bgra"));
+        std::fs::write(path, &px).expect("write");
+
         let (w, h) = (2048, 1080);
         for enc in [Encoding::Sdr, Encoding::Pq] {
             let mut px = vec![0u8; w * 4 * h];

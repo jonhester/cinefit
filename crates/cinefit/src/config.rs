@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use cinefit_render::{Curve, Levels};
 
 /// Every setting's value.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// The panel: the output's size. The rate is not a setting: it follows
     /// the source.
@@ -68,6 +68,10 @@ pub struct Config {
     /// Content wider than this is trimmed at the sides to fill the screen's
     /// height rather than letterboxed inside it.
     pub fill_max_ar: f64,
+    /// The theater's name, on the waiting slate; empty for none.
+    pub venue: String,
+    /// A banner on each change of picture type.
+    pub banners: bool,
 }
 
 /// What the output sends.
@@ -102,6 +106,8 @@ impl Default for Config {
             crop: true,
             screen_ar: 2.35,
             fill_max_ar: 2.40,
+            venue: String::new(),
+            banners: true,
         }
     }
 }
@@ -142,6 +148,8 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// A number in `min..=max`, with a fraction: a ratio.
     Float { min: f64, max: f64 },
+    /// Free text, up to this many characters.
+    Text { max: usize },
 }
 
 /// One row of the table.
@@ -350,6 +358,24 @@ static SETTINGS: &[Setting] = &[
         get: |c| Value::Float(c.fill_max_ar),
         set: |c, v| c.fill_max_ar = float(v),
     },
+    Setting {
+        key: "slate.venue",
+        kind: Kind::Text { max: 40 },
+        apply: Apply::Restart,
+        help: "The theater's name, shown on the waiting slate above what cinefit is waiting for. Empty: no \
+               name, only the state.",
+        get: |c| Value::Name(c.venue.clone()),
+        set: |c, v| c.venue = name(v).trim().to_string(),
+    },
+    Setting {
+        key: "osd.banners",
+        kind: Kind::Choice(&["on", "off"]),
+        apply: Apply::Restart,
+        help: "on: a short banner when the picture type changes (Dolby Vision, HDR10, SDR), saying what came in \
+               and what happens to it; after the projector's resync when the change needs one.",
+        get: |c| Value::Name(if c.banners { "on" } else { "off" }.into()),
+        set: |c, v| c.banners = name(v) == "on",
+    },
 ];
 
 const CURVES: &[&str] = &[
@@ -384,6 +410,7 @@ impl Setting {
             Kind::Int { min, max } => format!("{min}-{max}"),
             Kind::Choice(names) => names.join(" | "),
             Kind::Float { min, max } => format!("{min}-{max}"),
+            Kind::Text { max } => format!("text, up to {max} characters"),
         }
     }
 
@@ -400,6 +427,9 @@ impl Setting {
             (Kind::Float { min, max }, Value::Float(x)) if (min..=max).contains(x) => {}
             // A whole number where a ratio goes: 2 for 2.0.
             (Kind::Float { min, max }, Value::Int(n)) if (min..=max).contains(&(*n as f64)) => {}
+            // Control characters would draw as nothing, or break the file.
+            (Kind::Text { max }, Value::Name(t))
+                if t.chars().count() <= max && !t.chars().any(char::is_control) => {}
             _ => return Err(bad()),
         }
         (self.set)(c, v);
@@ -490,7 +520,7 @@ pub fn set(c: &mut Config, assignment: &str) -> Result<(), Error> {
             value: text.to_string(),
             range: s.range(),
         })?),
-        Kind::Choice(_) => Value::Name(text.to_string()),
+        Kind::Choice(_) | Kind::Text { .. } => Value::Name(text.to_string()),
         Kind::Float { .. } => Value::Float(text.parse().map_err(|_| Error::Value {
             key: s.key.to_string(),
             value: text.to_string(),
@@ -522,12 +552,18 @@ pub fn render(c: &Config) -> String {
         ));
         match s.get(c) {
             Value::Int(v) => out.push_str(&format!("{name} = {v}\n")),
-            Value::Name(n) => out.push_str(&format!("{name} = \"{n}\"\n")),
+            Value::Name(n) => out.push_str(&format!("{name} = \"{}\"\n", toml_escape(&n))),
             // Always with a fraction, so it reads back as a float.
             Value::Float(v) => out.push_str(&format!("{name} = {v:?}\n")),
         }
     }
     out
+}
+
+/// `text` inside a TOML basic string: quotes and backslashes escaped.
+/// Control characters never get here: settings refuse them.
+fn toml_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -609,6 +645,19 @@ mod tests {
         let text = render(&c);
         assert!(text.contains("# The panel's width"));
         assert_eq!(parse(&text, p()).unwrap(), c);
+    }
+
+    #[test]
+    fn the_venue_is_text_that_survives_the_file() {
+        let mut c = Config::default();
+        assert_eq!(c.venue, "");
+        set(&mut c, r#"slate.venue = The "Back" Room \ 2"#).unwrap();
+        assert_eq!(c.venue, r#"The "Back" Room \ 2"#);
+        let text = render(&c);
+        assert_eq!(parse(&text, p()).unwrap(), c);
+        assert!(set(&mut c, &format!("slate.venue={}", "x".repeat(41))).is_err());
+        assert!(parse("[slate]\nvenue = \"a\\nb\"\n", p()).is_err());
+        assert!(parse("[slate]\nvenue = 3\n", p()).is_err());
     }
 
     #[test]

@@ -16,6 +16,8 @@ mod runlog;
 #[cfg(target_os = "linux")]
 mod tunnel_check;
 #[cfg(target_os = "linux")]
+mod ui;
+#[cfg(target_os = "linux")]
 mod unpack_check;
 
 use std::path::PathBuf;

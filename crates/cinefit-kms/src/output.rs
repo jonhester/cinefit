@@ -116,10 +116,26 @@ struct Overlay {
     /// A change for the next commit: `Some(None)` takes the layer down.
     pending: Option<Option<usize>>,
     on_screen: Option<usize>,
+    /// The plane's own opacity (0-0xffff), for fades without redrawing:
+    /// absent on planes without the property.
+    alpha: Option<property::Handle>,
+    alpha_pending: Option<u16>,
+    /// What a commit of this run set it to; `None` until one has, since a
+    /// run that ended without restoring may have left it anywhere.
+    alpha_now: Option<u16>,
     /// Whether a commit of this run has changed the plane. Only then does
     /// `restore` take it down: an overlay nobody asked for is left alone.
     touched: bool,
 }
+
+/// An overlay's commit state: pending buffer change, buffer on screen,
+/// pending opacity, opacity set.
+type OverlayState = (
+    Option<Option<usize>>,
+    Option<usize>,
+    Option<u16>,
+    Option<u16>,
+);
 
 /// A CPU-drawn scanout buffer.
 struct Frame {
@@ -548,19 +564,42 @@ impl Output {
         }
     }
 
-    /// The overlay's pending change, as properties for a commit.
+    /// Whether the overlay plane has its own opacity, for
+    /// [`Self::set_overlay_alpha`].
+    pub fn has_overlay_alpha(&self) -> bool {
+        self.overlay.as_ref().is_some_and(|ov| ov.alpha.is_some())
+    }
+
+    /// The whole overlay's opacity, 0 to 0xffff, with the next flip or
+    /// modeset, as [`Self::set_overlay`]: a fade costs a property in the
+    /// commit, not a redraw. Does nothing on a plane without the property.
+    pub fn set_overlay_alpha(&mut self, alpha: u16) {
+        if let Some(ov) = self.overlay.as_mut()
+            && ov.alpha.is_some()
+        {
+            ov.alpha_pending = (ov.alpha_now != Some(alpha)).then_some(alpha);
+        }
+    }
+
+    /// The overlay's pending changes, as properties for a commit.
     fn overlay_props(&mut self) -> Vec<(RawResourceHandle, property::Handle, u64)> {
         let crtc = u64::from(u32::from(RawResourceHandle::from(self.crtc)));
         let Some(ov) = self.overlay.as_mut() else {
             return Vec::new();
         };
+        let plane: RawResourceHandle = ov.plane.into();
+        let mut set = Vec::new();
+        if let (Some(a), Some(prop)) = (ov.alpha_pending.take(), ov.alpha) {
+            ov.alpha_now = Some(a);
+            ov.touched = true;
+            set.push((plane, prop, u64::from(a)));
+        }
         let Some(change) = ov.pending.take() else {
-            return Vec::new();
+            return set;
         };
         ov.on_screen = change;
         ov.touched = true;
-        let plane: RawResourceHandle = ov.plane.into();
-        match change {
+        set.extend(match change {
             None => vec![(plane, ov.fb_id, 0), (plane, ov.crtc_id, 0)],
             Some(i) => {
                 let (frame, (w, h)) = &ov.frames[i];
@@ -578,6 +617,21 @@ impl Output {
                 }
                 set
             }
+        });
+        set
+    }
+
+    /// The overlay's commit state, to put back if a commit is refused:
+    /// nothing changed, so its changes are still to come.
+    fn overlay_state(&self) -> Option<OverlayState> {
+        self.overlay
+            .as_ref()
+            .map(|o| (o.pending, o.on_screen, o.alpha_pending, o.alpha_now))
+    }
+
+    fn put_back_overlay(&mut self, state: Option<OverlayState>) {
+        if let (Some(ov), Some(s)) = (self.overlay.as_mut(), state) {
+            (ov.pending, ov.on_screen, ov.alpha_pending, ov.alpha_now) = s;
         }
     }
 
@@ -746,7 +800,7 @@ impl Output {
         }
         // The overlay rides in the same commit, outside what is saved: it
         // was off before, and restore always takes it down.
-        let overlay_before = self.overlay.as_ref().map(|o| (o.pending, o.on_screen));
+        let overlay_before = self.overlay_state();
         set.extend(self.overlay_props());
         let req = request(&set);
         // A test commit first: if another program holds the display, nothing
@@ -758,10 +812,7 @@ impl Output {
         )
         .and_then(|()| commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, req));
         if let Err(e) = result {
-            if let (Some(ov), Some((pending, on_screen))) = (self.overlay.as_mut(), overlay_before)
-            {
-                (ov.pending, ov.on_screen) = (pending, on_screen);
-            }
+            self.put_back_overlay(overlay_before);
             for id in [Some(blob), hdr_blob].into_iter().flatten() {
                 let _ = self.card.destroy_property_blob(id);
             }
@@ -851,7 +902,7 @@ impl Output {
     pub fn flip(&mut self, frame: usize) -> Result<(), Error> {
         let fb = u64::from(u32::from(RawResourceHandle::from(self.frames[frame].fb)));
         let mut set = vec![(self.plane.into(), self.props.fb_id, fb)];
-        let overlay_before = self.overlay.as_ref().map(|o| (o.pending, o.on_screen));
+        let overlay_before = self.overlay_state();
         set.extend(self.overlay_props());
         let pending = self.pending_hdr_blob.take();
         if let (Some(id), Some(prop)) = (pending, self.props.hdr_metadata) {
@@ -863,9 +914,7 @@ impl Output {
             request(&set),
         ) {
             // Refused: nothing changed, so the overlay change is still to come.
-            if let (Some(ov), Some((p, on))) = (self.overlay.as_mut(), overlay_before) {
-                (ov.pending, ov.on_screen) = (p, on);
-            }
+            self.put_back_overlay(overlay_before);
             self.pending_hdr_blob = pending;
             return Err(e);
         }
@@ -936,7 +985,12 @@ impl Output {
             .filter(|ov| ov.touched)
             .map(|ov| {
                 let plane: RawResourceHandle = ov.plane.into();
-                vec![(plane, ov.fb_id, 0), (plane, ov.crtc_id, 0)]
+                let mut off = vec![(plane, ov.fb_id, 0), (plane, ov.crtc_id, 0)];
+                // Opaque again, its default, for whoever uses the plane next.
+                if let Some(a) = ov.alpha {
+                    off.push((plane, a, 0xffff));
+                }
+                off
             })
             .unwrap_or_default();
         let mut previous: Vec<_> = self
@@ -977,6 +1031,8 @@ impl Output {
         if let Some(ov) = self.overlay.as_mut() {
             ov.on_screen = None;
             ov.pending = None;
+            ov.alpha_pending = None;
+            ov.alpha_now = None;
             ov.touched = false;
         }
         for blob in [
@@ -1142,6 +1198,9 @@ fn find_overlay(
         frames: Vec::new(),
         pending: None,
         on_screen: None,
+        alpha: get("alpha"),
+        alpha_pending: None,
+        alpha_now: None,
         touched: false,
     })
 }
