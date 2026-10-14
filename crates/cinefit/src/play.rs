@@ -523,27 +523,67 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
     peak
 }
 
-/// A small copy of the frame on screen for the web page's preview: every
-/// sixth pixel each way, as 8-bit RGB of the codes sent (so BT.2020 SDR, or
-/// PQ when HDR10 goes out, shown as is).
-fn scanout_preview(
-    px: &[u8],
-    stride: usize,
-    fourcc: u32,
-    size: (u32, u32),
-) -> Option<(u16, u16, Vec<u8>)> {
-    const STEP: usize = 6;
-    let (w, h) = (size.0 as usize / STEP, size.1 as usize / STEP);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for y in 0..h {
-        for x in 0..w {
-            let o = y * STEP * stride + x * STEP * 4;
-            let p = px.get(o..o + 4)?;
-            let c = cinefit_kms::scanout::decode(fourcc, [p[0], p[1], p[2], p[3]])?;
-            rgb.extend(c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
-        }
+/// The preview's size: a sixth of the 4096 x 2160 raster each way.
+const PREVIEW: (usize, usize) = (682, 360);
+
+/// The frame just drawn, drawn again into a small target in SDR BT.709 and
+/// read back as 8-bit RGB: what the web page shows. Its own stage times, so
+/// the run's are the frames' alone.
+#[allow(clippy::too_many_arguments)]
+fn make_preview<'p>(
+    pl: &'p Placebo,
+    tex: &mut Option<cinefit_render::Rgba16Target<'p>>,
+    info: &FrameInfo,
+    kind: Kind,
+    tunnel: Option<&Tunnel>,
+    sources: &mut Sources<'p>,
+    view: View,
+    out: (u32, u32),
+    c: &Config,
+) -> Result<(u16, u16, Vec<u8>), Box<dyn Error>> {
+    let (w, h) = PREVIEW;
+    if tex.is_none() {
+        *tex = Some(pl.target_rgba16(w, h)?);
     }
-    Some((u16::try_from(w).ok()?, u16::try_from(h).ok()?, rgb))
+    let t = tex.as_ref().expect("made above");
+    let (sx, sy) = (w as f32 / out.0 as f32, h as f32 / out.1 as f32);
+    let small = View {
+        src: view.src,
+        dst: view.dst.map(|r| Rect {
+            x0: r.x0 * sx,
+            y0: r.y0 * sy,
+            x1: r.x1 * sx,
+            y1: r.y1 * sy,
+        }),
+    };
+    let dst = Target {
+        tex: t.texture(),
+        color: RgbColor {
+            primaries: Primaries::Bt709,
+            transfer: Transfer::Bt1886,
+        },
+        rgb_range: c.rgb_range,
+        white_nits: f32::from(c.white_nits),
+        curve: c.curve,
+        lldv: c.lldv,
+        source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
+        view: small,
+    };
+    draw(
+        pl,
+        info,
+        kind,
+        tunnel,
+        sources,
+        &dst,
+        &mut Stages::default(),
+    )?;
+    let rgba = t.download()?;
+    let rgb = rgba
+        .chunks(4)
+        .flat_map(|p| [p[0] >> 8, p[1] >> 8, p[2] >> 8].map(|v| v as u8))
+        .collect();
+    Ok((w as u16, h as u16, rgb))
 }
 
 /// A picture size as people say it.
@@ -1399,6 +1439,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut wait_changed = false;
     let mut info_at: Option<Instant> = None;
     let mut read_back_logged = false;
+    // The web page's preview: its small target, made when first wanted, and
+    // when the last was made.
+    let mut preview_tex: Option<cinefit_render::Rgba16Target> = None;
+    let (mut preview_at, mut preview_logged): (Option<Instant>, bool) = (None, false);
     let mut cur_mode = mode;
     let now = Instant::now();
     match (&start_key, &start_input) {
@@ -1593,7 +1637,6 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     signal: follow::Signal::Sdr,
                 });
             }
-            let watching = web.as_ref().is_some_and(Web::wants_preview);
             if !ui.info_open() && web.is_none() {
                 info_at = None;
             } else if info_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
@@ -1610,22 +1653,19 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // sent. A mapping of the buffer, so timed and logged once.
                 // Only while the panel or a page's preview is looking.
                 let read_at = Instant::now();
-                let (shown, preview) = if ui.info_open() || watching {
+                // Only while the panel is open: mapping the output buffer
+                // copies all of it off the GPU, ~13 ms (the web page's
+                // preview is a small render of its own instead).
+                let shown = if ui.info_open() {
                     out.read_scanout(buffers[front], |px, stride| {
-                        let peak = scanout_peak(px, stride, scan_fourcc, size);
-                        let small = watching
-                            .then(|| scanout_preview(px, stride, scan_fourcc, size))
-                            .flatten();
-                        (peak, small)
+                        scanout_peak(px, stride, scan_fourcc, size)
                     })
-                    .unwrap_or((None, None))
+                    .ok()
+                    .flatten()
                 } else {
-                    (None, None)
+                    None
                 };
-                if let (Some(w), Some((pw, ph, rgb))) = (&web, preview) {
-                    w.set_preview(pw, ph, rgb);
-                }
-                if (ui.info_open() || watching) && !read_back_logged {
+                if ui.info_open() && !read_back_logged {
                     read_back_logged = true;
                     info!(
                         "osd: the frame on screen read back for the panel in {:.1} ms",
@@ -1845,6 +1885,41 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         )?;
                         ready = Some(free);
                         ui.set_slate(None);
+                        // The web page's preview, when one is due: the same
+                        // frame drawn again, small and in ordinary SDR, for
+                        // a phone. About a millisecond on the GPU and a 2 MB
+                        // download, against mapping the whole output.
+                        if let Some(every) = web.as_ref().and_then(Web::preview_every)
+                            && preview_at.is_none_or(|t| t.elapsed() >= every)
+                        {
+                            preview_at = Some(Instant::now());
+                            let made = make_preview(
+                                &pl,
+                                &mut preview_tex,
+                                &frame_info,
+                                k.kind,
+                                last_tunnel.as_ref(),
+                                &mut sources,
+                                view,
+                                size,
+                                &cfg,
+                            );
+                            match made {
+                                Ok((w, h, rgb)) => {
+                                    if !preview_logged {
+                                        preview_logged = true;
+                                        info!(
+                                            "web: preview {w} x {h} made in {:.1} ms",
+                                            ms(preview_at.unwrap_or_else(Instant::now))
+                                        );
+                                    }
+                                    if let Some(wb) = &web {
+                                        wb.set_preview(w, h, rgb);
+                                    }
+                                }
+                                Err(e) => warn!("web: no preview: {e}"),
+                            }
+                        }
                         if let Some(&r) = stages.render.last() {
                             // The frame's whole work, as it ran: detect beside
                             // the upload, then the draw.

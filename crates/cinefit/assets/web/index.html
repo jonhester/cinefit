@@ -55,7 +55,7 @@
 <main>
   <header><div class="wordmark">cine<span>fit</span></div><div id="pill" class="pill">…</div></header>
   <section>
-    <div class="card preview"><img id="preview" alt="The screen as shown"><div class="live">LIVE · 1/s</div></div>
+    <div class="card preview"><img id="preview" alt="The screen as shown"><div class="live" id="live">LIVE</div></div>
     <div class="card now" id="now" style="margin-top:18px"></div>
     <h2 style="margin-top:22px">RECENT RUNS AND LOGS</h2>
     <div class="card logs" id="logs"></div>
@@ -148,21 +148,34 @@ async function poll() {
   catch (e) { document.getElementById("pill").textContent = "No answer"; }
 }
 
-// Fetched rather than set as the image's source: until cinefit has a
-// frame to show (the first second, or no overlay plane) the answer is
-// empty, and the last picture stays rather than a broken image.
-let shown;
-async function preview() {
-  if (document.visibilityState !== "visible") return;
+// The preview: a motion-JPEG stream (about five frames a second), shown
+// as the image's source, which browsers play natively. Stopped while the
+// tab is hidden, so a forgotten tab costs cinefit nothing. If the stream
+// fails, a still once a second instead.
+const img = () => document.getElementById("preview");
+let streaming = true, shown;
+function startStream() { img().src = "/api/stream.mjpg?t=" + Date.now(); }
+function stopStream() { img().src = ""; }
+async function still() {
+  if (streaming || document.visibilityState !== "visible") return;
   try {
     const r = await fetch("/api/preview.jpg", { cache: "no-store" });
     if (r.status !== 200) return;
     const url = URL.createObjectURL(await r.blob());
-    document.getElementById("preview").src = url;
+    img().src = url;
     if (shown) URL.revokeObjectURL(shown);
     shown = url;
   } catch (e) {}
 }
+img().addEventListener("error", () => {
+  if (!streaming || !img().src.includes("stream")) return;
+  streaming = false;
+  document.getElementById("live").textContent = "LIVE · 1/s";
+});
+document.addEventListener("visibilitychange", () => {
+  if (!streaming) return;
+  document.visibilityState === "visible" ? startStream() : stopStream();
+});
 
 async function logs() {
   const list = document.getElementById("logs"); list.replaceChildren();
@@ -174,9 +187,9 @@ async function logs() {
   } catch (e) {}
 }
 
-poll(); logs(); preview();
+poll(); logs(); startStream();
 setInterval(poll, 1000);
-setInterval(preview, 1000);
+setInterval(still, 1000);
 setInterval(logs, 30000);
 </script>
 </body>
