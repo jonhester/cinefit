@@ -21,6 +21,8 @@ pub struct Window {
     /// Each rendered frame's whole work on the frame thread: detect, unpack
     /// and render, which run one after the other.
     work: VecDeque<(Instant, f64)>,
+    /// Each frame's brightest luma code.
+    peaks: VecDeque<(Instant, u16)>,
 }
 
 fn prune<T>(q: &mut VecDeque<(Instant, T)>, now: Instant) {
@@ -53,6 +55,17 @@ impl Window {
         self.work.push_back((now, work_ms));
         prune(&mut self.render, now);
         prune(&mut self.work, now);
+    }
+
+    pub fn peak(&mut self, now: Instant, code: u16) {
+        self.peaks.push_back((now, code));
+        prune(&mut self.peaks, now);
+    }
+
+    /// The brightest luma code of the last ten seconds.
+    pub fn brightest(&mut self, now: Instant) -> Option<u16> {
+        prune(&mut self.peaks, now);
+        self.peaks.iter().map(|(_, c)| *c).max()
     }
 
     pub fn detect(&mut self, now: Instant, ms: f64) {
