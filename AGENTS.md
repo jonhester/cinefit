@@ -63,7 +63,8 @@ tree. `tools/install.sh` builds the tree (or with `--release` downloads a
 published build), copies it there and repoints `current`;
 `--rollback` and `--cpp` switch builds. It restarts the service only with
 `RESTART=1`: a restart is a resync on the projector, so not while someone is
-watching.
+watching. The one-time root setup, and keeping Ubuntu's automatic updates from
+restarting it mid-film, are in `docs/service.md`.
 
 Releases are SemVer from 0.1.0, the version in `Cargo.toml`:
 `tools/release.sh patch|minor|major` bumps it, commits, tags and pushes, as
