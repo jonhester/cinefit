@@ -49,6 +49,8 @@ next to it:
 
 - Blackmagic Design DeckLink SDK headers:
   [crates/cinefit-decklink/vendor/decklink-sdk/LICENSE](crates/cinefit-decklink/vendor/decklink-sdk/LICENSE)
+- The Inter typeface, for on-screen text, under the SIL Open Font License 1.1:
+  [crates/cinefit/assets/fonts/OFL-Inter.txt](crates/cinefit/assets/fonts/OFL-Inter.txt)
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be

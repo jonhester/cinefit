@@ -46,6 +46,8 @@ pub enum Error {
     NoPlane,
     /// The primary plane takes none of the scanout formats used here.
     NoScanoutFormat,
+    /// The CRTC has no overlay plane that takes ARGB8888.
+    NoOverlay,
     /// The driver lacks a property every atomic driver should have.
     MissingProperty(&'static str),
     /// Another program holds the display (DRM master).
@@ -62,6 +64,7 @@ impl fmt::Display for Error {
             Error::NoDisplay => f.write_str("no DRM device has a connected display"),
             Error::NoCrtc => f.write_str("no CRTC can drive the connector"),
             Error::NoPlane => f.write_str("no primary plane for the CRTC"),
+            Error::NoOverlay => f.write_str("no overlay plane taking ARGB8888 for the CRTC"),
             Error::NoScanoutFormat => {
                 f.write_str("the primary plane takes no XRGB2101010, XBGR2101010 or XRGB8888")
             }
@@ -98,6 +101,24 @@ struct ColorspaceProp {
     handle: property::Handle,
     default: Option<u64>,
     bt2020_rgb: Option<u64>,
+}
+
+/// The overlay plane: a second, transparent layer the display engine
+/// composites over the video, for on-screen text. Drawn by the CPU when it
+/// changes, never per frame; the video's buffers never see it.
+struct Overlay {
+    plane: plane::Handle,
+    fb_id: property::Handle,
+    crtc_id: property::Handle,
+    src: [property::Handle; 4],
+    dst: [property::Handle; 4],
+    frames: Vec<(Frame, (u16, u16))>,
+    /// A change for the next commit: `Some(None)` takes the layer down.
+    pending: Option<Option<usize>>,
+    on_screen: Option<usize>,
+    /// Whether a commit of this run has changed the plane. Only then does
+    /// `restore` take it down: an overlay nobody asked for is left alone.
+    touched: bool,
 }
 
 /// A CPU-drawn scanout buffer.
@@ -181,6 +202,8 @@ pub struct Output {
     /// The blob on the connector now, and one queued for the next flip.
     hdr_blob: Option<u64>,
     pending_hdr_blob: Option<u64>,
+    /// `None` when the CRTC has no overlay plane that takes ARGB8888.
+    overlay: Option<Overlay>,
 }
 
 impl Output {
@@ -287,6 +310,8 @@ impl Output {
             })
             .ok_or(Error::NoPlane)?;
 
+        let overlay = find_overlay(&card, &res, crtc);
+
         let conn_props = props_by_name(&card, conn.handle())?;
         let crtc_props = props_by_name(&card, crtc)?;
         let plane_props = props_by_name(&card, plane)?;
@@ -337,6 +362,7 @@ impl Output {
             sdr_bt2020: false,
             hdr_blob: None,
             pending_hdr_blob: None,
+            overlay,
         }))
     }
 
@@ -443,6 +469,116 @@ impl Output {
             fb,
         });
         Ok(self.frames.len() - 1)
+    }
+
+    /// Whether this output has an overlay plane for on-screen text.
+    pub fn has_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// A transparent ARGB8888 buffer the size of mode `index` for the overlay
+    /// plane, premultiplied alpha (the plane's default blend). Make two and
+    /// alternate, so a redraw never shows half-drawn.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoOverlay`] without an overlay plane; else if the driver
+    /// cannot allocate or register it.
+    pub fn create_overlay(&mut self, index: usize) -> Result<usize, Error> {
+        let (w, h) = self.modes[index].size();
+        let Some(ov) = self.overlay.as_mut() else {
+            return Err(Error::NoOverlay);
+        };
+        let mut buffer = self
+            .card
+            .create_dumb_buffer((w.into(), h.into()), DrmFourcc::Argb8888, 32)
+            .map_err(io("allocating an overlay buffer"))?;
+        // Depth 32 at 32 bpp is ARGB8888 to the legacy call.
+        let fb = match self.card.add_framebuffer(&buffer, 32, 32) {
+            Ok(fb) => fb,
+            Err(e) => {
+                let _ = self.card.destroy_dumb_buffer(buffer);
+                return Err(io("registering an overlay framebuffer")(e));
+            }
+        };
+        if let Ok(mut map) = self.card.map_dumb_buffer(&mut buffer) {
+            map.as_mut().fill(0); // transparent
+        }
+        ov.frames.push((
+            Frame {
+                buffer: FrameBuffer::Dumb(buffer),
+                fb,
+            },
+            (w, h),
+        ));
+        Ok(ov.frames.len() - 1)
+    }
+
+    /// Draws into overlay buffer `i`: `draw` gets its bytes (B, G, R, A per
+    /// pixel, premultiplied) and pitch.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoOverlay`], or if the buffer cannot be mapped.
+    pub fn draw_overlay(
+        &mut self,
+        i: usize,
+        draw: impl FnOnce(&mut [u8], usize),
+    ) -> Result<(), Error> {
+        let ov = self.overlay.as_mut().ok_or(Error::NoOverlay)?;
+        let FrameBuffer::Dumb(buffer) = &mut ov.frames[i].0.buffer else {
+            return Err(Error::NotScanout);
+        };
+        let pitch = drm::buffer::Buffer::pitch(buffer) as usize;
+        let mut map = self
+            .card
+            .map_dumb_buffer(buffer)
+            .map_err(io("mapping an overlay buffer"))?;
+        draw(map.as_mut(), pitch);
+        Ok(())
+    }
+
+    /// Shows overlay buffer `i`, or with `None` takes the layer down, with
+    /// the next flip or modeset: no commit of its own, and no modeset.
+    pub fn set_overlay(&mut self, i: Option<usize>) {
+        if let Some(ov) = self.overlay.as_mut()
+            && ov.on_screen != i
+        {
+            ov.pending = Some(i);
+        }
+    }
+
+    /// The overlay's pending change, as properties for a commit.
+    fn overlay_props(&mut self) -> Vec<(RawResourceHandle, property::Handle, u64)> {
+        let crtc = u64::from(u32::from(RawResourceHandle::from(self.crtc)));
+        let Some(ov) = self.overlay.as_mut() else {
+            return Vec::new();
+        };
+        let Some(change) = ov.pending.take() else {
+            return Vec::new();
+        };
+        ov.on_screen = change;
+        ov.touched = true;
+        let plane: RawResourceHandle = ov.plane.into();
+        match change {
+            None => vec![(plane, ov.fb_id, 0), (plane, ov.crtc_id, 0)],
+            Some(i) => {
+                let (frame, (w, h)) = &ov.frames[i];
+                let fb = u64::from(u32::from(RawResourceHandle::from(frame.fb)));
+                let mut set = vec![(plane, ov.fb_id, fb), (plane, ov.crtc_id, crtc)];
+                for (prop, v) in ov
+                    .src
+                    .iter()
+                    .zip([0, 0, u64::from(*w) << 16, u64::from(*h) << 16])
+                {
+                    set.push((plane, *prop, v));
+                }
+                for (prop, v) in ov.dst.iter().zip([0, 0, u64::from(*w), u64::from(*h)]) {
+                    set.push((plane, *prop, v));
+                }
+                set
+            }
+        }
     }
 
     /// Shares scanout frame `frame` as a dma-buf.
@@ -608,6 +744,10 @@ impl Output {
         if !self.modeset {
             self.saved = self.current_values(&set);
         }
+        // The overlay rides in the same commit, outside what is saved: it
+        // was off before, and restore always takes it down.
+        let overlay_before = self.overlay.as_ref().map(|o| (o.pending, o.on_screen));
+        set.extend(self.overlay_props());
         let req = request(&set);
         // A test commit first: if another program holds the display, nothing
         // on screen changes before we find out.
@@ -618,6 +758,10 @@ impl Output {
         )
         .and_then(|()| commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, req));
         if let Err(e) = result {
+            if let (Some(ov), Some((pending, on_screen))) = (self.overlay.as_mut(), overlay_before)
+            {
+                (ov.pending, ov.on_screen) = (pending, on_screen);
+            }
             for id in [Some(blob), hdr_blob].into_iter().flatten() {
                 let _ = self.card.destroy_property_blob(id);
             }
@@ -707,15 +851,24 @@ impl Output {
     pub fn flip(&mut self, frame: usize) -> Result<(), Error> {
         let fb = u64::from(u32::from(RawResourceHandle::from(self.frames[frame].fb)));
         let mut set = vec![(self.plane.into(), self.props.fb_id, fb)];
+        let overlay_before = self.overlay.as_ref().map(|o| (o.pending, o.on_screen));
+        set.extend(self.overlay_props());
         let pending = self.pending_hdr_blob.take();
         if let (Some(id), Some(prop)) = (pending, self.props.hdr_metadata) {
             set.push((self.connector.into(), prop, id));
         }
-        commit(
+        if let Err(e) = commit(
             &self.card,
             AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK,
             request(&set),
-        )?;
+        ) {
+            // Refused: nothing changed, so the overlay change is still to come.
+            if let (Some(ov), Some((p, on))) = (self.overlay.as_mut(), overlay_before) {
+                (ov.pending, ov.on_screen) = (p, on);
+            }
+            self.pending_hdr_blob = pending;
+            return Err(e);
+        }
         if let Some(id) = pending
             && let Some(old) = self.hdr_blob.replace(id)
         {
@@ -775,11 +928,23 @@ impl Output {
             }
         };
 
-        let previous: Vec<_> = self
+        // The overlay goes down either way if this run put anything on it:
+        // it was free or ours when found (`find_overlay`).
+        let overlay_off: Vec<_> = self
+            .overlay
+            .as_ref()
+            .filter(|ov| ov.touched)
+            .map(|ov| {
+                let plane: RawResourceHandle = ov.plane.into();
+                vec![(plane, ov.fb_id, 0), (plane, ov.crtc_id, 0)]
+            })
+            .unwrap_or_default();
+        let mut previous: Vec<_> = self
             .saved
             .iter()
             .map(|&(obj, prop, value)| (obj, prop, clear_hdr(prop, value).unwrap_or(value)))
             .collect();
+        previous.extend(overlay_off.iter().copied());
         let outcome = commit(
             &self.card,
             AtomicCommitFlags::ALLOW_MODESET,
@@ -794,6 +959,7 @@ impl Output {
                 (self.plane.into(), p.fb_id, 0),
                 (self.plane.into(), p.plane_crtc, 0),
             ];
+            off.extend(overlay_off.iter().copied());
             // Off is not enough on its own: HDR signalling and max bpc
             // belong to the connector and outlive the mode.
             for &(obj, prop, value) in &self.saved {
@@ -808,6 +974,11 @@ impl Output {
         });
         let outcome = outcome?;
         self.modeset = false;
+        if let Some(ov) = self.overlay.as_mut() {
+            ov.on_screen = None;
+            ov.pending = None;
+            ov.touched = false;
+        }
         for blob in [
             self.mode_blob.take(),
             self.hdr_blob.take(),
@@ -851,7 +1022,15 @@ impl Drop for Output {
         // Destroyed even if restoring failed: removing a framebuffer that is
         // on screen makes the kernel turn the output off, and closing the
         // device below releases everything anyway. Keeping them gains nothing.
-        for f in std::mem::take(&mut self.frames) {
+        let overlay_frames = self
+            .overlay
+            .as_mut()
+            .map(|ov| std::mem::take(&mut ov.frames))
+            .unwrap_or_default();
+        for f in std::mem::take(&mut self.frames)
+            .into_iter()
+            .chain(overlay_frames.into_iter().map(|(f, _)| f))
+        {
             let _ = self.card.destroy_framebuffer(f.fb);
             if let FrameBuffer::Dumb(b) = f.buffer {
                 let _ = self.card.destroy_dumb_buffer(b);
@@ -929,6 +1108,42 @@ fn props_by_name<T: drm::control::ResourceHandle>(
         .as_hashmap(card)
         .map_err(io("reading property names"))?;
     Ok(map.into_iter().map(|(k, v)| (k, v.handle())).collect())
+}
+
+/// The first overlay plane that can sit on `crtc` and takes ARGB8888, with
+/// the properties a commit needs. A plane on another CRTC is skipped:
+/// putting it on ours would take it off that output. One already on ours is
+/// taken, since a run that ended without restoring leaves it there.
+fn find_overlay(
+    card: &Card,
+    res: &drm::control::ResourceHandles,
+    crtc: crtc::Handle,
+) -> Option<Overlay> {
+    let plane = card.plane_handles().ok()?.into_iter().find(|&p| {
+        card.get_plane(p).is_ok_and(|info| {
+            info.crtc().is_none_or(|c| c == crtc)
+                && res.filter_crtcs(info.possible_crtcs()).contains(&crtc)
+                && info.formats().contains(&(DrmFourcc::Argb8888 as u32))
+        }) && plane_type(card, p) == Some(PlaneType::Overlay)
+    })?;
+    let props = props_by_name(card, plane).ok()?;
+    let get = |name: &str| props.get(name).copied();
+    Some(Overlay {
+        plane,
+        fb_id: get("FB_ID")?,
+        crtc_id: get("CRTC_ID")?,
+        src: [get("SRC_X")?, get("SRC_Y")?, get("SRC_W")?, get("SRC_H")?],
+        dst: [
+            get("CRTC_X")?,
+            get("CRTC_Y")?,
+            get("CRTC_W")?,
+            get("CRTC_H")?,
+        ],
+        frames: Vec::new(),
+        pending: None,
+        on_screen: None,
+        touched: false,
+    })
 }
 
 fn plane_type(card: &Card, plane: plane::Handle) -> Option<PlaneType> {

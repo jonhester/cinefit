@@ -17,6 +17,8 @@ clap = { version = "4.5", features = ["derive"] }
 # termination: SIGTERM (from timeout or kill) ends a run as Ctrl-C does, so the
 # capture input is stopped rather than left enabled in the driver.
 ctrlc = { version = "3.4", features = ["termination"] }
+# On-screen text (osd.rs): glyphs rasterised from the bundled Inter (OFL).
+fontdue = "0.9"
 # Logging (runlog.rs): play's lines to the terminal and to a file per run.
 fern = "0.7"
 log = "0.4"
