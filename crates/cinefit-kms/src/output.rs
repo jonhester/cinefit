@@ -116,6 +116,9 @@ struct Overlay {
     /// A change for the next commit: `Some(None)` takes the layer down.
     pending: Option<Option<usize>>,
     on_screen: Option<usize>,
+    /// Whether a commit of this run has changed the plane. Only then does
+    /// `restore` take it down: an overlay nobody asked for is left alone.
+    touched: bool,
 }
 
 /// A CPU-drawn scanout buffer.
@@ -555,6 +558,7 @@ impl Output {
             return Vec::new();
         };
         ov.on_screen = change;
+        ov.touched = true;
         let plane: RawResourceHandle = ov.plane.into();
         match change {
             None => vec![(plane, ov.fb_id, 0), (plane, ov.crtc_id, 0)],
@@ -924,10 +928,12 @@ impl Output {
             }
         };
 
-        // The overlay goes down either way: it was off before this program.
+        // The overlay goes down either way if this run put anything on it:
+        // it was free or ours when found (`find_overlay`).
         let overlay_off: Vec<_> = self
             .overlay
             .as_ref()
+            .filter(|ov| ov.touched)
             .map(|ov| {
                 let plane: RawResourceHandle = ov.plane.into();
                 vec![(plane, ov.fb_id, 0), (plane, ov.crtc_id, 0)]
@@ -971,6 +977,7 @@ impl Output {
         if let Some(ov) = self.overlay.as_mut() {
             ov.on_screen = None;
             ov.pending = None;
+            ov.touched = false;
         }
         for blob in [
             self.mode_blob.take(),
@@ -1104,7 +1111,9 @@ fn props_by_name<T: drm::control::ResourceHandle>(
 }
 
 /// The first overlay plane that can sit on `crtc` and takes ARGB8888, with
-/// the properties a commit needs.
+/// the properties a commit needs. A plane on another CRTC is skipped:
+/// putting it on ours would take it off that output. One already on ours is
+/// taken, since a run that ended without restoring leaves it there.
 fn find_overlay(
     card: &Card,
     res: &drm::control::ResourceHandles,
@@ -1112,7 +1121,8 @@ fn find_overlay(
 ) -> Option<Overlay> {
     let plane = card.plane_handles().ok()?.into_iter().find(|&p| {
         card.get_plane(p).is_ok_and(|info| {
-            res.filter_crtcs(info.possible_crtcs()).contains(&crtc)
+            info.crtc().is_none_or(|c| c == crtc)
+                && res.filter_crtcs(info.possible_crtcs()).contains(&crtc)
                 && info.formats().contains(&(DrmFourcc::Argb8888 as u32))
         }) && plane_type(card, p) == Some(PlaneType::Overlay)
     })?;
@@ -1132,6 +1142,7 @@ fn find_overlay(
         frames: Vec::new(),
         pending: None,
         on_screen: None,
+        touched: false,
     })
 }
 
