@@ -55,6 +55,16 @@ pub trait Samples {
         pair_flags(&s.chroma, dc, out);
     }
 
+    /// Row `y`'s luma at the columns `xs`, into `out` (as long as `xs`): for
+    /// a sampler that reads a grid of points, not whole rows.
+    fn luma_at(&self, y: u32, xs: &[u32], out: &mut [u16], s: &mut RowScratch) {
+        s.luma.resize(self.width() as usize, 0);
+        self.luma_row(y, &mut s.luma);
+        for (o, &x) in out.iter_mut().zip(xs) {
+            *o = s.luma[x as usize];
+        }
+    }
+
     /// As [`Samples::count_lit`], with each pair's chroma taken from `flags`
     /// instead of tested: the count and the quarters.
     fn count_lit_flags(&self, y: u32, thr: u16, flags: &[u8], s: &mut RowScratch) -> (u32, u8) {
@@ -293,6 +303,14 @@ impl Samples for V210<'_> {
         (n, mask, chroma_only + co_groups)
     }
 
+    fn luma_at(&self, y: u32, xs: &[u32], out: &mut [u16], _: &mut RowScratch) {
+        let row = self.row(y);
+        for (o, &x) in out.iter_mut().zip(xs) {
+            let (word, slot) = Y_AT[x as usize % 6];
+            *o = field(words(&row[x as usize / 6])[word], slot);
+        }
+    }
+
     fn chroma_flags(&self, y: u32, dc: u32, out: &mut Vec<u8>, _: &mut RowScratch) {
         let pairs = (self.width as usize).div_ceil(2);
         out.clear();
@@ -415,6 +433,11 @@ mod tests {
                     fast.chroma_flags(y, dc, &mut a, &mut s);
                     plain.chroma_flags(y, dc, &mut b, &mut s);
                     assert_eq!(a, b, "chroma_flags w {w} y {y} dc {dc}");
+                    let xs: Vec<u32> = (0..w).step_by(7).chain([w - 1]).collect();
+                    let (mut pa, mut pb) = (vec![0u16; xs.len()], vec![0u16; xs.len()]);
+                    fast.luma_at(y, &xs, &mut pa, &mut s);
+                    plain.luma_at(y, &xs, &mut pb, &mut s);
+                    assert_eq!(pa, pb, "luma_at w {w} y {y}");
                     // Flags with runs cut out, as the bar scan passes them.
                     let flags: Vec<u8> = a
                         .iter()
