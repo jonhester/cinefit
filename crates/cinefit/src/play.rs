@@ -526,11 +526,11 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
 /// The preview's size: a sixth of the 4096 x 2160 raster each way.
 const PREVIEW: (usize, usize) = (682, 360);
 
-/// The frame just drawn, drawn again into a small target in SDR BT.709 and
-/// read back as 8-bit RGB: what the web page shows. Its own stage times, so
-/// the run's are the frames' alone.
+/// The frame just drawn, drawn again into a small target in SDR BT.709:
+/// what the web page shows, read back later without waiting (see the
+/// caller). Its own stage times, so the run's are the frames' alone.
 #[allow(clippy::too_many_arguments)]
-fn make_preview<'p>(
+fn render_preview<'p>(
     pl: &'p Placebo,
     tex: &mut Option<cinefit_render::Rgba16Target<'p>>,
     info: &FrameInfo,
@@ -540,7 +540,7 @@ fn make_preview<'p>(
     view: View,
     out: (u32, u32),
     c: &Config,
-) -> Result<(u16, u16, Vec<u8>), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let (w, h) = PREVIEW;
     if tex.is_none() {
         *tex = Some(pl.target_rgba16(w, h)?);
@@ -578,12 +578,14 @@ fn make_preview<'p>(
         &dst,
         &mut Stages::default(),
     )?;
-    let rgba = t.download()?;
-    let rgb = rgba
-        .chunks(4)
+    Ok(())
+}
+
+/// A read-back preview as 8-bit RGB.
+fn preview_rgb(rgba: &[u16]) -> Vec<u8> {
+    rgba.chunks(4)
         .flat_map(|p| [p[0] >> 8, p[1] >> 8, p[2] >> 8].map(|v| v as u8))
-        .collect();
-    Ok((w as u16, h as u16, rgb))
+        .collect()
 }
 
 /// A picture size as people say it.
@@ -1443,6 +1445,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // when the last was made.
     let mut preview_tex: Option<cinefit_render::Rgba16Target> = None;
     let (mut preview_at, mut previews): (Option<Instant>, u32) = (None, 0);
+    let mut preview_busy = false;
     let mut cur_mode = mode;
     let now = Instant::now();
     match (&start_key, &start_input) {
@@ -1889,43 +1892,56 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         // frame drawn again, small and in ordinary SDR, for
                         // a phone. About a millisecond on the GPU and a 2 MB
                         // download, against mapping the whole output.
-                        if let Some(every) = web.as_ref().and_then(Web::preview_every)
-                            && preview_at.is_none_or(|t| t.elapsed() >= every)
-                        {
-                            preview_at = Some(Instant::now());
-                            let made = make_preview(
-                                &pl,
-                                &mut preview_tex,
-                                &frame_info,
-                                k.kind,
-                                last_tunnel.as_ref(),
-                                &mut sources,
-                                view,
-                                size,
-                                &cfg,
-                            );
-                            match made {
-                                Ok((w, h, rgb)) => {
-                                    // The first includes making the target
-                                    // and its shaders; the tenth is the cost
-                                    // that repeats.
-                                    previews += 1;
-                                    if previews == 1 || previews == 10 {
-                                        info!(
-                                            "web: preview {w} x {h} made in {:.1} ms ({})",
-                                            ms(preview_at.unwrap_or_else(Instant::now)),
-                                            if previews == 1 {
-                                                "the first"
-                                            } else {
-                                                "the tenth"
-                                            }
-                                        );
+                        if let Some(wb) = &web {
+                            // The last preview's read-back, if it has come.
+                            if let Some(rgba) = preview_tex.as_mut().and_then(|t| t.take_download())
+                            {
+                                preview_busy = false;
+                                let (w, h) = PREVIEW;
+                                wb.set_preview(w as u16, h as u16, preview_rgb(&rgba));
+                            }
+                            if let Some(every) = wb.preview_every()
+                                && !preview_busy
+                                && preview_at.is_none_or(|t| t.elapsed() >= every)
+                            {
+                                let t0 = Instant::now();
+                                preview_at = Some(t0);
+                                let made = render_preview(
+                                    &pl,
+                                    &mut preview_tex,
+                                    &frame_info,
+                                    k.kind,
+                                    last_tunnel.as_ref(),
+                                    &mut sources,
+                                    view,
+                                    size,
+                                    &cfg,
+                                )
+                                .and_then(|()| {
+                                    let t = preview_tex.as_mut().expect("made by render_preview");
+                                    Ok(t.start_download()?)
+                                });
+                                match made {
+                                    Ok(started) => {
+                                        preview_busy = started;
+                                        // The first includes making the target
+                                        // and its shaders; the tenth is the
+                                        // cost that repeats.
+                                        previews += 1;
+                                        if previews == 1 || previews == 10 {
+                                            info!(
+                                                "web: preview made in {:.1} ms on the frame thread ({})",
+                                                ms(t0),
+                                                if previews == 1 {
+                                                    "the first"
+                                                } else {
+                                                    "the tenth"
+                                                }
+                                            );
+                                        }
                                     }
-                                    if let Some(wb) = &web {
-                                        wb.set_preview(w, h, rgb);
-                                    }
+                                    Err(e) => warn!("web: no preview: {e}"),
                                 }
-                                Err(e) => warn!("web: no preview: {e}"),
                             }
                         }
                         if let Some(&r) = stages.render.last() {

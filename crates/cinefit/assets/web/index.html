@@ -148,7 +148,7 @@ async function poll() {
   catch (e) { document.getElementById("pill").textContent = "No answer"; }
 }
 
-// The preview: a motion-JPEG stream (about five frames a second), shown
+// The preview: a motion-JPEG stream (every frame), shown
 // as the image's source, which browsers play natively. Stopped while the
 // tab is hidden, so a forgotten tab costs cinefit nothing. If the stream
 // fails, a still once a second instead.

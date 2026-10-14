@@ -539,6 +539,81 @@ cf_pl_tex *cf_pl_target_rgba16(cf_pl *pl, int w, int h) {
         .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0)));
 }
 
+/* 0 idle, 1 in flight, 2 done and not yet taken. Set by the callback,
+ * which libplacebo runs from a later call on the thread using the GPU, so
+ * no other thread ever sees it. */
+struct cf_pl_readback {
+    cf_pl *pl;
+    pl_tex tex;
+    uint16_t *data;
+    size_t len;
+    int state;
+    bool async;
+};
+
+static void readback_done(void *priv) {
+    ((cf_pl_readback *)priv)->state = 2;
+}
+
+cf_pl_readback *cf_pl_readback_create(cf_pl *pl, cf_pl_tex *t) {
+    cf_pl_readback *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->pl = pl;
+    r->tex = unwrap_tex(t);
+    r->len = (size_t)r->tex->params.w * (size_t)r->tex->params.h * 4;
+    r->data = malloc(r->len * sizeof *r->data);
+    r->async = pl->vk->gpu->limits.callbacks;
+    if (!r->data) {
+        free(r);
+        return NULL;
+    }
+    return r;
+}
+
+int cf_pl_readback_start(cf_pl_readback *r) {
+    if (r->state != 0) return 0;
+    struct pl_tex_transfer_params p = {
+        .tex = r->tex,
+        .ptr = r->data,
+        .row_pitch = (size_t)r->tex->params.w * 8,
+    };
+    if (r->async) {
+        p.callback = readback_done;
+        p.priv = r;
+        r->state = 1;
+        if (!pl_tex_download(r->pl->vk->gpu, &p)) {
+            r->state = 0;
+            log_err(r->pl, "preview read-back failed to start");
+            return -1;
+        }
+        pl_gpu_flush(r->pl->vk->gpu);
+        return 1;
+    }
+    if (!pl_tex_download(r->pl->vk->gpu, &p)) {
+        log_err(r->pl, "preview read-back failed");
+        return -1;
+    }
+    r->state = 2;
+    return 1;
+}
+
+int cf_pl_readback_take(cf_pl_readback *r, uint16_t *out) {
+    // A poll that does not wait: it runs the callbacks of finished work.
+    if (r->state == 1) pl_tex_poll(r->pl->vk->gpu, r->tex, 0);
+    if (r->state != 2) return 0;
+    memcpy(out, r->data, r->len * sizeof *r->data);
+    r->state = 0;
+    return 1;
+}
+
+void cf_pl_readback_destroy(cf_pl_readback *r) {
+    if (!r) return;
+    // The callback writes into r: let it run before r goes.
+    if (r->state == 1) pl_gpu_finish(r->pl->vk->gpu);
+    free(r->data);
+    free(r);
+}
+
 int cf_pl_download_rgba16(cf_pl *pl, cf_pl_tex *t, uint16_t *out) {
     pl_tex tex = unwrap_tex(t);
     if (!pl_tex_download(pl->vk->gpu, pl_tex_transfer_params(

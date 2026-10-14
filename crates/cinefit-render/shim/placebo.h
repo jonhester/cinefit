@@ -191,4 +191,18 @@ cf_pl_tex *cf_pl_target_rgba16(cf_pl *pl, int w, int h);
  * Returns 0, or -1, logged. */
 int cf_pl_download_rgba16(cf_pl *pl, cf_pl_tex *tex, uint16_t *out);
 
+/* An asynchronous read-back of a cf_pl_target_rgba16 texture, for a preview
+ * made every frame: started after a render, taken a frame or more later,
+ * so the caller never waits for the GPU. Without GPU callbacks it falls
+ * back to a blocking download. Destroy before the texture. */
+typedef struct cf_pl_readback cf_pl_readback;
+cf_pl_readback *cf_pl_readback_create(cf_pl *pl, cf_pl_tex *tex);
+/* 1 started; 0 busy (the last one still in flight, or done and not taken);
+ * -1 failed, logged. */
+int cf_pl_readback_start(cf_pl_readback *r);
+/* 1 when a finished read-back was copied into out (w * h * 4 values, rows
+ * packed); 0 when none is ready. */
+int cf_pl_readback_take(cf_pl_readback *r, uint16_t *out);
+void cf_pl_readback_destroy(cf_pl_readback *r);
+
 #endif

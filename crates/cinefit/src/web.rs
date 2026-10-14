@@ -13,8 +13,9 @@
 //!
 //! The preview is a small render of each frame, made beside the frame on
 //! screen, in ordinary SDR BT.709 so it looks right on a phone: once a
-//! second while a page shows a still, about five a second while a page
-//! watches the stream ([`Web::preview_every`]).
+//! second while a page shows a still, and every frame while a page watches
+//! the stream ([`Web::preview_every`]), read back without the frame thread
+//! waiting for the GPU.
 //!
 //! Endpoints: `/` the page; `/api/state` the snapshot; `/api/preview.jpg`;
 //! `/api/stream.mjpg`, the preview as a motion-JPEG stream;
@@ -38,9 +39,10 @@ const PAGE: &str = include_str!("../assets/web/index.html");
 
 /// A page that asked for the preview this recently is still watching.
 const WATCHING: Duration = Duration::from_secs(3);
-/// How often the preview is made: for a still, and while streaming.
+/// How often the preview is made: for a still, and while streaming (every
+/// frame).
 const STILL_EVERY: Duration = Duration::from_secs(1);
-const STREAM_EVERY: Duration = Duration::from_millis(200);
+const STREAM_EVERY: Duration = Duration::ZERO;
 
 /// A preview: its number, width, height and RGB bytes.
 type Preview = (u64, u16, u16, Vec<u8>);
