@@ -5,10 +5,7 @@
 #
 #   tools/install.sh                     build this tree and make it current
 #   tools/install.sh --release [VERSION] a published release (default: the
-#                                        latest); also takes an rc's or a
-#                                        nightly's version
-#   tools/install.sh --nightly [DATE]    the newest nightly, or that day's
-#                                        (YYYY-MM-DD)
+#                                        latest)
 #   tools/install.sh --rollback          swap current and previous
 #   tools/install.sh --cpp               point current at the C++ build
 #   tools/install.sh --status            show what current and previous point at
@@ -23,8 +20,8 @@
 # what runs mid-film. A build from this tree is copied into
 # ~/cinefit-app/rust-<commit>/, a published one into rust-<version>/: one file,
 # with libplacebo linked in. Published builds come from GitHub's releases
-# (CINEFIT_REPO, default jonhester/cinefit), the x86_64-v3 archive where the
-# CPU runs it, checked against SHA256SUMS.
+# (CINEFIT_REPO, default jonhester/cinefit), built for x86-64-v3, checked
+# against SHA256SUMS.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -155,20 +152,21 @@ api() {
         python3 -c "import json, sys; r = json.load(sys.stdin); print($2)"; } 2>/dev/null || true
 }
 
-# The archive this CPU should run: v3 needs AVX2, BMI1/2, FMA, F16C, LZCNT
-# (abm), MOVBE and XSAVE.
-flavour() {
+# Releases are built for x86-64-v3; refuse a CPU without it, rather than
+# install a binary that dies with an illegal instruction.
+need_v3() {
     flags=$(grep -m1 '^flags' /proc/cpuinfo)
     for f in avx2 bmi1 bmi2 fma f16c abm movbe xsave; do
-        echo "$flags" | grep -qw "$f" || { echo x86_64; return; }
+        echo "$flags" | grep -qw "$f" ||
+            die "this CPU lacks $f: releases need x86-64-v3; build from the source instead (tools/install.sh)"
     done
-    echo x86_64-v3
 }
 
 # Downloads, checks and installs release version $1.
 install_release() {
     version=$1
-    name="cinefit-$version-$(flavour)"
+    need_v3
+    name="cinefit-$version-x86_64-v3"
     base="https://github.com/$repo/releases/download/v$version"
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT
@@ -182,16 +180,9 @@ install_release() {
     place "$work/$name/cinefit" "rust-$version" "$version"
 }
 
-# The newest release's version, or the newest nightly's (that day's, given
-# YYYY-MM-DD). The API lists releases newest first.
+# The newest release's version.
 latest_release() {
     api releases/latest "r['tag_name'][1:]"
-}
-
-latest_nightly() {
-    day=$(echo "${1:-}" | tr -d -)
-    api "releases?per_page=100" \
-        "next((x['tag_name'][1:] for x in r if '-nightly.$day' in x['tag_name']), '')"
 }
 
 # The C++ build takes no subcommand and refuses `play`, so the service reaches
@@ -218,10 +209,6 @@ case "${1:-}" in
         v=${2:-$(latest_release)}
         [ -n "$v" ] || die "no release found"
         install_release "${v#v}" ;;
-    --nightly)
-        v=$(latest_nightly "${2:-}")
-        [ -n "$v" ] || die "no nightly${2:+ for $2} found"
-        install_release "$v" ;;
     --rollback)
         prev=$(readlink "$app/previous" 2>/dev/null) || die "nothing to roll back to"
         switch_to "$prev" ;;

@@ -1,16 +1,16 @@
 #!/bin/sh
 # Packs a built cinefit binary into a release archive:
-#   tools/package.sh BINARY VERSION FLAVOUR OUTDIR
-# gives OUTDIR/cinefit-VERSION-FLAVOUR.tar.gz, holding cinefit-VERSION-FLAVOUR/
-# with the binary and every licence it ships under. FLAVOUR is x86_64 (any
-# 64-bit x86) or x86_64-v3 (AVX2 and friends: 2015 and later).
+#   tools/package.sh BINARY VERSION OUTDIR
+# gives OUTDIR/cinefit-VERSION-x86_64-v3.tar.gz, holding the binary and every
+# licence it ships under. Releases are built for x86-64-v3 (AVX2 and friends:
+# x86 CPUs from about 2015 on).
 #
 # The binary needs from the system only what a working machine has anyway:
 # Blackmagic Desktop Video for the capture card, and Mesa's Vulkan driver,
 # GBM and libdrm for the GPU. libplacebo is inside it.
 set -eu
-[ $# -eq 4 ] || { echo "usage: $0 BINARY VERSION FLAVOUR OUTDIR" >&2; exit 2; }
-bin=$1 version=$2 flavour=$3 out=$4
+[ $# -eq 3 ] || { echo "usage: $0 BINARY VERSION OUTDIR" >&2; exit 2; }
+bin=$1 version=$2 out=$3 flavour=x86_64-v3
 root=$(cd "$(dirname "$0")/.." && pwd)
 name="cinefit-$version-$flavour"
 work=$(mktemp -d)
