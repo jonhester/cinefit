@@ -400,7 +400,8 @@ fn input_section(
     key: Option<Key>,
     format: Option<InputFormat>,
     dark: bool,
-    lldv: bool,
+    lldv: Option<u16>,
+    peak: Option<u16>,
 ) -> InfoSection {
     let label = "IN".to_string();
     let Some(k) = key.filter(|_| !dark) else {
@@ -412,7 +413,7 @@ fn input_section(
     };
     let line = match k.kind {
         Kind::Tunnel => "Dolby Vision \u{b7} tunnel".into(),
-        kind if is_lldv(kind, lldv) => "Dolby Vision \u{b7} low latency".into(),
+        kind if is_lldv(kind, lldv.is_some()) => "Dolby Vision \u{b7} low latency".into(),
         Kind::Ycbcr(c) if c.transfer == Transfer::Pq => "HDR10".into(),
         Kind::Ycbcr(c) if c.transfer == Transfer::Hlg => "HLG".into(),
         Kind::Ycbcr(c) if c.primaries == Primaries::Bt2020 => "SDR BT.2020".into(),
@@ -430,6 +431,9 @@ fn input_section(
         if let Some(d) = f.bit_depth {
             detail += &format!(" {d}-bit");
         }
+    }
+    if let Some(p) = peak {
+        detail += &format!(" \u{b7} {}", peak_words(k.kind, p, lldv));
     }
     InfoSection {
         label,
@@ -649,6 +653,59 @@ struct Found {
     ms: Option<f64>,
     /// The crop it changed to on this frame, and why.
     change: Option<(Crop, &'static str)>,
+    /// The frame's brightest luma code (10-bit), YCbCr frames only.
+    peak: Option<u16>,
+}
+
+/// The brightest luma code in a frame, from every 16th row: enough to see
+/// where a player's highlights go, for about half a millisecond on the
+/// worker thread.
+fn peak_luma(v: &V210<'_>) -> u16 {
+    use cinefit_detect::Samples;
+    let mut row = vec![0u16; v.width() as usize];
+    let mut peak = 0;
+    for y in (0..v.height()).step_by(16) {
+        v.luma_row(y, &mut row);
+        peak = peak.max(row.iter().copied().max().unwrap_or(0));
+    }
+    peak
+}
+
+/// A limited-range 10-bit code as a signal value, 0 at black and 1 at
+/// nominal peak.
+fn signal(code: u16) -> f64 {
+    ((f64::from(code) - 64.0) / 876.0).clamp(0.0, 1.0)
+}
+
+/// SMPTE ST 2084: a signal value (0-1) in nits.
+fn pq_nits(e: f64) -> f64 {
+    let (m1, m2) = (2610.0 / 16384.0, 2523.0 / 4096.0 * 128.0);
+    let (c1, c2, c3) = (
+        3424.0 / 4096.0,
+        2413.0 / 4096.0 * 32.0,
+        2392.0 / 4096.0 * 32.0,
+    );
+    let p = e.powf(1.0 / m2);
+    10000.0 * ((p - c1).max(0.0) / (c2 - c3 * p)).powf(1.0 / m1)
+}
+
+/// The brightest level of the last ten seconds as the panel says it: in nits
+/// where cinefit reads the input as PQ, as a share of white for SDR. For
+/// low-latency Dolby Vision, against the peak the player is assumed to map
+/// to (`lldv`, the setting, when it is on).
+fn peak_words(kind: Kind, code: u16, lldv: Option<u16>) -> String {
+    let as_lldv = lldv.is_some() && is_lldv(kind, true);
+    let pq = as_lldv || matches!(kind, Kind::Ycbcr(c) if c.transfer == Transfer::Pq);
+    if !pq {
+        return format!("brightest {:.0}% of white", signal(code) * 100.0);
+    }
+    let nits = pq_nits(signal(code));
+    match lldv {
+        Some(assumed) if as_lldv && nits > f64::from(assumed) * 1.05 => {
+            format!("brightest {nits:.0} nits, above the {assumed} assumed")
+        }
+        _ => format!("brightest {nits:.0} nits"),
+    }
 }
 
 impl CropFinder {
@@ -660,11 +717,16 @@ impl CropFinder {
         t: f64,
         epoch: u32,
     ) -> Found {
+        let peak = bytes
+            .filter(|_| matches!(kind, Kind::Ycbcr(_)))
+            .and_then(|b| V210::new(b, info.width, info.height, info.row_bytes))
+            .map(|v| peak_luma(&v));
         if !self.on {
             return Found {
                 source: geo::Source::Whole,
                 ms: None,
                 change: None,
+                peak,
             };
         }
         let (mut took, mut change) = (None, None);
@@ -690,6 +752,7 @@ impl CropFinder {
             },
             ms: took,
             change,
+            peak,
         }
     }
 }
@@ -1142,6 +1205,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         if let Some(d) = found.ms {
             window.borrow_mut().detect(Instant::now(), d);
         }
+        if let Some(p) = found.peak {
+            window.borrow_mut().peak(Instant::now(), p);
+        }
         if let Some((c, reason)) = found.change {
             crop_change.set(Some((Instant::now(), reason)));
             info!(
@@ -1360,9 +1426,18 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     geo::Source::Rows { top, bottom } => (top, bottom),
                     _ => (0, 0),
                 });
+                // Read first: the window is borrowed again for LAST 10 S
+                // below, and two borrows in one statement panic.
+                let brightest = window.borrow_mut().brightest(now);
                 ui.set_info(InfoText {
                     sections: vec![
-                        input_section(last_key, last_format, dark, opts.config.lldv),
+                        input_section(
+                            last_key,
+                            last_format,
+                            dark,
+                            opts.config.lldv.then_some(opts.config.lldv_nits),
+                            brightest,
+                        ),
                         output_section(
                             last_key,
                             dark,
@@ -2037,13 +2112,45 @@ mod tests {
             kind,
         };
         let lldv = Some(key(ycbcr(Transfer::Bt1886)));
-        let s = input_section(lldv, None, false, true);
+        let s = input_section(lldv, None, false, Some(96), None);
         assert_eq!(
             (s.line.as_str(), s.detail.as_str()),
             ("Dolby Vision \u{b7} low latency", "3840 \u{d7} 2160")
         );
-        assert_eq!(input_section(lldv, None, true, true).line, "No signal");
-        assert_eq!(input_section(None, None, false, true).line, "No signal");
+        assert_eq!(
+            input_section(lldv, None, true, Some(96), None).line,
+            "No signal"
+        );
+        assert_eq!(
+            input_section(None, None, false, Some(96), None).line,
+            "No signal"
+        );
+        // The brightest level: PQ codes in nits, against the assumed peak.
+        let lldv_kind = ycbcr(Transfer::Bt1886);
+        let at = |nits: f64| {
+            (0..1024u16)
+                .min_by(|&a, &b| {
+                    (pq_nits(signal(a)) - nits)
+                        .abs()
+                        .total_cmp(&(pq_nits(signal(b)) - nits).abs())
+                })
+                .unwrap()
+        };
+        let at96 = peak_words(lldv_kind, at(96.0), Some(96));
+        // The nearest code to 96 nits reads 95: within the assumed peak.
+        assert!(at96.ends_with(" nits") && !at96.contains("above"), "{at96}");
+        let over = peak_words(lldv_kind, at(200.0), Some(96));
+        assert!(over.ends_with("nits, above the 96 assumed"), "{over}");
+        // With input.lldv off the same signal is SDR: a share of white.
+        assert!(peak_words(lldv_kind, at(96.0), None).ends_with("% of white"));
+        let sdr = Kind::Ycbcr(YcbcrColor {
+            matrix: Matrix::Bt709,
+            primaries: Primaries::Bt709,
+            transfer: Transfer::Bt1886,
+        });
+        assert_eq!(peak_words(sdr, 940, Some(96)), "brightest 100% of white");
+        assert!((pq_nits(1.0) - 10_000.0).abs() < 1e-6);
+        assert!((pq_nits(0.508) - 100.0).abs() < 2.0, "{}", pq_nits(0.508));
         // 4096x2160 at 23.976: 296,703 kHz over 5500 x 2250.
         let mode = cinefit_kms::ModeTiming {
             width: 4096,
