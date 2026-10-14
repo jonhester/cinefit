@@ -41,11 +41,9 @@ const STABLE_FRAMES: usize = 12;
 const TUNNEL_GRACE: usize = 48;
 /// How long to wait for stable input before starting without it. A source
 /// that is on settles in well under a second (a tunnel, in two); past this
-/// the display is opened in [`WAIT_HZ`] with black, so it shows neither the
-/// console nor a stale picture, and the source is followed when it comes.
+/// the display is opened at `output.wait_hz` with black, so it shows neither
+/// the console nor a stale picture, and the source is followed when it comes.
 const PRE_ROLL_WAIT: Duration = Duration::from_secs(4);
-/// The output's rate while there is no source to take one from.
-const WAIT_HZ: f64 = 60000.0 / 1001.0;
 /// No frame for this long is no signal: black, not the last frame held. The
 /// C++ version's figure; a frame at 24p is 42 ms, so two missed frames.
 const NO_SIGNAL: Duration = Duration::from_millis(100);
@@ -674,7 +672,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     }
     let reported = *format.lock().unwrap_or_else(PoisonError::into_inner);
     // The source to start from, if one held still: without one the output
-    // starts in WAIT_HZ with black, and follows the source when it comes.
+    // starts at output.wait_hz with black, and follows the source when it comes.
     let start = match (key, first, reported) {
         (Some(key), Some(first), Some(input))
             if stable >= frames_to_trust(key) && !matches!(key.kind, Kind::Unsupported(_)) =>
@@ -725,7 +723,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let want = cinefit_kms::ModeRequest {
         width: opts.config.width,
         height: opts.config.height,
-        refresh_hz: start.as_ref().map_or(WAIT_HZ, |s| s.2.frames_per_second()),
+        refresh_hz: start
+            .as_ref()
+            .map_or(opts.config.wait_hz, |s| s.2.frames_per_second()),
     };
     let Some(index) = cinefit_kms::choose_mode(&modes, &want) else {
         info!("progressive modes offered:");

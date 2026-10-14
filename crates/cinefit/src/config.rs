@@ -46,6 +46,9 @@ pub struct Config {
     /// The brightness, in nits, that the SDR output's white stands for: what
     /// HDR is mapped down to.
     pub white_nits: u16,
+    /// The output's rate, in hertz, while there is no source to follow:
+    /// the rate the sources start in saves a resync when one comes on.
+    pub wait_hz: f64,
     /// Whether YCbCr input labelled SDR BT.2020 is a player's low-latency
     /// Dolby Vision: PQ already mapped by the player to `lldv_nits`.
     pub lldv: bool,
@@ -87,6 +90,7 @@ impl Default for Config {
             // The 96-nit low-latency Dolby Vision target the splitter's EDID
             // declares (2026-10-13), so that input maps one to one.
             white_nits: 96,
+            wait_hz: 23.976,
             lldv: true,
             lldv_nits: 96,
             // libplacebo's own default. Hable ranked closest to Dolby in the
@@ -246,6 +250,17 @@ static SETTINGS: &[Setting] = &[
                Match input.lldv_nits so a player's low-latency Dolby Vision passes one to one.",
         get: |c| Value::Int(c.white_nits.into()),
         set: |c, v| c.white_nits = int(v) as u16,
+    },
+    Setting {
+        key: "output.wait_hz",
+        kind: Kind::Float {
+            min: 23.0,
+            max: 61.0,
+        },
+        apply: Apply::Restart,
+        help: "The output's rate while no source is playing, with black on screen. A source that starts at the same rate (and SDR) comes up without a resync: 23.976 for an Apple TV set to 23.976, 59.94 for a player whose menus are 59.94.",
+        get: |c| Value::Float(c.wait_hz),
+        set: |c, v| c.wait_hz = float(v),
     },
     Setting {
         key: "input.rgb_range",
