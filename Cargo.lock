@@ -229,6 +229,7 @@ dependencies = [
  "fern",
  "fontdue",
  "log",
+ "rustix 0.38.44",
  "serde_json",
  "time",
  "tiny_http",

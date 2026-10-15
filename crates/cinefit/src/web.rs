@@ -281,6 +281,10 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "osd.banners" => ("Picture", "Banners"),
         "detect.record" => ("Picture", "Record for detector tuning"),
         "detect.frames_gb" => ("Picture", "Disk for kept frames, GB (0: none)"),
+        "detect.pair_every" => (
+            "Picture",
+            "Pairing passes: keep every Nth frame of each shot (0: off)",
+        ),
         "output.mode" => ("Output", "HDR10"),
         "output.wait_hz" => ("Output", "Rate while waiting"),
         "output.white_nits" => ("Output", "SDR white and low-latency Dolby Vision, nits"),

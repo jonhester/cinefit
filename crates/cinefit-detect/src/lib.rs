@@ -361,9 +361,111 @@ impl Samples for V210<'_> {
     }
 }
 
+/// A tunneled Dolby Vision frame, read in place (#109): the source's 12-bit
+/// 4:2:2 packed into 8-bit RGB, which the card delivers as `r210`, each
+/// 8-bit code shifted left by two, one big-endian word a pixel:
+///
+/// ```text
+/// G = Y[11:4]    R = C[11:4]    B = C[3:0] << 4 | Y[3:0]
+/// ```
+///
+/// with C Cb on even pixels and Cr on odd ones (as `cinefit_render::tunnel`
+/// unpacks it, which the GPU's unpack is checked against). Given as 10-bit
+/// codes, the 12-bit ones' top ten bits, like v210's. For cuts and
+/// fingerprints: the tunnel's codes are the source's own (ICtCp or YCbCr,
+/// often full range), so its levels are not the HDR10 or LLDV picture's,
+/// and the bar detector does not read it (#69).
+pub struct Tunnel<'a> {
+    bytes: &'a [u8],
+    width: u32,
+    height: u32,
+    row_bytes: usize,
+}
+
+impl<'a> Tunnel<'a> {
+    /// `None` for an odd width, or unless `bytes` holds `height` rows of
+    /// `row_bytes`, each with room for `width` pixels.
+    pub fn new(bytes: &'a [u8], width: u32, height: u32, row_bytes: usize) -> Option<Self> {
+        (width.is_multiple_of(2)
+            && row_bytes >= width as usize * 4
+            && bytes.len() >= row_bytes.checked_mul(height as usize)?)
+        .then_some(Self {
+            bytes,
+            width,
+            height,
+            row_bytes,
+        })
+    }
+
+    /// Pixel `x` of row `y` as (luma, chroma), 12-bit.
+    fn pixel(&self, x: usize, y: u32) -> (u16, u16) {
+        let o = y as usize * self.row_bytes + 4 * x;
+        let w = u32::from_be_bytes(self.bytes[o..o + 4].try_into().expect("4 bytes"));
+        let [r, g, b] = [w >> 22, w >> 12, w >> 2].map(|c| (c & 0xFF) as u16);
+        (g << 4 | b & 0xF, r << 4 | b >> 4)
+    }
+}
+
+impl Samples for Tunnel<'_> {
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn luma_row(&self, y: u32, out: &mut [u16]) {
+        for (x, o) in out.iter_mut().enumerate().take(self.width as usize) {
+            *o = self.pixel(x, y).0 >> 2;
+        }
+    }
+
+    fn chroma_row(&self, y: u32, out: &mut [[u16; 2]]) {
+        for (k, o) in out.iter_mut().enumerate().take(self.width as usize / 2) {
+            *o = [self.pixel(2 * k, y).1 >> 2, self.pixel(2 * k + 1, y).1 >> 2];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tunnel adapter reads what the packing put there: a frame packed
+    /// by hand, as `cinefit_render::tunnel::pack_r210` packs it.
+    #[test]
+    fn a_tunnel_frame_reads_back_its_luma_and_chroma() {
+        let (w, h) = (4u32, 2u32);
+        let row_bytes = 4 * w as usize + 8;
+        let y12 = |x: u32, y: u32| (100 + 37 * x + 900 * y) as u16;
+        let c12 = |x: u32, y: u32| (2048 + 11 * x - 300 * y) as u16;
+        let mut bytes = vec![0u8; row_bytes * h as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (l, c) = (y12(x, y), c12(x, y));
+                let (r, g, b) = (c >> 4, l >> 4, (c & 0xF) << 4 | (l & 0xF));
+                let word = u32::from(r) << 22 | u32::from(g) << 12 | u32::from(b) << 2;
+                let o = y as usize * row_bytes + 4 * x as usize;
+                bytes[o..o + 4].copy_from_slice(&word.to_be_bytes());
+            }
+        }
+        let t = Tunnel::new(&bytes, w, h, row_bytes).unwrap();
+        let mut luma = vec![0u16; w as usize];
+        let mut chroma = vec![[0u16; 2]; w as usize / 2];
+        t.luma_row(1, &mut luma);
+        t.chroma_row(1, &mut chroma);
+        assert_eq!(luma, (0..w).map(|x| y12(x, 1) >> 2).collect::<Vec<_>>());
+        assert_eq!(
+            chroma,
+            [
+                [c12(0, 1) >> 2, c12(1, 1) >> 2],
+                [c12(2, 1) >> 2, c12(3, 1) >> 2]
+            ]
+        );
+        assert!(Tunnel::new(&bytes, 3, h, row_bytes).is_none(), "odd width");
+        assert!(Tunnel::new(&bytes[1..], w, h, row_bytes).is_none(), "short");
+    }
 
     /// A v210 frame seen only through the four required methods, so the
     /// counting methods are the trait's defaults.

@@ -73,6 +73,9 @@ pub struct Config {
     /// The disk the dataset's kept full frames may use, every session
     /// together, in GB; 0 keeps none (#91).
     pub frames_gb: u16,
+    /// Pairing passes (#109): keep each shot's first frame and every this
+    /// many after it, and nothing else; 0 for the usual choice.
+    pub pair_every: u32,
     /// The screen's aspect: the band of the raster that lands on it.
     pub screen_ar: Ratio,
     /// Content wider than this is trimmed at the sides to fill the screen's
@@ -167,6 +170,7 @@ impl Default for Config {
             crop: true,
             record: true,
             frames_gb: 20,
+            pair_every: 0,
             screen_ar: Ratio::of(2.35),
             fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
@@ -433,6 +437,20 @@ static SETTINGS: &[Setting] = &[
                are deleted first. 0: no full frames, only the readings.",
         get: |c| Value::Int(c.frames_gb.into()),
         set: Set::Int(|c, v| c.frames_gb = v as u16),
+    },
+    Setting {
+        key: "detect.pair_every",
+        kind: Kind::Int {
+            min: 0,
+            max: 100_000,
+        },
+        apply: Apply::Live,
+        help: "For pairing two passes of a title (Dolby Vision tunnel, then low-latency): keep in full the first \
+               frame of every shot and every this many frames after it, and no other frames, so both passes keep \
+               the same frames of the film. 48 at 24p is one every two seconds; a tunnel frame is about 15 MB \
+               kept, so mind detect.frames_gb. 0: off, frames kept as usual.",
+        get: |c| Value::Int(c.pair_every.into()),
+        set: Set::Int(|c, v| c.pair_every = v as u32),
     },
     Setting {
         key: "geometry.screen_ar",

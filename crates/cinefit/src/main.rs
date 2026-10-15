@@ -14,18 +14,21 @@ mod content;
 #[cfg(target_os = "linux")]
 mod dataset;
 mod device;
+mod dovi_meta;
 mod follow;
 mod hindsight;
 #[cfg(target_os = "linux")]
 mod menu;
 #[cfg(target_os = "linux")]
 mod osd;
+mod pairs;
 #[cfg(target_os = "linux")]
 mod play;
 mod record;
 mod replay;
 #[cfg(target_os = "linux")]
 mod runlog;
+mod splitter;
 #[cfg(target_os = "linux")]
 mod status;
 #[cfg(target_os = "linux")]
@@ -94,6 +97,29 @@ enum Command {
     /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
     /// an identity render read back and compared. Touches no display.
     Gpu,
+    /// The Dolby Vision metadata of a session's kept tunnel frames (#109):
+    /// the grade's range, each shot's brightness and the colourist's trims.
+    /// Writes dovi.csv into the session.
+    Dovi {
+        /// The session directory (under ~/cinefit-clips/caught).
+        session: PathBuf,
+    },
+    /// Pair the frames two passes of a title both kept (#109): a Dolby
+    /// Vision tunnel pass and a low-latency one, each recorded with
+    /// detect.pair_every. Writes pairs.csv into the first session.
+    Pairs {
+        /// The first pass's session directory (under ~/cinefit-clips/caught).
+        a: PathBuf,
+        /// The second pass's.
+        b: PathBuf,
+        /// Only the first session's frames of this content (tunnel, lldv,
+        /// sdr, hdr10): for a session holding several passes.
+        #[arg(long)]
+        a_content: Option<String>,
+        /// The same for the second session.
+        #[arg(long)]
+        b_content: Option<String>,
+    },
     /// Time a 4K render into a scanout buffer in each layout the display
     /// plane takes, and check each renders the same picture as LINEAR, with
     /// a negative control (#101). Off-screen; for clean numbers, stop the
@@ -283,6 +309,13 @@ fn main() -> ExitCode {
             sessions.iter().try_for_each(|s| hindsight::run(s, worst))
         }
         Command::Gpu => gpu(),
+        Command::Dovi { session } => dovi_meta::run(&session),
+        Command::Pairs {
+            a,
+            b,
+            a_content,
+            b_content,
+        } => pairs::run((&a, a_content.as_deref()), (&b, b_content.as_deref())),
         #[cfg(target_os = "linux")]
         Command::Bench { frames, card } => bench::run(frames, card.as_deref()),
         #[cfg(not(target_os = "linux"))]
