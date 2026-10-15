@@ -456,7 +456,13 @@ mod tests {
         t.luma_row(1, &mut luma);
         t.chroma_row(1, &mut chroma);
         assert_eq!(luma, (0..w).map(|x| y12(x, 1) >> 2).collect::<Vec<_>>());
-        assert_eq!(chroma, [[c12(0, 1) >> 2, c12(1, 1) >> 2], [c12(2, 1) >> 2, c12(3, 1) >> 2]]);
+        assert_eq!(
+            chroma,
+            [
+                [c12(0, 1) >> 2, c12(1, 1) >> 2],
+                [c12(2, 1) >> 2, c12(3, 1) >> 2]
+            ]
+        );
         assert!(Tunnel::new(&bytes, 3, h, row_bytes).is_none(), "odd width");
         assert!(Tunnel::new(&bytes[1..], w, h, row_bytes).is_none(), "short");
     }

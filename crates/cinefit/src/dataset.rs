@@ -65,6 +65,9 @@ pub struct Record {
     /// did not run (input it cannot read, or cropping off).
     pub reading: Option<(Observation, bool)>,
     pub thumb: Option<[u8; THUMB]>,
+    /// A hard cut on this frame, from whichever detector read it: the
+    /// tunnel's too, which has no reading (#109).
+    pub cut: bool,
 }
 
 /// A small luma thumbnail of `f`: each cell the mean of a grid of samples in
@@ -158,7 +161,7 @@ impl Recorder {
         let mut frames_file = BufWriter::new(File::create(dir.join("frames.csv"))?);
         writeln!(
             frames_file,
-            "index,time,epoch,content,crop_top,crop_bottom,reading,thumb"
+            "index,time,epoch,content,crop_top,crop_bottom,reading,thumb,cut"
         )?;
         let thumbs_file = BufWriter::new(File::create(dir.join("thumbs.bin"))?);
         let (tx, rx) = sync_channel(QUEUE);
@@ -315,6 +318,9 @@ const SAMPLE_MEAN: f64 = 300.0;
 /// Which frames to keep in full, frame by frame. Pure: tested without a
 /// card, a GPU or a disk.
 pub struct Picker {
+    /// Frames since the last cut, once there has been one: the pair mode's
+    /// anchor (#109).
+    since_cut: Option<u32>,
     after_change: u8,
     candidate: bool,
     last_candidate: Option<f64>,
@@ -326,6 +332,7 @@ impl Picker {
     /// `seed` drives the sample's random times (any value but 0).
     pub fn new(seed: u64, t: f64) -> Self {
         let mut p = Self {
+            since_cut: None,
             after_change: 0,
             candidate: false,
             last_candidate: None,
@@ -345,6 +352,21 @@ impl Picker {
         self.rng ^= self.rng << 17;
         let u = (self.rng >> 11) as f64 / (1u64 << 53) as f64;
         -SAMPLE_MEAN * (1.0 - u).ln()
+    }
+
+    /// The pair mode (#109): the frame a cut starts a shot on, and every
+    /// `every`th frame of the shot after it. A hard cut is the film's own, so
+    /// two passes of the same title (tunnel, then low-latency) keep the same
+    /// frames without knowing of each other, where keeping by time would
+    /// not. Before the first cut, nothing: there is no anchor yet.
+    pub fn pick_pairs(&mut self, cut: bool, every: u32) -> Option<&'static str> {
+        if cut {
+            self.since_cut = Some(0);
+            return Some("cut");
+        }
+        let n = self.since_cut.as_mut()?;
+        *n += 1;
+        (every > 0 && (*n).is_multiple_of(every)).then_some("in shot")
     }
 
     /// Whether to keep the frame at `t`, and why: `changed` if the crop
@@ -427,7 +449,7 @@ fn write_all(
         }
         writeln!(
             frames_file,
-            "{},{:.4},{},{},{},{},{},{}",
+            "{},{:.4},{},{},{},{},{},{},{}",
             r.index,
             r.time,
             r.epoch,
@@ -435,7 +457,8 @@ fn write_all(
             r.crop.0,
             r.crop.1,
             u8::from(r.reading.is_some()),
-            u8::from(r.thumb.is_some())
+            u8::from(r.thumb.is_some()),
+            u8::from(r.cut)
         )?;
         if let Some(t) = &r.thumb {
             thumbs_file.write_all(t)?;
@@ -451,6 +474,65 @@ fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detector's tunnel reader agrees with the renderer's packing,
+    /// which the GPU unpack is checked against: the same frame, both ways.
+    #[test]
+    fn the_tunnel_reader_agrees_with_the_renderers_packing() {
+        use cinefit_render::tunnel::pack_r210;
+        use cinefit_render::v210::Planes;
+        let (w, h) = (8usize, 3usize);
+        let p = Planes {
+            width: w,
+            height: h,
+            luma: (0..w * h).map(|i| (64 + 151 * i % 4000) as u16).collect(),
+            chroma: (0..w * h).map(|i| (2048 + 97 * i % 1900) as u16).collect(),
+        };
+        let row_bytes = w * 4 + 16;
+        let bytes = pack_r210(&p, row_bytes).unwrap();
+        let t = cinefit_detect::Tunnel::new(&bytes, w as u32, h as u32, row_bytes).unwrap();
+        let (mut luma, mut chroma) = (vec![0u16; w], vec![[0u16; 2]; w / 2]);
+        for y in 0..h {
+            t.luma_row(y as u32, &mut luma);
+            t.chroma_row(y as u32, &mut chroma);
+            let row = &p.luma[y * w..][..w];
+            assert_eq!(
+                luma,
+                row.iter().map(|v| v >> 2).collect::<Vec<_>>(),
+                "row {y}"
+            );
+            let c = &p.chroma[y * w..][..w];
+            let want: Vec<[u16; 2]> = c.chunks(2).map(|k| [k[0] >> 2, k[1] >> 2]).collect();
+            assert_eq!(chroma, want, "row {y}");
+        }
+    }
+
+    /// Two passes starting at different moments, with the same cuts at the
+    /// same frames of the film, keep the same frames of it.
+    #[test]
+    fn the_pair_mode_keeps_the_same_frames_of_the_film_in_any_pass() {
+        let cuts = [100u64, 160, 400];
+        let kept = |start: u64| {
+            let mut p = Picker::new(1, 0.0);
+            (start..600)
+                .filter(|&f| p.pick_pairs(cuts.contains(&f), 48).is_some())
+                .collect::<Vec<_>>()
+        };
+        // The cut frames, then every 48th of each shot after its cut.
+        assert_eq!(
+            kept(0),
+            [100, 148, 160, 208, 256, 304, 352, 400, 448, 496, 544, 592]
+        );
+        // A pass started later, after the first cut: from the next cut on,
+        // the same frames.
+        assert_eq!(
+            kept(120),
+            [160, 208, 256, 304, 352, 400, 448, 496, 544, 592]
+        );
+        // Before any cut there is no anchor.
+        let mut p = Picker::new(1, 0.0);
+        assert!((0..99).all(|_| p.pick_pairs(false, 1).is_none()));
+    }
 
     #[test]
     fn a_crop_change_keeps_itself_and_the_next_two() {
@@ -636,6 +718,7 @@ mod tests {
                 // The middle frame without a reading: the detector did not run.
                 reading: (i != 1).then(|| (Observation::default(), i == 2)),
                 thumb: Some([i as u8; THUMB]),
+                cut: false,
             });
         }
         let s = rec.finish().unwrap();
@@ -652,7 +735,7 @@ mod tests {
                 .lines()
                 .nth(2)
                 .unwrap()
-                .ends_with(",hdr10,276,277,0,1")
+                .ends_with(",hdr10,276,277,0,1,0")
         );
         let thumbs = fs::read(dir.join("thumbs.bin")).unwrap();
         assert_eq!(thumbs.len(), 3 * THUMB);

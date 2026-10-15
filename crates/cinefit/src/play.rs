@@ -423,6 +423,11 @@ struct CropFinder {
     unread: bool,
     /// Make each frame's fingerprint for the dataset (`detect.record`, #91).
     thumbs: bool,
+    /// Cuts in tunneled Dolby Vision, which the detector does not read:
+    /// for the dataset, so a tunnel pass can be paired with a low-latency one
+    /// by its shots (#109). The epoch it last saw, to start again on a new one.
+    tunnel_cuts: cinefit_detect::cuts::Cuts,
+    tunnel_epoch: u32,
 }
 
 /// What the detector made of one frame.
@@ -442,6 +447,9 @@ struct Found {
     /// The policy holds a crop it has not adopted: the detector is unsure,
     /// a moment the dataset keeps a frame of (#91).
     candidate: bool,
+    /// A hard cut on this frame: from the detector on YCbCr, from a cut
+    /// detector of its own on the tunnel (#109).
+    cut: bool,
 }
 
 /// The brightest luma code in a frame, from every 16th row: enough to see
@@ -543,6 +551,7 @@ impl Dataset {
                 crop,
                 reading: found.reading,
                 thumb: found.thumb,
+                cut: found.cut,
             });
             self.next += 1;
         }
@@ -565,7 +574,12 @@ impl Dataset {
                 .map_or(1, |d| d.as_nanos() as u64);
             dataset::Picker::new(seed, t)
         });
-        let Some(why) = picker.pick(t, found.change.is_some(), found.candidate) else {
+        let why = if cfg.pair_every > 0 {
+            picker.pick_pairs(found.cut, cfg.pair_every)
+        } else {
+            picker.pick(t, found.change.is_some(), found.candidate)
+        };
+        let Some(why) = why else {
             return;
         };
         if let Some(px) = frame.pixels() {
@@ -667,10 +681,23 @@ impl CropFinder {
             .filter(|_| matches!(kind, Kind::Ycbcr(_)))
             .and_then(|b| V210::new(b, info.width, info.height, info.row_bytes));
         let peak = v210.as_ref().map(peak_luma);
-        let thumb = v210
-            .as_ref()
-            .filter(|_| self.thumbs)
-            .map(|v| dataset::thumbnail(v));
+        // The tunnel, read for the dataset only: its fingerprint and its
+        // cuts, while recording (#109).
+        let tunnel = bytes
+            .filter(|_| self.thumbs && matches!(kind, Kind::Tunnel))
+            .and_then(|b| cinefit_detect::Tunnel::new(b, info.width, info.height, info.row_bytes));
+        let thumb = match (&v210, &tunnel) {
+            (Some(v), _) if self.thumbs => Some(dataset::thumbnail(v)),
+            (_, Some(t)) => Some(dataset::thumbnail(t)),
+            _ => None,
+        };
+        let tunnel_cut = tunnel.as_ref().is_some_and(|t| {
+            if epoch != self.tunnel_epoch {
+                self.tunnel_cuts.reset();
+                self.tunnel_epoch = epoch;
+            }
+            self.tunnel_cuts.observe(t, 0, 0).cut
+        });
         if !self.on {
             return Found {
                 source: geo::Source::Whole,
@@ -680,6 +707,7 @@ impl CropFinder {
                 reading: None,
                 thumb,
                 candidate: false,
+                cut: tunnel_cut,
             };
         }
         // A crop belongs to the picture it was found on: held over RGB or the
@@ -702,6 +730,7 @@ impl CropFinder {
                 reading: None,
                 thumb,
                 candidate: false,
+                cut: tunnel_cut,
             };
         }
         self.unread = false;
@@ -726,6 +755,7 @@ impl CropFinder {
             ms: took,
             change,
             peak,
+            cut: reading.is_some_and(|(_, cut)| cut),
             reading,
             thumb,
             candidate,
@@ -1226,6 +1256,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         crops: 0,
         unread: false,
         thumbs: cfg.record,
+        tunnel_cuts: Default::default(),
+        tunnel_epoch: 0,
     };
     // The detector's dataset (#91): a session directory, opened on the first
     // frame recorded, so a run with nothing coming in leaves none.
@@ -2289,6 +2321,8 @@ mod tests {
             crops: 0,
             unread: false,
             thumbs: false,
+            tunnel_cuts: Default::default(),
+            tunnel_epoch: 0,
         };
         let sdr = Kind::Ycbcr(YcbcrColor {
             matrix: Matrix::Bt2020Nc,
