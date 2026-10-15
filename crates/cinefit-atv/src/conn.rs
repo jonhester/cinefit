@@ -1,5 +1,8 @@
 //! A TCP connection that speaks HTTP or RTSP, in the clear until a
 //! pair-verify, then through a [`Session`].
+//!
+//! The messages are formed as pyatv forms them (MIT; `pyatv/support/http.py`,
+//! `pyatv/support/rtsp.py`), which is what the Apple TV is known to accept.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

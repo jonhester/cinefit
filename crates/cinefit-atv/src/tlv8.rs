@@ -1,5 +1,8 @@
 //! TLV8, the pairing messages' encoding: a tag byte, a length byte, the
 //! value. A value longer than 255 bytes is split across repeats of its tag.
+//!
+//! As pyatv reads and writes it (MIT; `pyatv/auth/hap_tlv8.py`), and the
+//! tag values are its.
 
 use std::collections::HashMap;
 

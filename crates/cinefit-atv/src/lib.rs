@@ -3,7 +3,8 @@
 //! tunnels. Reads only; it sends nothing that changes what the Apple TV
 //! does.
 //!
-//! Written from pyatv (MIT, <https://github.com/postlund/pyatv>), which
+//! Written from pyatv (MIT, <https://github.com/postlund/pyatv>; see the
+//! crate's README for what came from where and its licence), which
 //! stays a development tool to check this against, never a dependency. The
 //! steps, as pyatv takes them (`protocols/airplay/ap2_session.py`):
 //!
@@ -192,6 +193,9 @@ pub fn cocoa(secs: f64) -> SystemTime {
 
 /// Each app's state, kept apart: the Apple TV reports for every app that
 /// has a player, and says which one is in front.
+///
+/// Simplified from pyatv's `protocols/mrp/player_state.py` (MIT): one
+/// player per app, where pyatv keeps each app's players apart.
 #[derive(Debug, Default)]
 pub struct Tracker {
     front: Option<String>,

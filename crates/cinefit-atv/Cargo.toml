@@ -1,6 +1,7 @@
 [package]
 name = "cinefit-atv"
 description = "What an Apple TV is playing, read over its AirPlay remote-control channel"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
