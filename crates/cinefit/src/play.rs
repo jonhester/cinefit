@@ -1441,6 +1441,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 ready = Some(free);
                 dark = true;
                 counts.signal_losses += 1;
+                receiver.nudge();
                 // A break in the input: the viewing so far is judged.
                 dataset.judge(true);
                 ui.set_slate(Some(if last_seen.as_ref().is_some_and(|s| !s.on) {
@@ -1530,6 +1531,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
                 if Some(k) != last_key {
                     counts.format_changes += 1;
+                    receiver.nudge();
                     // Capped: a source that flaps would bury everything else.
                     if counts.format_changes <= LOGGED_CHANGES {
                         info!(

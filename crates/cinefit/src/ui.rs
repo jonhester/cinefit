@@ -54,7 +54,8 @@ pub enum Slate {
 }
 
 impl Slate {
-    fn text(&self, venue: &str, now: Instant) -> SlateText {
+    /// `source` is the receiver's input (#116), named for what is awaited.
+    fn text(&self, venue: &str, source: Option<&str>, now: Instant) -> SlateText {
         let (state, detail, tone) = match self {
             Slate::NoSignal => ("No signal", String::new(), Tone::Plain),
             Slate::ReceiverOff => (
@@ -64,7 +65,11 @@ impl Slate {
             ),
             Slate::SignalLost { since } => (
                 "Signal lost",
-                format!("{} \u{b7} waiting for the source", ago(now - *since)),
+                format!(
+                    "{} \u{b7} waiting for {}",
+                    ago(now - *since),
+                    source.unwrap_or("the source")
+                ),
                 Tone::Attention,
             ),
             Slate::Identifying { detail } => (
@@ -473,7 +478,10 @@ impl Ui {
                 Corner::TopLeft,
             ][(turns % 4) as usize];
             return (
-                Some(Content::Slate(slate.text(&self.venue, now), corner)),
+                Some(Content::Slate(
+                    slate.text(&self.venue, self.source.as_deref(), now),
+                    corner,
+                )),
                 1.0,
             );
         }
@@ -684,6 +692,13 @@ mod tests {
         ui.set_slate(None);
         ui.picture(text("Dolby Vision"), false, later);
         assert!(ui.want(later).0.is_none());
+        // Lost again with the receiver's input known: it is named.
+        ui.set_source(Some("Apple TV".into()));
+        ui.set_slate(Some(Slate::SignalLost { since: later }));
+        let Some(Content::Slate(s, _)) = ui.want(later).0 else {
+            panic!("no slate");
+        };
+        assert_eq!(s.detail, "just now \u{b7} waiting for Apple TV");
     }
 
     #[test]

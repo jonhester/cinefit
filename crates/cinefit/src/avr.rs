@@ -14,11 +14,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// How often the status is read.
-const POLL: Duration = Duration::from_secs(3);
+/// How often the status is read when nothing asks sooner: for standby,
+/// which only ends a session and can wait. A change of input always breaks
+/// or changes the signal, and play asks then ([`Receiver::nudge`]).
+const POLL: Duration = Duration::from_secs(30);
 /// Connecting and each read: a receiver that is off the network should not
 /// hold anything up.
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -69,22 +71,27 @@ pub fn parse_names(text: &str) -> HashMap<String, String> {
 
 /// A background reader of one receiver; follows the address as it changes.
 pub struct Receiver {
-    shared: Arc<Mutex<Shared>>,
+    shared: Arc<(Mutex<Shared>, Condvar)>,
 }
 
 #[derive(Default)]
 struct Shared {
     host: String,
     seen: Option<Seen>,
+    /// Read now, not at the next poll.
+    nudged: bool,
 }
 
 impl Receiver {
     /// Starts reading `host` (a hostname or an IP address; empty for none).
     pub fn start(host: &str) -> Self {
-        let shared = Arc::new(Mutex::new(Shared {
-            host: host.to_string(),
-            seen: None,
-        }));
+        let shared = Arc::new((
+            Mutex::new(Shared {
+                host: host.to_string(),
+                ..Shared::default()
+            }),
+            Condvar::new(),
+        ));
         let s = Arc::clone(&shared);
         let _ = std::thread::Builder::new()
             .name("avr".into())
@@ -94,17 +101,28 @@ impl Receiver {
 
     /// A new address (the `avr.denon` setting, changed live).
     pub fn set_host(&self, host: &str) {
-        let mut s = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut s = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
         if s.host != host {
             s.host = host.to_string();
             s.seen = None;
+            s.nudged = true;
+            self.shared.1.notify_one();
         }
+    }
+
+    /// The signal broke or changed, which is when the input may have: read
+    /// it now. The banner waits out the resync, by when it has answered.
+    pub fn nudge(&self) {
+        let mut s = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
+        s.nudged = true;
+        self.shared.1.notify_one();
     }
 
     /// What the receiver last said; `None` with no address, or while it
     /// does not answer.
     pub fn seen(&self) -> Option<Seen> {
         self.shared
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .seen
@@ -112,7 +130,7 @@ impl Receiver {
     }
 }
 
-fn poll(shared: &Mutex<Shared>) {
+fn poll((shared, wake): &(Mutex<Shared>, Condvar)) {
     let mut names: HashMap<String, String> = HashMap::new();
     let mut names_for = String::new();
     let mut names_tried: Option<Instant> = None;
@@ -148,13 +166,14 @@ fn poll(shared: &Mutex<Shared>) {
                 }
             })
         };
-        {
-            let mut s = shared.lock().unwrap_or_else(PoisonError::into_inner);
-            if s.host == host {
-                s.seen = seen;
-            }
+        let mut s = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if s.host == host {
+            s.seen = seen;
         }
-        std::thread::sleep(POLL);
+        let (mut s, _) = wake
+            .wait_timeout_while(s, POLL, |s| !s.nudged)
+            .unwrap_or_else(PoisonError::into_inner);
+        s.nudged = false;
     }
 }
 
