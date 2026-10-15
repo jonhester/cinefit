@@ -54,6 +54,9 @@ pub struct Config {
     /// Whether YCbCr input labelled SDR BT.2020 is a player's low-latency
     /// Dolby Vision: PQ already mapped by the player to `white_nits`.
     pub lldv: bool,
+    /// The capture device by persistent ID (hex); empty for the first that
+    /// can capture (#68).
+    pub input_device: String,
     /// The tone curve for HDR into the SDR output.
     pub curve: Curve,
     /// The HDR10 source's peak for the curve, in nits, in place of its
@@ -150,6 +153,7 @@ impl Default for Config {
             // declares (2026-10-13), so that input maps one to one.
             white_nits: 96,
             wait_hz: 23.976,
+            input_device: String::new(),
             lldv: true,
             // libplacebo's own default. Hable ranked closest to Dolby in the
             // C++ version's step zero, but on a stand-in source, and blew out
@@ -368,6 +372,17 @@ static SETTINGS: &[Setting] = &[
                to output.white_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
         get: |c| Value::Name(if c.lldv { "on" } else { "off" }.into()),
         set: Set::Name(|c, v| c.lldv = v == "on"),
+    },
+    Setting {
+        key: "input.device",
+        kind: Kind::Text { max: 20 },
+        apply: Apply::Start,
+        help: "The capture device, by the persistent ID `cinefit probe` prints (for example 0x1620413): on a \
+               card with several inputs, which one. The SDK's list order can change across reboots and driver \
+               updates, so not an index. An ID that is not present stops the run with the list. Empty: the \
+               first device that can capture.",
+        get: |c| Value::Name(c.input_device.clone()),
+        set: Set::Name(|c, v| c.input_device = v.trim().to_string()),
     },
     Setting {
         key: "tonemap.curve",

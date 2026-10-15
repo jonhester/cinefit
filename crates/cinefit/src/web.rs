@@ -291,6 +291,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "slate.venue" => ("Screen", "Theater name"),
         "input.rgb_range" => ("Input", "RGB range"),
         "input.lldv" => ("Input", "Dolby Vision low latency"),
+        "input.device" => ("Input", "Capture device (persistent ID)"),
         "web.port" => ("Web page", "Port"),
         "avr.denon" => ("Receiver", "Denon AVR (hostname or IP)"),
         "atv.host" => ("Receiver", "Apple TV (hostname or IP)"),

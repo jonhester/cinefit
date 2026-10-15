@@ -11,6 +11,7 @@ mod config;
 mod content;
 #[cfg(target_os = "linux")]
 mod dataset;
+mod device;
 mod follow;
 mod hindsight;
 #[cfg(target_os = "linux")]
@@ -71,9 +72,10 @@ enum Command {
         /// How long to capture, in seconds.
         #[arg(short = 't', long, default_value_t = 10.0)]
         seconds: f64,
-        /// Which device, by its index in `cinefit probe`.
-        #[arg(short, long, default_value_t = 0)]
-        device: usize,
+        /// Which device, by its index in `cinefit probe`; by default the
+        /// first that can capture.
+        #[arg(short, long)]
+        device: Option<usize>,
         /// Save raw frames, with a JSON description of each, into this
         /// directory.
         #[arg(long)]
@@ -210,9 +212,11 @@ enum Command {
         /// SIGTERM from a service manager).
         #[arg(short = 't', long)]
         seconds: Option<f64>,
-        /// Which capture device, by its index in `cinefit probe`.
-        #[arg(short, long, default_value_t = 0)]
-        device: usize,
+        /// Which capture device, by its index in `cinefit probe`, for this
+        /// run; by default the `input.device` setting (a persistent ID), else
+        /// the first that can capture.
+        #[arg(short, long)]
+        device: Option<usize>,
         /// The DRM device; by default the first with a connected display.
         #[arg(long)]
         card: Option<PathBuf>,
@@ -407,7 +411,7 @@ fn probe(edid: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 fn capture(
     seconds: f64,
-    index: usize,
+    index: Option<usize>,
     dump_dir: Option<PathBuf>,
     dump_every: f64,
     record_dir: Option<PathBuf>,
@@ -418,9 +422,10 @@ fn capture(
         .ok_or("--seconds must be a positive number")?;
 
     let devices = cinefit_decklink::devices()?;
-    let device = devices
-        .get(index)
-        .ok_or_else(|| format!("no device {index}: {} found", devices.len()))?;
+    let infos: Vec<_> = devices.iter().map(|d| d.info()).collect();
+    let want = index.map_or(crate::device::Want::First, crate::device::Want::Index);
+    let index = crate::device::choose(&infos, want)?;
+    let device = &devices[index];
     println!("device {index}: {}", device.info().display_name);
 
     // Frames to dump go to a writer thread, so disk writes never stall the
@@ -770,7 +775,7 @@ fn pattern(run: PatternRun) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(target_os = "linux")]
 fn play_options(
     seconds: Option<f64>,
-    device: usize,
+    device: Option<usize>,
     card: Option<PathBuf>,
     config: config::Config,
     file: (PathBuf, config::Config),
@@ -796,7 +801,7 @@ fn play(opts: play::Options) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(target_os = "linux"))]
 fn play_options(
     _seconds: Option<f64>,
-    _device: usize,
+    _device: Option<usize>,
     _card: Option<PathBuf>,
     _config: config::Config,
     _file: (PathBuf, config::Config),
