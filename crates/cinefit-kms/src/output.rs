@@ -90,7 +90,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-fn io(what: &'static str) -> impl FnOnce(io::Error) -> Error {
+pub(crate) fn io(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Io { what, source }
 }
 
