@@ -439,6 +439,9 @@ struct Found {
     reading: Option<(cinefit_detect::bars::Observation, bool)>,
     /// The frame's fingerprint for the dataset, YCbCr frames only.
     thumb: Option<[u8; dataset::THUMB]>,
+    /// The policy holds a crop it has not adopted: the detector is unsure,
+    /// a moment the dataset keeps a frame of (#91).
+    candidate: bool,
 }
 
 /// The brightest luma code in a frame, from every 16th row: enough to see
@@ -471,6 +474,8 @@ struct Dataset {
     source: Option<String>,
     /// What the Apple TV plays, by name, noted in each session (#115).
     playing: Option<String>,
+    /// Which frames to keep in full (#91), from the first frame recorded.
+    picker: Option<dataset::Picker>,
 }
 
 /// The signal gone this long ends a viewing: the dataset's session closes,
@@ -545,6 +550,30 @@ impl Dataset {
 }
 
 impl Dataset {
+    /// Keeps the frame just recorded in full, when the picker says it
+    /// teaches something (#91): the raw bytes, copied, written elsewhere.
+    fn keep(&mut self, cfg: &Config, found: &Found, t: f64, frame: &Frame) {
+        if !cfg.record || cfg.frames_gb == 0 || self.next == 0 {
+            return;
+        }
+        let Some(r) = self.recorder.as_mut() else {
+            return;
+        };
+        let picker = self.picker.get_or_insert_with(|| {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |d| d.as_nanos() as u64);
+            dataset::Picker::new(seed, t)
+        });
+        let Some(why) = picker.pick(t, found.change.is_some(), found.candidate) else {
+            return;
+        };
+        if let Some(px) = frame.pixels() {
+            let budget = u64::from(cfg.frames_gb) << 30;
+            r.keep(self.next - 1, t, frame.info(), px.bytes(), why, budget);
+        }
+    }
+
     /// The receiver's input changed: noted in the open session, and in
     /// every session opened after.
     fn set_source(&mut self, source: Option<String>, t: f64) {
@@ -608,13 +637,16 @@ impl Dataset {
             let _ = j.join();
         }
         self.next = 0;
+        self.picker = None;
         if let Some(r) = self.recorder.take() {
             match r.finish() {
                 Ok(s) => info!(
-                    "dataset: {} frames recorded to {}, {} dropped",
+                    "dataset: {} frames recorded to {}, {} dropped; {} full frames kept, {} dropped",
                     s.frames,
                     s.dir.display(),
-                    s.dropped
+                    s.dropped,
+                    s.kept,
+                    s.kept_dropped
                 ),
                 Err(e) => warn!("dataset: writing failed: {e}"),
             }
@@ -647,6 +679,7 @@ impl CropFinder {
                 peak,
                 reading: None,
                 thumb,
+                candidate: false,
             };
         }
         // A crop belongs to the picture it was found on: held over RGB or the
@@ -668,15 +701,17 @@ impl CropFinder {
                 peak,
                 reading: None,
                 thumb,
+                candidate: false,
             };
         }
         self.unread = false;
-        let (mut took, mut change, mut reading) = (None, None, None);
+        let (mut took, mut change, mut reading, mut candidate) = (None, None, None, false);
         if let Some(v) = &v210 {
             let t0 = Instant::now();
             let (d, obs, cut) = self.det.push_reading(v, t, epoch);
             took = Some(ms(t0));
             reading = Some((obs, cut));
+            candidate = d.diag.candidate.is_some();
             if d.changed {
                 self.crops += 1;
                 change = Some((d.crop, d.diag.reason));
@@ -693,6 +728,7 @@ impl CropFinder {
             peak,
             reading,
             thumb,
+            candidate,
         }
     }
 }
@@ -1866,6 +1902,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     )?;
                     noted(&found, &frame_info, t);
                     dataset.record(cfg.record, &found, t, epoch, content);
+                    dataset.keep(&cfg, &found, t, &frame);
                     let source = found.source;
                     last_source = source;
                     let view = view_for(

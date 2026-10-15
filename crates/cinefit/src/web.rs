@@ -280,6 +280,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "geometry.fill_max_ar" => ("Picture", "Fill the screen up to"),
         "osd.banners" => ("Picture", "Banners"),
         "detect.record" => ("Picture", "Record for detector tuning"),
+        "detect.frames_gb" => ("Picture", "Disk for kept frames, GB (0: none)"),
         "output.mode" => ("Output", "HDR10"),
         "output.wait_hz" => ("Output", "Rate while waiting"),
         "output.white_nits" => ("Output", "SDR white and low-latency Dolby Vision, nits"),
@@ -428,13 +429,19 @@ mod tests {
 
     #[test]
     fn the_server_serves_the_page_the_state_and_takes_a_change() {
-        // A free port from the system, then served on it.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let web = Web::start(port).expect("serves");
+        // A free port from the system, then served on it. Released in
+        // between, so a test running beside this one can take it first:
+        // tried a few times (it failed once that way, 2026-10-15).
+        let (port, web) = (0..5)
+            .find_map(|_| {
+                let port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .ok()?
+                    .local_addr()
+                    .ok()?
+                    .port();
+                Web::start(port).map(|w| (port, w))
+            })
+            .expect("serves");
         web.publish(json!({"pill": "Playing"}), &Config::default());
         let page = http(port, "GET / HTTP/1.0\r\n\r\n");
         assert!(

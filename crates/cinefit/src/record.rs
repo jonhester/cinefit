@@ -56,6 +56,8 @@ pub struct ClipWriter {
     tx: Mutex<Option<SyncSender<Item>>>,
     free: Arc<Mutex<Vec<Vec<u8>>>>,
     next: AtomicU64,
+    /// Frames offered so far, which the pool grows with.
+    offered: AtomicU64,
     dropped: AtomicU64,
     thread: Mutex<Option<JoinHandle<std::io::Result<u64>>>>,
     dir: PathBuf,
@@ -102,6 +104,7 @@ impl ClipWriter {
             tx: Mutex::new(Some(tx)),
             free,
             next: AtomicU64::new(0),
+            offered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             thread: Mutex::new(Some(thread)),
             dir: dir.to_owned(),
@@ -112,6 +115,14 @@ impl ClipWriter {
     /// never blocks, and drops the frame (counted) when the pool is in use.
     pub fn offer(&self, at: Duration, info: &FrameInfo, bytes: &[u8]) {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
+        self.offer_as(index, at, info, bytes);
+    }
+
+    /// As [`ClipWriter::offer`], under a frame number of the caller's: the
+    /// dataset keeps a few frames of many, numbered as its readings are
+    /// (#91).
+    pub fn offer_as(&self, index: u64, at: Duration, info: &FrameInfo, bytes: &[u8]) {
+        let offered = self.offered.fetch_add(1, Ordering::Relaxed);
         let in_flight = POOL as u64;
         let mut buf = {
             let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
@@ -119,7 +130,7 @@ impl ClipWriter {
                 Some(b) => b,
                 // Grow the pool to its size once; after that, a frame with no
                 // buffer free is dropped.
-                None if index < in_flight => Vec::new(),
+                None if offered < in_flight => Vec::new(),
                 None => {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -398,11 +409,11 @@ pub fn for_each_frame<E: From<std::io::Error>>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cinefit_decklink::{ColorInfo, PixelFormat};
 
-    fn info(row_bytes: usize) -> FrameInfo {
+    pub(crate) fn info(row_bytes: usize) -> FrameInfo {
         FrameInfo {
             width: 6,
             height: 2,

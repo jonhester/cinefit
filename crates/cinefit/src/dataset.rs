@@ -15,13 +15,30 @@
 //!
 //! Writing happens on its own thread; the frame loop only hands over a
 //! record, and drops it (counted) rather than wait if the writer falls behind.
+//!
+//! Full frames only where they teach something (#91 part 2), chosen by a
+//! [`Picker`]: a crop change and the two frames after it, a crop the policy
+//! is considering but has not adopted (at most one every few seconds), and a
+//! random sample, about one frame in five minutes, for an unbiased set. They
+//! go into `frames/`, a clip as `cinefit capture --record` writes them (the
+//! raw captured bytes through zstd, `frames.csv` its index), numbered as the
+//! readings are, with `kept.csv` saying why each was kept. A disk budget
+//! (`detect.frames_gb`) bounds the kept frames of every session together:
+//! the oldest sessions' are deleted first, and a session that alone
+//! reaches it keeps no more.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
+use log::{info, warn};
+
+use crate::record::ClipWriter;
+
+use cinefit_decklink::FrameInfo;
 use cinefit_detect::Samples;
 use cinefit_detect::bars::Observation;
 use cinefit_detect::readings::{self, Reading};
@@ -105,6 +122,17 @@ pub struct Recorder {
     writer: Option<JoinHandle<io::Result<u64>>>,
     dir: PathBuf,
     dropped: u64,
+    /// The full frames kept, once there is one.
+    keeper: Option<Keeper>,
+}
+
+/// The session's kept frames: the clip, and why each was kept.
+struct Keeper {
+    clip: ClipWriter,
+    why: BufWriter<File>,
+    kept: u64,
+    /// The budget was reached: no more this session.
+    full: bool,
 }
 
 /// What a session wrote, at its end.
@@ -112,6 +140,9 @@ pub struct Summary {
     pub dir: PathBuf,
     pub frames: u64,
     pub dropped: u64,
+    /// Full frames kept, and kept frames the clip writer had to drop.
+    pub kept: u64,
+    pub kept_dropped: u64,
 }
 
 impl Recorder {
@@ -139,6 +170,7 @@ impl Recorder {
             writer: Some(writer),
             dir,
             dropped: 0,
+            keeper: None,
         })
     }
 
@@ -172,6 +204,77 @@ impl Recorder {
         }
     }
 
+    /// Keeps one full frame, the raw bytes as captured, as frame `index` of
+    /// the readings, for `why`. Copies the bytes and returns; a slow disk
+    /// drops it (counted) rather than wait. Within `budget` bytes for the
+    /// kept frames of every session: the first keep of a session makes room
+    /// by deleting the oldest sessions' (on a thread of its own), and a
+    /// session that alone reaches it keeps no more.
+    pub fn keep(
+        &mut self,
+        index: u64,
+        time: f64,
+        info: &FrameInfo,
+        bytes: &[u8],
+        why: &str,
+        budget: u64,
+    ) {
+        if budget == 0 {
+            return;
+        }
+        if self.keeper.is_none() {
+            let dir = self.dir.join("frames");
+            let made = ClipWriter::create(&dir).and_then(|clip| {
+                let mut why = BufWriter::new(File::create(dir.join("kept.csv"))?);
+                writeln!(why, "index,time,why")?;
+                Ok(Keeper {
+                    clip,
+                    why,
+                    kept: 0,
+                    full: false,
+                })
+            });
+            match made {
+                Ok(k) => self.keeper = Some(k),
+                Err(e) => {
+                    warn!("dataset: no full frames this session: {e}");
+                    return;
+                }
+            }
+            if let Some(caught) = self.dir.parent().map(Path::to_path_buf) {
+                let current = self.dir.clone();
+                let _ = std::thread::Builder::new()
+                    .name("dataset-budget".into())
+                    .spawn(move || match prune(&caught, &current, budget) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            info!("dataset: deleted {n} older sessions' kept frames for the budget")
+                        }
+                        Err(e) => warn!("dataset: the budget could not be kept: {e}"),
+                    });
+            }
+        }
+        let Some(k) = self.keeper.as_mut() else {
+            return;
+        };
+        if k.full {
+            return;
+        }
+        // The clip's size as written so far: a cheap look, before each keep.
+        // What zstd still holds is not on disk yet, so the budget can be
+        // overshot by a few frames' worth, against many GB.
+        let size = fs::metadata(k.clip.dir().join("frames.zst")).map_or(0, |m| m.len());
+        if size + bytes.len() as u64 > budget {
+            k.full = true;
+            info!("dataset: this session's kept frames reached the budget; no more kept");
+            return;
+        }
+        k.clip
+            .offer_as(index, Duration::from_secs_f64(time.max(0.0)), info, bytes);
+        let _ = writeln!(k.why, "{index},{time:.3},{why}");
+        k.kept += 1;
+    }
+
     /// Ends the session: the writer drains its queue and closes the files.
     ///
     /// # Errors
@@ -184,12 +287,124 @@ impl Recorder {
             Some(Err(_)) => return Err(io::Error::other("the dataset writer panicked")),
             None => 0,
         };
+        let (mut kept, mut kept_dropped) = (0, 0);
+        if let Some(mut k) = self.keeper.take() {
+            k.why.flush()?;
+            let r = k.clip.finish()?;
+            (kept, kept_dropped) = (k.kept.saturating_sub(r.dropped), r.dropped);
+        }
         Ok(Summary {
             dir: self.dir.clone(),
             frames,
             dropped: self.dropped,
+            kept,
+            kept_dropped,
         })
     }
+}
+
+/// After a crop change, the frames kept with it: the change's own and the
+/// next two, to see what the policy saw just after.
+const AFTER_CHANGE: u8 = 2;
+/// At most one kept for a candidate in this many seconds: a policy
+/// hesitating flips its candidate often.
+const CANDIDATE_GAP: f64 = 5.0;
+/// The random sample's mean interval, in seconds.
+const SAMPLE_MEAN: f64 = 300.0;
+
+/// Which frames to keep in full, frame by frame. Pure: tested without a
+/// card, a GPU or a disk.
+pub struct Picker {
+    after_change: u8,
+    candidate: bool,
+    last_candidate: Option<f64>,
+    next_sample: f64,
+    rng: u64,
+}
+
+impl Picker {
+    /// `seed` drives the sample's random times (any value but 0).
+    pub fn new(seed: u64, t: f64) -> Self {
+        let mut p = Self {
+            after_change: 0,
+            candidate: false,
+            last_candidate: None,
+            next_sample: 0.0,
+            rng: seed.max(1),
+        };
+        p.next_sample = t + p.interval();
+        p
+    }
+
+    /// The next random interval: exponential about [`SAMPLE_MEAN`], so the
+    /// times sampled do not line up with anything in the films.
+    fn interval(&mut self) -> f64 {
+        // xorshift64: enough randomness for picking moments.
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        let u = (self.rng >> 11) as f64 / (1u64 << 53) as f64;
+        -SAMPLE_MEAN * (1.0 - u).ln()
+    }
+
+    /// Whether to keep the frame at `t`, and why: `changed` if the crop
+    /// changed on it, `candidate` if the policy holds one it has not
+    /// adopted.
+    pub fn pick(&mut self, t: f64, changed: bool, candidate: bool) -> Option<&'static str> {
+        let new_candidate = candidate && !self.candidate;
+        self.candidate = candidate;
+        if changed {
+            self.after_change = AFTER_CHANGE;
+            return Some("crop change");
+        }
+        if self.after_change > 0 {
+            self.after_change -= 1;
+            return Some("after a crop change");
+        }
+        if new_candidate && self.last_candidate.is_none_or(|l| t - l >= CANDIDATE_GAP) {
+            self.last_candidate = Some(t);
+            return Some("candidate");
+        }
+        if t >= self.next_sample {
+            self.next_sample = t + self.interval();
+            return Some("sample");
+        }
+        None
+    }
+}
+
+/// Deletes the oldest sessions' kept frames under `caught` until those of
+/// every session together fit `budget` bytes, never `current`'s. Returns
+/// how many sessions' it deleted.
+fn prune(caught: &Path, current: &Path, budget: u64) -> io::Result<usize> {
+    let mut sessions: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in fs::read_dir(caught)? {
+        let frames = entry?.path().join("frames");
+        if frames.is_dir() {
+            let size = fs::read_dir(&frames)?
+                .filter_map(Result::ok)
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            sessions.push((frames, size));
+        }
+    }
+    // Session directories are named by their UTC start: by name is by age.
+    sessions.sort();
+    let mut total: u64 = sessions.iter().map(|(_, s)| s).sum();
+    let mut deleted = 0;
+    for (frames, size) in sessions {
+        if total <= budget {
+            break;
+        }
+        if frames.parent() == Some(current) {
+            continue;
+        }
+        fs::remove_dir_all(&frames)?;
+        total -= size;
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 fn write_all(
@@ -236,6 +451,125 @@ fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_crop_change_keeps_itself_and_the_next_two() {
+        let mut p = Picker::new(1, 0.0);
+        p.next_sample = f64::INFINITY;
+        assert_eq!(p.pick(10.0, true, false), Some("crop change"));
+        assert_eq!(p.pick(10.04, false, false), Some("after a crop change"));
+        assert_eq!(p.pick(10.08, false, false), Some("after a crop change"));
+        assert_eq!(p.pick(10.12, false, false), None);
+    }
+
+    #[test]
+    fn a_candidate_is_kept_when_it_appears_at_most_every_few_seconds() {
+        let mut p = Picker::new(1, 0.0);
+        p.next_sample = f64::INFINITY;
+        assert_eq!(p.pick(1.0, false, true), Some("candidate"));
+        // Held: not again.
+        assert_eq!(p.pick(1.04, false, true), None);
+        // Gone and back within the gap: not again either.
+        assert_eq!(p.pick(2.0, false, false), None);
+        assert_eq!(p.pick(3.0, false, true), None);
+        // Gone and back after it.
+        assert_eq!(p.pick(4.0, false, false), None);
+        assert_eq!(p.pick(6.5, false, true), Some("candidate"));
+    }
+
+    #[test]
+    fn the_sample_averages_one_in_five_minutes() {
+        let mut p = Picker::new(0x9e37_79b9_7f4a_7c15, 0.0);
+        // Ten hours at 24 frames a second.
+        let samples = (0..24 * 3600 * 10)
+            .filter(|&i| p.pick(f64::from(i) / 24.0, false, false) == Some("sample"))
+            .count();
+        // 120 expected; a Poisson count is within 3 sigma (about 33) of it.
+        assert!((87..=153).contains(&samples), "{samples}");
+    }
+
+    /// Kept frames come back from the session's clip whole, under the
+    /// readings' frame numbers, with why; a frame over the budget is not
+    /// kept, and none after it.
+    #[test]
+    fn kept_frames_read_back_under_their_frame_numbers() {
+        if std::process::Command::new("zstd")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("cinefit-keep-{}", std::process::id()))
+            .join("20261015-030000");
+        let _ = fs::remove_dir_all(&dir);
+        let mut r = Recorder::start(dir.clone()).unwrap();
+        let info = crate::record::tests::info(16);
+        let (a, b) = (vec![1u8; 32], vec![2u8; 32]);
+        r.keep(7, 0.29, &info, &a, "crop change", 1 << 30);
+        r.keep(42, 1.75, &info, &b, "sample", 1 << 30);
+        // A budget the next frame alone would cross: not kept, and the
+        // session keeps no more even under a larger one. (What zstd has not
+        // yet written is not counted, so a budget is overshot by at most a
+        // few frames; here nothing is on disk yet, so smaller than a frame.)
+        r.keep(43, 1.79, &info, &b, "sample", 31);
+        r.keep(44, 1.83, &info, &b, "sample", 1 << 30);
+        let s = r.finish().unwrap();
+        assert_eq!((s.kept, s.kept_dropped), (2, 0));
+
+        let frames = dir.join("frames");
+        let index = crate::record::read_index(&frames).unwrap();
+        assert_eq!(index.iter().map(|f| f.index).collect::<Vec<_>>(), [7, 42]);
+        let mut got = Vec::new();
+        crate::record::for_each_frame::<io::Error>(
+            &frames,
+            &index,
+            |_| true,
+            |f, bytes| {
+                got.push((f.index, bytes.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, [(7, a), (42, b)]);
+        let why = fs::read_to_string(frames.join("kept.csv")).unwrap();
+        assert_eq!(
+            why,
+            "index,time,why\n7,0.290,crop change\n42,1.750,sample\n"
+        );
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn the_budget_deletes_the_oldest_sessions_frames_and_never_the_current() {
+        let root = std::env::temp_dir().join(format!("cinefit-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mk = |name: &str, kb: usize| {
+            let d = root.join(name).join("frames");
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("frames.zst"), vec![0u8; kb * 1024]).unwrap();
+            fs::write(root.join(name).join("readings.csv"), "kept\n").unwrap();
+        };
+        mk("20261013-200000", 400);
+        mk("20261014-200000", 400);
+        mk("20261015-200000", 400);
+        // Another session with no kept frames is left alone.
+        fs::create_dir_all(root.join("20261012-200000")).unwrap();
+        let current = root.join("20261015-200000");
+        // 1200 KB of kept frames against a 700 KB budget: the two oldest go,
+        // the readings stay.
+        assert_eq!(prune(&root, &current, 700 * 1024).unwrap(), 2);
+        assert!(!root.join("20261013-200000/frames").exists());
+        assert!(!root.join("20261014-200000/frames").exists());
+        assert!(root.join("20261014-200000/readings.csv").exists());
+        assert!(current.join("frames").exists());
+        // The current session alone over the budget is not deleted.
+        assert_eq!(prune(&root, &current, 1).unwrap(), 0);
+        assert!(current.join("frames").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// A frame of luma by position, for the thumbnail.
     struct Luma {
