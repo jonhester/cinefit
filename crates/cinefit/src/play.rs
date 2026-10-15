@@ -1916,13 +1916,20 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 counts.shown += 1;
                             }
                             info!(
-                                "{:.1} s: followed the source: {} with {}",
+                                "{:.1} s: followed the source: {} with {}{}",
                                 now.as_secs_f64(),
                                 modes[i],
                                 match w.signal {
                                     follow::Signal::Sdr => "SDR".to_string(),
                                     follow::Signal::Hdr(h) =>
                                         format!("{:?}, MaxCLL {}", h.eotf, h.max_cll),
+                                },
+                                match out.last_dark() {
+                                    Some(d) => format!(
+                                        " (through dark, into or out of HDR: dark {:.0} ms)",
+                                        d.as_secs_f64() * 1000.0
+                                    ),
+                                    None => String::new(),
                                 }
                             );
                             finished.push((
@@ -2038,8 +2045,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         None => info!("shorter than the {} s settle: no verdict", SETTLE.as_secs()),
     }
     info!(
-        "followed the source: {} modesets, {} metadata updates without one, {} refused",
-        counts.modesets, counts.metadata, counts.refused
+        "followed the source: {} modesets ({} through dark, into or out of HDR), {} metadata updates without one, {} refused",
+        counts.modesets,
+        out.relights(),
+        counts.metadata,
+        counts.refused
     );
     if cfg.crop {
         let shares: Vec<String> = finder
