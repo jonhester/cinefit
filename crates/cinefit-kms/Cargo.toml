@@ -13,6 +13,8 @@ repository.workspace = true
 drm = "0.14.1"
 # Scanout buffers the GPU renders into, shared as dma-bufs.
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+# poll(2) for the flip deadline; the version drm itself uses.
+rustix = { version = "0.38", features = ["event"] }
 
 [lints]
 workspace = true

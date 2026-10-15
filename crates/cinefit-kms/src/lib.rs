@@ -13,5 +13,5 @@ mod output;
 
 pub use hdr::{Eotf, HdrStatic};
 #[cfg(target_os = "linux")]
-pub use output::{DmaBuf, Error, Flip, Output, Restored};
+pub use output::{DmaBuf, Error, FLIP_TIMEOUT, Flip, Output, Restored};
 pub use timing::{ModeRequest, ModeTiming, Pacing, choose_mode};
