@@ -16,6 +16,7 @@ pub mod ar_policy;
 pub mod bars;
 pub mod cuts;
 pub mod detector;
+pub mod hindsight;
 pub mod readings;
 
 pub use ar_policy::{Crop, Decision, Diagnostics};

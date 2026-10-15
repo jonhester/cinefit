@@ -9,6 +9,7 @@ mod content;
 #[cfg(target_os = "linux")]
 mod dataset;
 mod follow;
+mod hindsight;
 #[cfg(target_os = "linux")]
 mod menu;
 #[cfg(target_os = "linux")]
@@ -94,6 +95,18 @@ enum Command {
         /// A DRM device such as /dev/dri/card1; default: every card.
         #[arg(long)]
         card: Option<PathBuf>,
+    },
+    /// Judge a dataset session's crops shot by shot (#91): the picture's
+    /// true edge in each shot, from its readings, against the crop shown.
+    /// Prints a summary and the worst shots, and writes hindsight.csv in the
+    /// session's directory. Reads files only.
+    Hindsight {
+        /// Session directories, under ~/cinefit-clips/caught.
+        #[arg(required = true)]
+        sessions: Vec<PathBuf>,
+        /// How many of the worst shots of each kind to list.
+        #[arg(long, default_value_t = 10)]
+        worst: usize,
     },
     /// Show a test pattern on the display and measure flip pacing. Needs the
     /// display to itself: nothing else may be driving it.
@@ -239,6 +252,9 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Probe { edid } => probe(edid),
         Command::Display { card } => display(card.as_deref()),
+        Command::Hindsight { sessions, worst } => {
+            sessions.iter().try_for_each(|s| hindsight::run(s, worst))
+        }
         Command::Gpu => gpu(),
         Command::Replay {
             clips,
