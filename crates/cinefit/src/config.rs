@@ -501,7 +501,7 @@ static SETTINGS: &[Setting] = &[
         key: "avr.denon",
         kind: Kind::Text { max: 253 },
         apply: Apply::Live,
-        help: "The Denon receiver, by hostname or IP address (for example 10.42.1.172): cinefit reads which \
+        help: "The Denon receiver, by hostname or IP address (for example denon.local): cinefit reads which \
                input is on, by its name on the receiver, and whether the receiver is on, for the info panel, the \
                slate and the detector's dataset. Reads only. Empty: none.",
         get: |c| Value::Name(c.denon.clone()),
@@ -800,6 +800,64 @@ pub fn render_changed(c: &Config) -> String {
     out
 }
 
+/// The user guide's settings page, as Markdown: every row with its help,
+/// range, default and cost. The guide is generated from the table so that it
+/// cannot describe a setting the binary does not have; a test fails when the
+/// committed page differs (`CINEFIT_UPDATE_GUIDE=1 cargo test -p cinefit
+/// config` rewrites it).
+#[cfg(test)]
+fn render_markdown() -> String {
+    let d = Config::default();
+    let mut out = String::from(
+        "---\ntitle: \"Settings reference\"\ndescription: \"Every cinefit setting: what it does, \
+         its values, its default and what changing it costs.\"\n---\n\n\
+         <!-- Generated from crates/cinefit/src/config.rs: edit the table there, then run \
+         CINEFIT_UPDATE_GUIDE=1 cargo test -p cinefit config -->\n\n\
+         # Settings reference\n\n\
+         Settings live in `~/.config/cinefit-rs/cinefit.toml`, one `[section]` per group below. \
+         A file that is not there means every setting is at its default, and the file only needs \
+         the settings you change. The on-screen menu and the web page change the same settings \
+         and save them to the same file. `cinefit settings` prints them all with their current \
+         values, and `cinefit settings --toml` prints a complete file to start from.\n\n\
+         Each setting says what changing it costs while cinefit is running:\n\n\
+         - **Immediately**: the next frame uses it, with no interruption.\n\
+         - **Immediately, with a resync**: the output is set up again, and the display blanks \
+         for a few seconds while it locks on to the new signal.\n\
+         - **When cinefit starts**: read once at startup; restart the service to apply it.\n",
+    );
+    let mut section = "";
+    for s in SETTINGS {
+        let (sec, name) = s.key.split_once('.').expect("keys are section.name");
+        if sec != section {
+            out.push_str(&format!("\n## [{sec}]\n"));
+            section = sec;
+        }
+        let default = match s.get(&d) {
+            Value::Name(n) if n.is_empty() => "empty".to_string(),
+            Value::Name(n) => format!("`\"{n}\"`"),
+            v => format!("`{v}`"),
+        };
+        let applies = match s.apply {
+            Apply::Live => "immediately",
+            Apply::Modeset => "immediately, with a resync",
+            Apply::Start => "when cinefit starts",
+        };
+        // `<` opens a tag in Markdown: help text may say `<this machine>`.
+        // Each heading carries its key as its anchor, `output-width`, so
+        // links to a setting survive the page being reorganized.
+        let help = s.help.replace('<', "&lt;");
+        out.push_str(&format!(
+            "\n### {} {{#{}}}\n\n{help}\n\n\
+             - In the file: `{name}` under `[{sec}]`\n- Values: {}\n- Default: {default}\n\
+             - Applies: {applies}\n",
+            s.key,
+            s.key.replace(['.', '_'], "-"),
+            s.range(),
+        ));
+    }
+    out
+}
+
 /// Writes [`render_changed`] to `path`, through a file beside it renamed
 /// over the old one: a crash mid-write leaves the old file, never half of
 /// one that would stop cinefit at its next start.
@@ -1031,5 +1089,23 @@ mod tests {
             assert!(seen.insert(s.key), "{} twice", s.key);
             assert!(!s.help.is_empty());
         }
+    }
+
+    /// The guide's settings page is the table's: rewritten with
+    /// `CINEFIT_UPDATE_GUIDE=1`, and a failure here when a row changed
+    /// without it.
+    #[test]
+    fn the_guide_lists_the_settings_as_the_table_has_them() {
+        let page = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/docs/settings.md");
+        let want = render_markdown();
+        if std::env::var_os("CINEFIT_UPDATE_GUIDE").is_some() {
+            std::fs::write(&page, &want).unwrap();
+        }
+        let have = std::fs::read_to_string(&page).unwrap_or_default();
+        assert!(
+            have == want,
+            "{} is out of date: run CINEFIT_UPDATE_GUIDE=1 cargo test -p cinefit config",
+            page.display()
+        );
     }
 }

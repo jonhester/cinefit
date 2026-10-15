@@ -1,0 +1,13 @@
+{
+  "name": "cinefit-guide",
+  "private": true,
+  "description": "The cinefit user guide, built with docmd",
+  "scripts": {
+    "dev": "docmd dev",
+    "build": "docmd build",
+    "validate": "docmd validate"
+  },
+  "devDependencies": {
+    "@docmd/core": "0.9.7"
+  }
+}

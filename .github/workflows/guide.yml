@@ -1,0 +1,63 @@
+name: Guide
+
+# The user guide (docs/guide), built with docmd and published to Cloudflare
+# Pages. The published guide is the released one: only a release tag,
+# vMAJOR.MINOR.PATCH and nothing after it (made by tools/release.sh, the
+# same push that starts release.yml), deploys to production, so the guide
+# never describes a setting or command that the latest release does not
+# have. Anything newer, main or a prerelease or nightly tag (v0.2.0-beta.1),
+# goes to the `next` preview alias and cannot touch production. A PR only
+# builds, so broken links show there. Only the guide's own files start it on a branch: Rust changes do
+# not need Node. The settings page is generated from the settings table
+# and checked by `cargo test` in CI.
+#
+# The Pages project is a direct-upload one (no Git connection in
+# Cloudflare), and needs the CLOUDFLARE_API_TOKEN (Cloudflare Pages: Edit)
+# and CLOUDFLARE_ACCOUNT_ID repository secrets.
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+    paths: ["docs/guide/**", ".github/workflows/guide.yml"]
+  pull_request:
+    paths: ["docs/guide/**", ".github/workflows/guide.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guide-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guide:
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: docs/guide
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: docs/guide/.nvmrc
+          cache: npm
+          cache-dependency-path: docs/guide/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npx docmd validate
+      - run: npx docmd build
+      # Production is the project's `main` branch in Cloudflare's terms;
+      # any other branch name is a preview, here aliased as next.
+      - if: github.event_name == 'push'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          REF: ${{ github.ref }}
+        run: |
+          if printf '%s' "$REF" | grep -Eq '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            branch=main
+          else
+            branch=next
+          fi
+          npx --yes wrangler@4 pages deploy site --project-name=cinefit --branch="$branch"

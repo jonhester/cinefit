@@ -111,6 +111,14 @@ unset.
   An owner-facing knob is a row there, read from
   `~/.config/cinefit-rs/cinefit.toml` and overridable with `--set`; switches
   for one experiment stay flags, so they cannot be left on in a file.
+  The user guide's settings page (`docs/guide/docs/settings.md`) is generated
+  from the table; after changing a row, `CINEFIT_UPDATE_GUIDE=1 cargo test -p
+  cinefit config` rewrites it, and `cargo test` fails until it is.
+- **The user guide** is `docs/guide/`, built with docmd (Node, kept to that
+  folder: `npm ci`, `npx docmd dev`, `npx docmd build`). A change users can
+  see (a command, a message, a menu row) updates the guide in the same PR.
+  `.github/workflows/guide.yml` publishes it to Cloudflare Pages on a release
+  tag only; main and prerelease tags go to the `next` preview.
 
 - Every `unsafe` block has a `// SAFETY:` comment; clippy enforces it.
 - Structs shared with a C shim are declared on both sides; assert every field

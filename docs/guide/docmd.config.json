@@ -1,0 +1,158 @@
+{
+  "title": "cinefit",
+  "url": "https://cinefit.pages.dev/",
+  "src": "docs",
+  "out": "site",
+  "engine": "js",
+  "logo": {
+    "light": "/assets/images/cinefit-dark-accent.svg",
+    "dark": "/assets/images/cinefit-light-accent.svg",
+    "alt": "cinefit"
+  },
+  "markdown": {
+    "breaks": false,
+    "typographer": false
+  },
+  "layout": {
+    "spa": true,
+    "header": {
+      "enabled": true
+    },
+    "sidebar": {
+      "collapsible": true,
+      "defaultCollapsed": false
+    },
+    "optionsMenu": {
+      "position": "sidebar-top",
+      "components": {
+        "search": true,
+        "themeSwitch": true
+      }
+    },
+    "footer": {
+      "style": "minimal",
+      "content": "cinefit is dual licensed under Apache-2.0 and MIT.",
+      "branding": false
+    },
+    "editLink": {
+      "enabled": true,
+      "baseUrl": "https://github.com/jonhester/cinefit/edit/main/docs/guide/docs",
+      "text": "Edit this page"
+    }
+  },
+  "theme": {
+    "name": "default",
+    "appearance": "system",
+    "codeHighlight": true
+  },
+  "minify": true,
+  "autoTitleFromH1": true,
+  "copyCode": true,
+  "pageNavigation": true,
+  "navigation": [
+    {
+      "title": "What cinefit is",
+      "path": "/",
+      "icon": "film"
+    },
+    {
+      "title": "Setting up",
+      "icon": "wrench",
+      "collapsible": false,
+      "children": [
+        {
+          "title": "What you need",
+          "path": "/requirements/",
+          "icon": "list-checks"
+        },
+        {
+          "title": "Installing",
+          "path": "/install/",
+          "icon": "download"
+        },
+        {
+          "title": "The signal chain",
+          "path": "/signal-chain/",
+          "icon": "cable"
+        },
+        {
+          "title": "First picture",
+          "path": "/first-picture/",
+          "icon": "monitor-play"
+        }
+      ]
+    },
+    {
+      "title": "Using it",
+      "icon": "tv",
+      "collapsible": false,
+      "children": [
+        {
+          "title": "Remote and menu",
+          "path": "/using/",
+          "icon": "gamepad-2"
+        },
+        {
+          "title": "Picture types",
+          "path": "/picture/",
+          "icon": "sun"
+        },
+        {
+          "title": "Receiver and Apple TV",
+          "path": "/integrations/",
+          "icon": "radio-receiver"
+        },
+        {
+          "title": "Updating",
+          "path": "/updating/",
+          "icon": "refresh-cw"
+        }
+      ]
+    },
+    {
+      "title": "Reference",
+      "icon": "book-open",
+      "collapsible": false,
+      "children": [
+        {
+          "title": "Settings",
+          "path": "/settings/",
+          "icon": "sliders-horizontal"
+        },
+        {
+          "title": "Commands",
+          "path": "/commands/",
+          "icon": "terminal"
+        },
+        {
+          "title": "Troubleshooting",
+          "path": "/troubleshooting/",
+          "icon": "life-buoy"
+        },
+        {
+          "title": "Getting help from an AI",
+          "path": "/ai-help/",
+          "icon": "bot"
+        }
+      ]
+    },
+    {
+      "title": "GitHub",
+      "path": "https://github.com/jonhester/cinefit",
+      "icon": "github",
+      "external": true
+    }
+  ],
+  "plugins": {
+    "llms": {},
+    "git": {
+      "commitHistory": false
+    },
+    "seo": {
+      "defaultDescription": "cinefit: a headless Linux video processor for home theatre projectors."
+    },
+    "ai": {
+      "enabled": false
+    }
+  }
+}
