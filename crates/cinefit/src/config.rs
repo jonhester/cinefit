@@ -70,6 +70,9 @@ pub struct Config {
     /// Record the detector's readings and a small fingerprint of every frame
     /// shown, for tuning the detector (#91).
     pub record: bool,
+    /// The disk the dataset's kept full frames may use, every session
+    /// together, in GB; 0 keeps none (#91).
+    pub frames_gb: u16,
     /// The screen's aspect: the band of the raster that lands on it.
     pub screen_ar: Ratio,
     /// Content wider than this is trimmed at the sides to fill the screen's
@@ -163,6 +166,7 @@ impl Default for Config {
             source_peak: 0,
             crop: true,
             record: true,
+            frames_gb: 20,
             screen_ar: Ratio::of(2.35),
             fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
@@ -415,9 +419,20 @@ static SETTINGS: &[Setting] = &[
         kind: Kind::Choice(&["on", "off"]),
         apply: Apply::Live,
         help: "on: record what the bar detector measured on every frame shown, and a small fingerprint of the \
-               picture, under ~/cinefit-clips/caught, for tuning the detector (about 150 MB a film). No pictures.",
+               picture, under ~/cinefit-clips/caught, for tuning the detector (about 150 MB a film). Full frames \
+               only where they teach something, within detect.frames_gb.",
         get: |c| Value::Name(if c.record { "on" } else { "off" }.into()),
         set: Set::Name(|c, v| c.record = v == "on"),
+    },
+    Setting {
+        key: "detect.frames_gb",
+        kind: Kind::Int { min: 0, max: 10000 },
+        apply: Apply::Live,
+        help: "While recording: the disk, in GB, that full frames may use, every session together. Frames are \
+               kept where the detector changed the crop or hesitated, and a few at random; the oldest sessions' \
+               are deleted first. 0: no full frames, only the readings.",
+        get: |c| Value::Int(c.frames_gb.into()),
+        set: Set::Int(|c, v| c.frames_gb = v as u16),
     },
     Setting {
         key: "geometry.screen_ar",
