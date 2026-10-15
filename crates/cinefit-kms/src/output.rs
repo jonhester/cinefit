@@ -836,7 +836,7 @@ impl Output {
         // display resyncs on these switches anyway. Other colour changes
         // (Colorspace alone) stay live.
         let hdr_now = self.hdr.is_some();
-        let relight = self.modeset && self.hdr_on_screen.is_some_and(|h| h != hdr_now);
+        let relight = goes_dark_first(self.modeset, self.hdr_on_screen, hdr_now);
         let dark_from = Instant::now();
         // A test commit first: if another program holds the display, or the
         // new state would be refused, nothing on screen changes (or goes
@@ -1163,6 +1163,15 @@ impl Drop for Output {
     }
 }
 
+/// Whether a modeset goes dark first (see [`Output::modeset`]): only on a lit
+/// output, and only into or out of HDR. `lit` is whether the output is lit,
+/// `on_screen` whether it signals HDR (`None` before anything is committed),
+/// and `hdr_now` whether the new state does. Metadata changes within HDR,
+/// colorimetry-only changes and the first modeset stay as they were.
+fn goes_dark_first(lit: bool, on_screen: Option<bool>, hdr_now: bool) -> bool {
+    lit && on_screen.is_some_and(|h| h != hdr_now)
+}
+
 /// Calls `read` each time `fd` becomes readable until it returns a value, or
 /// `timeout` passes (`Ok(None)`). `read` must not block once `fd` polls
 /// readable.
@@ -1340,6 +1349,22 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn only_a_switch_into_or_out_of_hdr_goes_dark_first() {
+        // Into and out of HDR on a lit output: dark first (#103).
+        assert!(goes_dark_first(true, Some(false), true));
+        assert!(goes_dark_first(true, Some(true), false));
+        // Staying in HDR (a metadata change) or in SDR (Colorspace alone,
+        // or a rate change): no dark step.
+        assert!(!goes_dark_first(true, Some(true), true));
+        assert!(!goes_dark_first(true, Some(false), false));
+        // The first modeset, and one after the output was restored: it
+        // comes up from off anyway.
+        assert!(!goes_dark_first(false, None, true));
+        assert!(!goes_dark_first(false, Some(false), true));
+        assert!(!goes_dark_first(true, None, true));
+    }
 
     #[test]
     fn a_source_that_never_delivers_times_out() {
