@@ -4,6 +4,7 @@
 //!     CINEFIT_ATV_CREDENTIALS=<pyatv's AirPlay credentials> \
 //!         cargo run -p cinefit-atv --example now_playing -- <host> [-v]
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
@@ -33,7 +34,7 @@ fn main() {
     log::set_max_level(level);
     let creds = std::env::var("CINEFIT_ATV_CREDENTIALS").expect("CINEFIT_ATV_CREDENTIALS");
     let creds = cinefit_atv::AtvCredentials::parse(&creds).expect("pyatv's four-field form");
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
     let result = cinefit_atv::watch(&host, &creds, &stop, |np| {
         let pos = np.position_at(SystemTime::now()).map(|p| format!("{p:.3}"));
         println!(

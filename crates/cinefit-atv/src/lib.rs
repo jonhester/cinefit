@@ -152,16 +152,22 @@ pub struct NowPlaying {
 
 impl NowPlaying {
     /// The position at `now`, carried on from the last measurement at the
-    /// reported rate. The rate is the app's word, which the Apple TV app
-    /// has left at 0 while playing: the caller knows better from the
-    /// picture whether it moves.
+    /// reported rate; at a rate of 0 while the state says playing, at 1.
+    /// The Apple TV app has been seen to leave its rate at 0 while playing,
+    /// and pyatv reads that as playing too: a caller that can see the
+    /// picture knows better whether it moves.
     pub fn position_at(&self, now: SystemTime) -> Option<f64> {
         let elapsed = self.elapsed?;
         let since = self
             .elapsed_at
             .and_then(|t| now.duration_since(t).ok())
             .map_or(0.0, |d| d.as_secs_f64());
-        Some(elapsed + since * f64::from(self.rate.unwrap_or(0.0)))
+        let rate = match self.rate.map(f64::from) {
+            Some(r) if r.abs() > 1e-6 => r,
+            _ if self.state == Some(State::Playing) => 1.0,
+            _ => 0.0,
+        };
+        Some(elapsed + since * rate)
     }
 }
 
@@ -409,11 +415,11 @@ fn merge(to: &mut proto::ContentItemMetadata, from: &proto::ContentItemMetadata)
 
 /// Reads one Apple TV until the connection ends, calling `update` with what
 /// the app in front is playing whenever a message may have changed it.
-/// `stop` ends it at the next message or keep-alive.
+/// `stop` ends it within a keep-alive interval, messages or not.
 pub fn watch(
     host: &str,
     creds: &Credentials,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     mut update: impl FnMut(&NowPlaying),
 ) -> Result<(), Error> {
     let addr = (host, PORT)
@@ -462,11 +468,11 @@ pub fn watch(
     // The keep-alive. When it fails, or `stop` is set, the data stream is
     // shut, which ends the read below.
     let alive = Arc::new(AtomicBool::new(true));
-    let (alive2, closer) = (Arc::clone(&alive), data_stream);
+    let (alive2, stop2, closer) = (Arc::clone(&alive), Arc::clone(stop), data_stream);
     let feedback = std::thread::Builder::new()
         .name("atv-feedback".into())
         .spawn(move || {
-            while alive2.load(Ordering::Relaxed) {
+            while alive2.load(Ordering::Relaxed) && !stop2.load(Ordering::Relaxed) {
                 std::thread::sleep(FEEDBACK);
                 if let Err(e) = rtsp.request(&mut control, "POST /feedback", None) {
                     debug!("atv: feedback: {e}");
@@ -829,8 +835,10 @@ mod tests {
         // 2026-10-15 04:59:11 UTC, as the Apple TV app sent it.
         let at = np.elapsed_at.unwrap().duration_since(UNIX_EPOCH).unwrap();
         assert_eq!(at.as_secs(), 1_792_040_351);
-        // At rate 0 the position stays where it was measured.
-        assert_eq!(np.position_at(SystemTime::now()), Some(825.3));
+        // At rate 0 while playing, the position moves at 1.
+        let at = np.elapsed_at.unwrap();
+        assert_eq!(np.position_at(at), Some(825.3));
+        assert_eq!(np.position_at(at + Duration::from_secs(10)), Some(835.3));
 
         // Another player of the same app, paused, changes nothing in front
         // (seen live on 2026-10-15: the Music app said paused while playing).

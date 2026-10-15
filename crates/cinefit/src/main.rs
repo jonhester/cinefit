@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
+mod appletv;
 mod avr;
 mod capture;
 mod compare;
