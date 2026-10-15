@@ -156,6 +156,15 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
         times.sort_by(f64::total_cmp);
         let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
         let words = read_words(&out, frame, w, h)?;
+        // play's start-up check on this layout (it renders over the frame,
+        // so after the frame is read).
+        let check = match crate::play::renders_right(&out, &pl, frame, &target) {
+            Ok(()) => "start-up check passes".to_string(),
+            Err(e) => {
+                bad += 1;
+                format!("start-up check FAILS: {e}")
+            }
+        };
         let compared = match &linear {
             None => {
                 linear = Some(words);
@@ -173,7 +182,7 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
             }
         };
         println!(
-            "{name:<20} {:>6.2}ms {:>6.2}ms {:>6.2}ms {:>8}  {compared}",
+            "{name:<20} {:>6.2}ms {:>6.2}ms {:>6.2}ms {:>8}  {compared}; {check}",
             at(0.5),
             at(0.95),
             times[times.len() - 1],
@@ -220,6 +229,18 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
                     );
                     if differ == 0 {
                         return Err("the negative control saw no difference".into());
+                    }
+                    // play's start-up check must fail on it too.
+                    match crate::play::renders_right(&out, &pl, frame, &target) {
+                        Err(e) => println!(
+                            "negative control, play's start-up check: fails, as it must ({e})"
+                        ),
+                        Ok(()) => {
+                            println!(
+                                "negative control, play's start-up check: PASSES -- it cannot see a layout mistake"
+                            );
+                            return Err("play's start-up check passed a mislabelled buffer".into());
+                        }
                     }
                 }
             }

@@ -95,6 +95,52 @@ pub struct Options {
 /// indices, the targets, their pixel format and the layout GBM chose.
 type Scanouts<'p> = (Vec<usize>, Vec<cinefit_render::Texture<'p>>, u32, u64);
 
+/// Renders a picture that places every pixel by position into `target`
+/// (scanout buffer `frame`) and reads it back through GBM, which detiles: a
+/// layout the renderer writes wrongly comes back moved or scrambled. Once at
+/// start; about a tenth of a second at 4K.
+pub(crate) fn renders_right(
+    out: &cinefit_kms::Output,
+    pl: &Placebo,
+    frame: usize,
+    target: &cinefit_render::Texture<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let d = out.export(frame)?;
+    let (w, h) = (d.width as usize, d.height as usize);
+    // Red counts across, green down, blue the 256-pixel block: no two
+    // pixels within a block alike, and blocks told apart.
+    let px = |x: usize, y: usize| [x as u8, y as u8, ((x / 256) * 16 + y / 256) as u8, 255];
+    let rgba: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).flat_map(move |x| px(x, y)))
+        .collect();
+    let src = pl.upload_rgba8(w as u32, h as u32, &rgba)?;
+    pl.render(&src, target, 0.0)?;
+    let fourcc = d.fourcc;
+    let wrong = out.read_scanout(frame, |bytes, stride| {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let o = y * stride + x * 4;
+                let got = cinefit_kms::scanout::decode(
+                    fourcc,
+                    bytes[o..o + 4].try_into().expect("4 bytes"),
+                )
+                .map_or([0; 3], |c| c.map(|v| (v * 255.0).round() as u8));
+                let want = px(x, y);
+                (0..3).any(|c| got[c].abs_diff(want[c]) > 1)
+            })
+            .count()
+    })?;
+    if wrong > 0 {
+        return Err(format!(
+            "a test picture came back with {wrong} of {} pixels wrong",
+            w * h
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Makes [`BUFFERS`] scanout buffers for mode `index` in a layout from
 /// `modifiers`, and imports each for the renderer.
 fn scanouts<'p>(
@@ -1023,11 +1069,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     };
     let before = out.scanout_count();
     let made = match &tiled {
-        Some(mods) => scanouts(&mut out, &pl, index, mods).or_else(|e| {
-            warn!("scanout: the tiled layouts failed ({e}); LINEAR, as before");
-            out.discard_scanouts(before);
-            scanouts(&mut out, &pl, index, &[0])
-        }),
+        Some(mods) => scanouts(&mut out, &pl, index, mods)
+            // Imported is not proof it renders: a test picture through the
+            // first buffer, read back, must come out right, or LINEAR. On a
+            // GPU where a tiled render failed or scrambled, play would
+            // otherwise fail at every restart, or show a scrambled picture.
+            .and_then(|s| renders_right(&out, &pl, s.0[0], &s.1[0]).map(|()| s))
+            .or_else(|e| {
+                warn!("scanout: the tiled layouts failed ({e}); LINEAR, as before");
+                out.discard_scanouts(before);
+                scanouts(&mut out, &pl, index, &[0])
+            }),
         None => scanouts(&mut out, &pl, index, &[0]),
     };
     let (buffers, targets, scan_fourcc, modifier) = made?;

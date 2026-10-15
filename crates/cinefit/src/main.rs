@@ -251,6 +251,8 @@ enum Command {
         dry_run: bool,
         /// Scan out of LINEAR buffers, as before #101, instead of the tiled
         /// layout the display and the GPU agree on: for comparing the two.
+        /// (A tiled layout that fails to render, or renders wrongly, is
+        /// caught at start and LINEAR used without it.)
         #[arg(long)]
         linear_scanout: bool,
     },
