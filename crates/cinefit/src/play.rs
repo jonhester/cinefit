@@ -236,8 +236,6 @@ struct Target<'a, 'p> {
     /// low-latency Dolby Vision is mapped to, and the curve (the settings).
     white_nits: f32,
     curve: Curve,
-    /// Whether SDR BT.2020 input is low-latency Dolby Vision (`input.lldv`).
-    lldv: bool,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
     /// Which part of the frame is drawn and where it lands.
@@ -286,7 +284,6 @@ fn target<'a, 'p>(
         rgb_range: c.rgb_range,
         white_nits: f32::from(c.white_nits),
         curve: c.curve,
-        lldv: c.lldv,
         source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
         view,
     }
@@ -486,7 +483,7 @@ fn upload<'p>(
 fn draw<'p>(
     pl: &'p Placebo,
     info: &FrameInfo,
-    kind: Kind,
+    content: Content,
     tunnel: Option<&Tunnel>,
     sources: &mut Sources<'p>,
     dst: &Target<'_, '_>,
@@ -495,17 +492,20 @@ fn draw<'p>(
     let view = dst.view;
     let out = dst.color;
     let t = Instant::now();
-    match kind {
-        Kind::Ycbcr(color) => {
+    match content {
+        Content::Sdr(color)
+        | Content::Hdr10(color)
+        | Content::Hlg(color)
+        | Content::Lldv(color) => {
             // Low-latency Dolby Vision is PQ under its SDR label, already
             // mapped by the player to its peak.
-            let (color, peak) = match dst.lldv.then_some(dst.white_nits) {
-                Some(nits) if is_lldv(kind, true) => (
+            let (color, peak) = match content {
+                Content::Lldv(_) => (
                     YcbcrColor {
                         transfer: Transfer::Pq,
                         ..color
                     },
-                    Some(nits),
+                    Some(dst.white_nits),
                 ),
                 _ => {
                     if color.transfer == Transfer::Pq
@@ -537,7 +537,7 @@ fn draw<'p>(
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
         }
-        Kind::Tunnel => {
+        Content::Tunnel => {
             let tunnel = tunnel.expect("uploaded only with one");
             let p = sources.planes.as_mut().expect("uploaded");
             // Into SDR from the grade's own peak, the whole title on one
@@ -549,7 +549,7 @@ fn draw<'p>(
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
         }
-        Kind::Rgb(_) => {
+        Content::Rgb(_) => {
             let r = sources.rgb.as_mut().expect("uploaded");
             // The card does not report RGB's range: the setting says (#23).
             let color = RgbSourceColor {
@@ -559,7 +559,7 @@ fn draw<'p>(
             };
             pl.render_rgb_view(r, color, dst.tex, out, view)?;
         }
-        Kind::Unsupported(_) => unreachable!("never uploaded"),
+        Content::Unsupported(_) => unreachable!("never uploaded"),
     }
     stages.render.push(ms(t));
     Ok(())
@@ -728,17 +728,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     };
     let mode = modes[index];
     info!("mode: {mode}");
-    let (hdr, mut out_color) = match &start {
-        Some((key, first, _)) => output_in(
+    // What the first input is, resolved once (#99).
+    let start_content = start.as_ref().map(|s| Content::of(s.0.kind, cfg.lldv));
+    let (hdr, mut out_color) = match (&start, start_content) {
+        (Some((_, first, _)), Some(content)) => output_in(
             cfg.mode,
-            cfg.lldv,
-            key.kind,
+            content,
             first.info().color.hdr.as_ref(),
             last_tunnel.as_ref(),
         ),
-        None => (None, SDR_BT2020),
+        _ => (None, SDR_BT2020),
     };
-    let start_kind = start.as_ref().map(|s| s.0.kind);
     match &hdr {
         Some(h) => info!(
             "signalling {:?}: MaxCLL {}, MaxFALL {}, mastering {:.4}-{:.0} nits",
@@ -746,19 +746,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         ),
         None => info!(
             "signalling SDR BT.2020{}",
-            match start_kind {
+            match start_content {
                 None => ", no source".to_string(),
-                Some(k) if is_lldv(k, cfg.lldv) => format!(
+                Some(Content::Lldv(_)) => format!(
                     ": low-latency Dolby Vision, passed through at {} nits",
                     cfg.white_nits
                 ),
-                Some(
-                    Kind::Tunnel
-                    | Kind::Ycbcr(YcbcrColor {
-                        transfer: Transfer::Pq,
-                        ..
-                    }),
-                ) => format!(
+                Some(Content::Tunnel | Content::Hdr10(_)) => format!(
                     ": HDR tone-mapped ({}) to white at {} nits",
                     cfg.curve.name(),
                     cfg.white_nits
@@ -884,7 +878,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             draw(
                 &pl,
                 &first_info,
-                key.kind,
+                Content::of(key.kind, cfg.lldv),
                 last_tunnel.as_ref(),
                 &mut sources,
                 &target(&targets, 0, out_color, view, &cfg),
@@ -962,7 +956,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     match (&start_key, &start_input) {
         (Some(key), Some(input)) => {
             if let Some(b) = banner_for(
-                key.kind,
+                Content::of(key.kind, opts.config.lldv),
                 (key.width, key.height),
                 rate_mhz(input),
                 size.0,
@@ -1058,7 +1052,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     match (last_key.filter(|_| !dark), brightest) {
                         (Some(k), Some(b)) => format!(
                             "; in {}, out {}",
-                            peak_words(k.kind, b, cfg.lldv.then_some(cfg.white_nits)),
+                            peak_words(
+                                Content::of(k.kind, cfg.lldv),
+                                b,
+                                cfg.lldv.then_some(cfg.white_nits)
+                            ),
                             shown
                                 .and_then(|v| out_nits(v, signal, cfg.white_nits))
                                 .map_or_else(|| "-".into(), |n| format!("brightest {n:.0} nits"))
@@ -1184,19 +1182,20 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         ms(read_at)
                     );
                 }
+                // What is coming in, resolved once for every section.
+                let picture = last_key
+                    .filter(|_| !dark)
+                    .map(|k| (Content::of(k.kind, cfg.lldv), k));
                 let text = InfoText {
                     sections: vec![
                         input_section(
-                            last_key,
+                            picture.map(|(c, k)| (c, k.width, k.height)),
                             last_format,
-                            dark,
                             cfg.lldv.then_some(cfg.white_nits),
                             brightest,
                         ),
                         output_section(
-                            last_key,
-                            dark,
-                            cfg.lldv,
+                            picture.map(|(c, _)| c),
                             policy.committed().signal,
                             cur_mode,
                             shown,
@@ -1269,12 +1268,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
                 last_frame_at = Instant::now();
                 let k = classify(&frame, &mut last_tunnel);
+                // What this frame is, resolved once for everything below.
+                let content = Content::of(k.kind, cfg.lldv);
                 {
                     let info = frame.info();
                     let first = counts.dv_flagged + counts.dv_bytes == 0;
                     counts.dv_flagged += u64::from(info.dolby_vision_flagged);
                     counts.dv_bytes += u64::from(info.dolby_vision_bytes.is_some());
-                    counts.lldv_labelled += u64::from(is_lldv(k.kind, cfg.lldv));
+                    counts.lldv_labelled += u64::from(matches!(content, Content::Lldv(_)));
                     if first && (info.dolby_vision_flagged || info.dolby_vision_bytes.is_some()) {
                         info!(
                             "{:.1} s: the card reports Dolby Vision on input: flag {}, metadata {}",
@@ -1344,16 +1345,15 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     // A PQ frame without its metadata block is not a change of
                     // metadata: the card attaches it only to frames it flags, and
                     // treating its absence as zeros would flap the output.
-                    let pq_without_metadata = matches!(k.kind, Kind::Ycbcr(c) if c.transfer == Transfer::Pq)
-                        && frame.info().color.hdr.is_none();
+                    let pq_without_metadata =
+                        matches!(content, Content::Hdr10(_)) && frame.info().color.hdr.is_none();
                     if !matches!(k.kind, Kind::Unsupported(_))
                         && !pq_without_metadata
                         && let Some(f) = *format.lock().unwrap_or_else(PoisonError::into_inner)
                     {
                         let (hdr, _) = output_in(
                             cfg.mode,
-                            cfg.lldv,
-                            k.kind,
+                            content,
                             frame.info().color.hdr.as_ref(),
                             last_tunnel.as_ref(),
                         );
@@ -1367,7 +1367,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         // after the resync if the output is to follow it.
                         if held == frames_to_trust(k).max(STABLE_FRAMES)
                             && let Some(b) = banner_for(
-                                k.kind,
+                                content,
                                 (k.width, k.height),
                                 want.rate_mhz,
                                 size.0,
@@ -1412,7 +1412,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         draw(
                             &pl,
                             &frame_info,
-                            k.kind,
+                            content,
                             last_tunnel.as_ref(),
                             &mut sources,
                             &target(&targets, free, out_color, view, &cfg),

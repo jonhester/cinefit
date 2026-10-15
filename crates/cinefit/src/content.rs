@@ -29,6 +29,50 @@ pub(crate) struct Key {
     pub(crate) kind: Kind,
 }
 
+/// What the input *is*: the capture's [`Kind`] read with the settings that
+/// change its meaning. Worked out in one place, [`Content::of`], and asked by
+/// everything that depends on it: the output's signalling, the render, the
+/// banner and the info panel. Before this, whether SDR BT.2020 meant
+/// low-latency Dolby Vision was decided separately in five places (#99).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Content {
+    /// YCbCr in SDR, BT.709 or BT.2020.
+    Sdr(YcbcrColor),
+    /// YCbCr in PQ: HDR10.
+    Hdr10(YcbcrColor),
+    Hlg(YcbcrColor),
+    /// A player's low-latency Dolby Vision: YCbCr labelled SDR BT.2020 whose
+    /// pixels are PQ, already mapped by the player (`input.lldv`). The
+    /// chain gives no Dolby Vision flag or metadata (#94), so the setting
+    /// decides.
+    Lldv(YcbcrColor),
+    /// The Dolby Vision tunnel, decoded by cinefit.
+    Tunnel,
+    Rgb(rgb::Format),
+    /// A capture format nothing renders.
+    Unsupported(PixelFormat),
+}
+
+impl Content {
+    /// What a frame of `kind` is, with the `input.lldv` setting.
+    pub(crate) fn of(kind: Kind, lldv: bool) -> Self {
+        match kind {
+            Kind::Ycbcr(c) if c.transfer == Transfer::Pq => Self::Hdr10(c),
+            Kind::Ycbcr(c) if c.transfer == Transfer::Hlg => Self::Hlg(c),
+            Kind::Ycbcr(c) if lldv && c.primaries == Primaries::Bt2020 => Self::Lldv(c),
+            Kind::Ycbcr(c) => Self::Sdr(c),
+            Kind::Rgb(f) => Self::Rgb(f),
+            Kind::Tunnel => Self::Tunnel,
+            Kind::Unsupported(f) => Self::Unsupported(f),
+        }
+    }
+
+    /// Low-latency Dolby Vision or the tunnel.
+    pub(crate) fn is_dolby_vision(self) -> bool {
+        matches!(self, Self::Lldv(_) | Self::Tunnel)
+    }
+}
+
 /// A decoded tunnel: its conversion, and the grade's range for the output's
 /// static metadata.
 #[derive(Debug, Clone, Copy)]
@@ -46,7 +90,7 @@ pub(crate) struct Tunnel {
 
 /// What the output signals and renders into for an input.
 pub(crate) fn output_for(
-    kind: Kind,
+    content: Content,
     hdr: Option<&HdrMetadata>,
     tunnel: Option<&Tunnel>,
 ) -> (Option<cinefit_kms::HdrStatic>, RgbColor) {
@@ -65,14 +109,14 @@ pub(crate) fn output_for(
         max_cll: 0.0,
         max_fall: 0.0,
     };
-    match kind {
+    match content {
         // The grade's range as mastering, and this scene's peak as MaxCLL:
         // the JVC re-derives its curve from a MaxCLL change mid-stream with
         // no resync (measured 2026-10-12), so the curve follows the film
         // scene by scene. Capped at the grade's peak. With no level 1 yet,
         // the grade's peak too: 0 is "unknown", and was sent at the start of
         // a title until the first scene arrived (2026-10-13).
-        Kind::Tunnel => {
+        Content::Tunnel => {
             let mastering = tunnel.map_or(0.0, |t| cinefit_dovi::pq_to_nits(t.source_max_pq));
             let scene = tunnel
                 .and_then(|t| t.scene_max_pq)
@@ -103,7 +147,7 @@ pub(crate) fn output_for(
                 pq_out,
             )
         }
-        Kind::Ycbcr(c) if c.transfer == Transfer::Pq => {
+        Content::Hdr10(_) => {
             // The source's own values; any it does not send stay unknown (0)
             // or default to BT.2020 D65.
             let xy = |c: Option<cinefit_decklink::Chromaticity>, d: (f64, f64)| {
@@ -127,7 +171,7 @@ pub(crate) fn output_for(
                 pq_out,
             )
         }
-        Kind::Ycbcr(c) if c.transfer == Transfer::Hlg => (
+        Content::Hlg(_) => (
             Some(cinefit_kms::HdrStatic {
                 eotf: cinefit_kms::Eotf::Hlg,
                 ..base
@@ -154,28 +198,21 @@ pub(crate) const SDR_BT2020: RgbColor = RgbColor {
     transfer: Transfer::Bt1886,
 };
 
-/// Whether a frame is a player's low-latency Dolby Vision: YCbCr labelled SDR
-/// BT.2020, when the `input.lldv` setting says that label means it.
-pub(crate) fn is_lldv(kind: Kind, lldv: bool) -> bool {
-    matches!(kind, Kind::Ycbcr(c) if lldv && c.primaries == Primaries::Bt2020 && c.transfer == Transfer::Bt1886)
-}
-
 /// The output for an input under the `output.mode` setting. Dolby Vision, as
 /// a tunnel or already mapped by the player, always goes out as SDR BT.2020:
 /// passed through it would be HDR10 with derived metadata, which the display
 /// maps by its own rules. Passthrough is for HDR10 (and HLG) only.
 pub(crate) fn output_in(
     mode: OutputMode,
-    lldv: bool,
-    kind: Kind,
+    content: Content,
     hdr: Option<&HdrMetadata>,
     tunnel: Option<&Tunnel>,
 ) -> (Option<cinefit_kms::HdrStatic>, RgbColor) {
     let sdr = (None, SDR_BT2020);
-    if kind == Kind::Tunnel || is_lldv(kind, lldv) || mode == OutputMode::Sdr2020 {
+    if content.is_dolby_vision() || mode == OutputMode::Sdr2020 {
         return sdr;
     }
-    match output_for(kind, hdr, tunnel) {
+    match output_for(content, hdr, tunnel) {
         (Some(h), color) => (Some(h), color),
         (None, _) => sdr,
     }
@@ -221,33 +258,34 @@ pub(crate) fn cant_show(f: PixelFormat) -> String {
 }
 
 /// What the info panel says about the input: its picture type, then size,
-/// rate and sampling as the card reports them.
+/// rate and sampling as the card reports them. `picture` is what is coming
+/// in and its size, `None` without a signal; `lldv` the peak low-latency
+/// Dolby Vision is assumed mapped to.
 pub(crate) fn input_section(
-    key: Option<Key>,
+    picture: Option<(Content, u32, u32)>,
     format: Option<InputFormat>,
-    dark: bool,
     lldv: Option<u16>,
     peak: Option<u16>,
 ) -> InfoSection {
     let label = "IN".to_string();
-    let Some(k) = key.filter(|_| !dark) else {
+    let Some((content, width, height)) = picture else {
         return InfoSection {
             label,
             line: "No signal".into(),
             detail: "waiting for a source".into(),
         };
     };
-    let line = match k.kind {
-        Kind::Tunnel => "Dolby Vision \u{b7} tunnel".into(),
-        kind if is_lldv(kind, lldv.is_some()) => "Dolby Vision \u{b7} low latency".into(),
-        Kind::Ycbcr(c) if c.transfer == Transfer::Pq => "HDR10".into(),
-        Kind::Ycbcr(c) if c.transfer == Transfer::Hlg => "HLG".into(),
-        Kind::Ycbcr(c) if c.primaries == Primaries::Bt2020 => "SDR BT.2020".into(),
-        Kind::Ycbcr(_) => "SDR".into(),
-        Kind::Rgb(_) => "RGB".into(),
-        Kind::Unsupported(f) => format!("{f}: nothing renders it"),
+    let line = match content {
+        Content::Tunnel => "Dolby Vision \u{b7} tunnel".into(),
+        Content::Lldv(_) => "Dolby Vision \u{b7} low latency".into(),
+        Content::Hdr10(_) => "HDR10".into(),
+        Content::Hlg(_) => "HLG".into(),
+        Content::Sdr(c) if c.primaries == Primaries::Bt2020 => "SDR BT.2020".into(),
+        Content::Sdr(_) => "SDR".into(),
+        Content::Rgb(_) => "RGB".into(),
+        Content::Unsupported(f) => format!("{f}: nothing renders it"),
     };
-    let mut detail = format!("{} \u{d7} {}", k.width, k.height);
+    let mut detail = format!("{width} \u{d7} {height}");
     if let Some(f) = format {
         detail += &format!(" \u{b7} {}", rate_name(rate_mhz(&f)));
         detail += match f.sampling {
@@ -259,7 +297,7 @@ pub(crate) fn input_section(
         }
     }
     if let Some(p) = peak {
-        detail += &format!(" \u{b7} {}", peak_words(k.kind, p, lldv));
+        detail += &format!(" \u{b7} {}", peak_words(content, p, lldv));
     }
     InfoSection {
         label,
@@ -271,9 +309,7 @@ pub(crate) fn input_section(
 /// What the info panel says about the output: what it signals and what
 /// happened to the picture on the way, then the mode.
 pub(crate) fn output_section(
-    key: Option<Key>,
-    dark: bool,
-    lldv: bool,
+    content: Option<Content>,
     signal: follow::Signal,
     mode: cinefit_kms::ModeTiming,
     shown: Option<f64>,
@@ -284,19 +320,19 @@ pub(crate) fn output_section(
         follow::Signal::Hdr(h) if h.eotf == cinefit_kms::Eotf::Hlg => ("HLG", None),
         follow::Signal::Hdr(h) => ("HDR10", Some(h)),
     };
-    let what = match key.filter(|_| !dark).map(|k| k.kind) {
+    let what = match content {
         None => "black, waiting",
-        Some(Kind::Tunnel) => "cinefit\u{2019}s own mapping",
-        Some(k) if is_lldv(k, lldv) => "unchanged from the player",
-        Some(Kind::Ycbcr(c)) if matches!(c.transfer, Transfer::Pq | Transfer::Hlg) => {
+        Some(Content::Tunnel) => "cinefit\u{2019}s own mapping",
+        Some(Content::Lldv(_)) => "unchanged from the player",
+        Some(Content::Hdr10(_) | Content::Hlg(_)) => {
             if hdr.is_some() || name == "HLG" {
                 "passed through"
             } else {
                 "tone-mapped by cinefit"
             }
         }
-        Some(Kind::Ycbcr(c)) if c.primaries == Primaries::Bt709 => "BT.709 placed in BT.2020",
-        Some(Kind::Unsupported(_)) => "black: nothing renders the input",
+        Some(Content::Sdr(c)) if c.primaries == Primaries::Bt709 => "BT.709 placed in BT.2020",
+        Some(Content::Unsupported(_)) => "black: nothing renders the input",
         Some(_) => "unchanged",
     };
     let mut detail = format!(
@@ -347,7 +383,7 @@ pub(crate) fn rate_name(rate_mhz: u32) -> String {
 /// The banner for a picture (#77): what is coming in, and what happens to
 /// it. `None` for what nothing renders, which has the slate instead.
 pub(crate) fn banner_for(
-    kind: Kind,
+    content: Content,
     key: (u32, u32),
     rate_mhz: u32,
     out_width: u32,
@@ -360,18 +396,18 @@ pub(crate) fn banner_for(
         ""
     };
     let passthrough = config.mode == OutputMode::Passthrough;
-    let (title, detail) = match kind {
-        Kind::Unsupported(_) => return None,
-        Kind::Tunnel => (
+    let (title, detail) = match content {
+        Content::Unsupported(_) => return None,
+        Content::Tunnel => (
             "Dolby Vision",
             format!("{what} \u{b7} tunnel, cinefit\u{2019}s own mapping"),
         ),
-        k if is_lldv(k, config.lldv) => (
+        Content::Lldv(_) => (
             "Dolby Vision",
             format!("{what} \u{b7} mapped by the player, shown as is"),
         ),
-        Kind::Ycbcr(c) if matches!(c.transfer, Transfer::Pq | Transfer::Hlg) => (
-            if c.transfer == Transfer::Pq {
+        Content::Hdr10(_) | Content::Hlg(_) => (
+            if matches!(content, Content::Hdr10(_)) {
                 "HDR10"
             } else {
                 "HLG"
@@ -382,8 +418,8 @@ pub(crate) fn banner_for(
                 format!("{what} \u{b7} tone-mapped by cinefit")
             },
         ),
-        Kind::Ycbcr(_) => ("SDR", format!("{what}{scaled}")),
-        Kind::Rgb(_) => ("SDR", format!("{what} \u{b7} RGB{scaled}")),
+        Content::Sdr(_) => ("SDR", format!("{what}{scaled}")),
+        Content::Rgb(_) => ("SDR", format!("{what} \u{b7} RGB{scaled}")),
     };
     Some(BannerText {
         title: title.into(),
@@ -432,9 +468,9 @@ pub(crate) fn pq_nits(e: f64) -> f64 {
 /// where cinefit reads the input as PQ, as a share of white for SDR. For
 /// low-latency Dolby Vision, against the peak the player is assumed to map
 /// to (`lldv`, the setting, when it is on).
-pub(crate) fn peak_words(kind: Kind, code: u16, lldv: Option<u16>) -> String {
-    let as_lldv = lldv.is_some() && is_lldv(kind, true);
-    let pq = as_lldv || matches!(kind, Kind::Ycbcr(c) if c.transfer == Transfer::Pq);
+pub(crate) fn peak_words(content: Content, code: u16, lldv: Option<u16>) -> String {
+    let as_lldv = lldv.is_some() && matches!(content, Content::Lldv(_));
+    let pq = as_lldv || matches!(content, Content::Hdr10(_));
     if !pq {
         return format!("brightest {:.0}% of white", signal(code) * 100.0);
     }
@@ -469,30 +505,128 @@ mod tests {
         })
     }
 
+    /// BT.2020 YCbCr with `transfer`, read with `input.lldv` on.
+    fn content(transfer: Transfer) -> Content {
+        Content::of(ycbcr(transfer), true)
+    }
+
+    fn bt709() -> Content {
+        Content::Sdr(YcbcrColor {
+            matrix: Matrix::Bt709,
+            primaries: Primaries::Bt709,
+            transfer: Transfer::Bt1886,
+        })
+    }
+
+    #[test]
+    fn what_the_input_is() {
+        assert!(matches!(content(Transfer::Pq), Content::Hdr10(_)));
+        assert!(matches!(content(Transfer::Hlg), Content::Hlg(_)));
+        // Labelled SDR BT.2020: low-latency Dolby Vision with input.lldv on,
+        // plain SDR with it off.
+        assert!(matches!(content(Transfer::Bt1886), Content::Lldv(_)));
+        assert!(matches!(
+            Content::of(ycbcr(Transfer::Bt1886), false),
+            Content::Sdr(_)
+        ));
+        // SDR BT.709 is never read as Dolby Vision.
+        let sdr709 = Kind::Ycbcr(YcbcrColor {
+            matrix: Matrix::Bt709,
+            primaries: Primaries::Bt709,
+            transfer: Transfer::Bt1886,
+        });
+        assert!(matches!(Content::of(sdr709, true), Content::Sdr(_)));
+        assert_eq!(Content::of(Kind::Tunnel, false), Content::Tunnel);
+        assert!(Content::Tunnel.is_dolby_vision() && content(Transfer::Bt1886).is_dolby_vision());
+        assert!(!content(Transfer::Pq).is_dolby_vision());
+    }
+
+    /// A sequence of inputs as a run sees them: what is signalled, what is
+    /// rendered into, what the banner and the info panel say, each from the
+    /// one resolved [`Content`].
+    #[test]
+    fn transitions_hdr10_lldv_no_signal_sdr() {
+        let c = Config::default();
+        let step = |picture: Option<Content>| {
+            let (hdr, _) = picture.map_or((None, SDR_BT2020), |p| {
+                output_in(OutputMode::Passthrough, p, None, None)
+            });
+            let signal = signal_of(hdr);
+            let banner = picture
+                .and_then(|p| banner_for(p, (3840, 2160), 23976, 4096, &c))
+                .map(|b| b.title);
+            let input = input_section(picture.map(|p| (p, 3840, 2160)), None, Some(96), None);
+            (
+                hdr.map(|h| h.eotf),
+                color_for(signal).transfer,
+                encoding_for(signal),
+                banner,
+                input.line,
+            )
+        };
+        assert_eq!(
+            step(Some(content(Transfer::Pq))),
+            (
+                Some(cinefit_kms::Eotf::Pq),
+                Transfer::Pq,
+                Encoding::Pq,
+                Some("HDR10".to_string()),
+                "HDR10".to_string()
+            )
+        );
+        assert_eq!(
+            step(Some(content(Transfer::Bt1886))),
+            (
+                None,
+                Transfer::Bt1886,
+                Encoding::Sdr,
+                Some("Dolby Vision".to_string()),
+                "Dolby Vision \u{b7} low latency".to_string()
+            )
+        );
+        assert_eq!(
+            step(None),
+            (
+                None,
+                Transfer::Bt1886,
+                Encoding::Sdr,
+                None,
+                "No signal".to_string()
+            )
+        );
+        assert_eq!(
+            step(Some(bt709())),
+            (
+                None,
+                Transfer::Bt1886,
+                Encoding::Sdr,
+                Some("SDR".to_string()),
+                "SDR".to_string()
+            )
+        );
+    }
+
     #[test]
     fn dolby_vision_is_never_passed_through() {
         use OutputMode::{Passthrough, Sdr2020};
-        let lldv = ycbcr(Transfer::Bt1886);
-        let hdr10 = ycbcr(Transfer::Pq);
+        let lldv = content(Transfer::Bt1886);
+        let hdr10 = content(Transfer::Pq);
         for mode in [Sdr2020, Passthrough] {
             assert_eq!(
-                output_in(mode, true, Kind::Tunnel, None, None),
+                output_in(mode, Content::Tunnel, None, None),
                 (None, SDR_BT2020)
             );
-            assert_eq!(output_in(mode, true, lldv, None, None), (None, SDR_BT2020));
+            assert_eq!(output_in(mode, lldv, None, None), (None, SDR_BT2020));
         }
         // HDR10 is passed through only when asked.
-        assert_eq!(
-            output_in(Sdr2020, true, hdr10, None, None),
-            (None, SDR_BT2020)
-        );
-        let (h, out) = output_in(Passthrough, true, hdr10, None, None);
+        assert_eq!(output_in(Sdr2020, hdr10, None, None), (None, SDR_BT2020));
+        let (h, out) = output_in(Passthrough, hdr10, None, None);
         assert_eq!(h.map(|h| h.eotf), Some(cinefit_kms::Eotf::Pq));
         assert_eq!(out.transfer, Transfer::Pq);
         // With the LLDV reading off, SDR BT.2020 is just SDR.
-        assert!(!is_lldv(lldv, false));
+        let sdr2020 = Content::of(ycbcr(Transfer::Bt1886), false);
         assert_eq!(
-            output_in(Passthrough, false, lldv, None, None),
+            output_in(Passthrough, sdr2020, None, None),
             (None, SDR_BT2020)
         );
     }
@@ -509,7 +643,7 @@ mod tests {
             max_cll: Some(637.0),
             max_fall: Some(148.0),
         };
-        let (h, out) = output_for(ycbcr(Transfer::Pq), Some(&hdr), None);
+        let (h, out) = output_for(content(Transfer::Pq), Some(&hdr), None);
         let h = h.expect("HDR");
         assert_eq!(h.eotf, cinefit_kms::Eotf::Pq);
         assert_eq!((h.max_cll, h.max_fall), (637.0, 148.0));
@@ -522,7 +656,7 @@ mod tests {
 
     #[test]
     fn hdr10_without_metadata_signals_unknowns() {
-        let (h, _) = output_for(ycbcr(Transfer::Pq), None, None);
+        let (h, _) = output_for(content(Transfer::Pq), None, None);
         let h = h.expect("HDR");
         assert_eq!((h.max_cll, h.max_fall, h.max_mastering), (0.0, 0.0, 0.0));
     }
@@ -540,7 +674,7 @@ mod tests {
             scene_max_pq: None,
             scene_avg_pq: None,
         };
-        let (h, out) = output_for(Kind::Tunnel, None, Some(&t));
+        let (h, out) = output_for(Content::Tunnel, None, Some(&t));
         let h = h.expect("HDR");
         assert_eq!(h.eotf, cinefit_kms::Eotf::Pq);
         assert!(
@@ -559,16 +693,16 @@ mod tests {
             scene_max_pq: Some(pq),
             ..t
         };
-        let (h, _) = output_for(Kind::Tunnel, None, Some(&scene(3079)));
+        let (h, _) = output_for(Content::Tunnel, None, Some(&scene(3079)));
         assert!((h.expect("HDR").max_cll - 1001.0).abs() < 2.0);
-        let (h, _) = output_for(Kind::Tunnel, None, Some(&scene(4000)));
+        let (h, _) = output_for(Content::Tunnel, None, Some(&scene(4000)));
         assert!((h.expect("HDR").max_cll - 4000.0).abs() < 10.0);
         // The scene's average, PQ 2081 (about 100 nits), goes out as MaxFALL.
         let avg = Tunnel {
             scene_avg_pq: Some(2081),
             ..scene(3079)
         };
-        let (h, _) = output_for(Kind::Tunnel, None, Some(&avg));
+        let (h, _) = output_for(Content::Tunnel, None, Some(&avg));
         assert!((h.expect("HDR").max_fall - 100.0).abs() < 1.5);
         assert_eq!(
             (out.primaries, out.transfer),
@@ -579,29 +713,24 @@ mod tests {
     #[test]
     fn banners_name_the_picture_and_what_happens_to_it() {
         let c = Config::default();
-        let bt709 = Kind::Ycbcr(YcbcrColor {
-            matrix: Matrix::Bt709,
-            primaries: Primaries::Bt709,
-            transfer: Transfer::Bt1886,
-        });
-        let b = |kind, size, rate, c: &Config| {
-            banner_for(kind, size, rate, 4096, c).map(|b| format!("{} / {}", b.title, b.detail))
+        let b = |content, size, rate, c: &Config| {
+            banner_for(content, size, rate, 4096, c).map(|b| format!("{} / {}", b.title, b.detail))
         };
         assert_eq!(
-            b(ycbcr(Transfer::Pq), (3840, 2160), 23976, &c).as_deref(),
+            b(content(Transfer::Pq), (3840, 2160), 23976, &c).as_deref(),
             Some("HDR10 / 4K 23.976 \u{b7} to the projector")
         );
         // Labelled SDR BT.2020: low-latency Dolby Vision, with input.lldv on.
         assert_eq!(
-            b(ycbcr(Transfer::Bt1886), (3840, 2160), 23976, &c).as_deref(),
+            b(content(Transfer::Bt1886), (3840, 2160), 23976, &c).as_deref(),
             Some("Dolby Vision / 4K 23.976 \u{b7} mapped by the player, shown as is")
         );
         assert_eq!(
-            b(bt709, (1920, 1080), 59940, &c).as_deref(),
+            b(bt709(), (1920, 1080), 59940, &c).as_deref(),
             Some("SDR / 1080p 59.94 \u{b7} scaled to 4K")
         );
         assert_eq!(
-            b(Kind::Tunnel, (1920, 1080), 24000, &c).as_deref(),
+            b(Content::Tunnel, (1920, 1080), 24000, &c).as_deref(),
             Some("Dolby Vision / 1080p 24 \u{b7} tunnel, cinefit\u{2019}s own mapping")
         );
         let sdr2020 = Config {
@@ -609,12 +738,12 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(
-            b(ycbcr(Transfer::Pq), (3840, 2160), 23976, &sdr2020).as_deref(),
+            b(content(Transfer::Pq), (3840, 2160), 23976, &sdr2020).as_deref(),
             Some("HDR10 / 4K 23.976 \u{b7} tone-mapped by cinefit")
         );
         assert_eq!(
             b(
-                Kind::Unsupported(PixelFormat::Other(7)),
+                Content::Unsupported(PixelFormat::Other(7)),
                 (3840, 2160),
                 23976,
                 &c
@@ -627,27 +756,15 @@ mod tests {
 
     #[test]
     fn the_info_panel_says_what_comes_in_and_goes_out() {
-        let key = |kind| Key {
-            width: 3840,
-            height: 2160,
-            kind,
-        };
-        let lldv = Some(key(ycbcr(Transfer::Bt1886)));
-        let s = input_section(lldv, None, false, Some(96), None);
+        let lldv = Some(content(Transfer::Bt1886));
+        let s = input_section(lldv.map(|c| (c, 3840, 2160)), None, Some(96), None);
         assert_eq!(
             (s.line.as_str(), s.detail.as_str()),
             ("Dolby Vision \u{b7} low latency", "3840 \u{d7} 2160")
         );
-        assert_eq!(
-            input_section(lldv, None, true, Some(96), None).line,
-            "No signal"
-        );
-        assert_eq!(
-            input_section(None, None, false, Some(96), None).line,
-            "No signal"
-        );
+        assert_eq!(input_section(None, None, Some(96), None).line, "No signal");
         // The brightest level: PQ codes in nits, against the assumed peak.
-        let lldv_kind = ycbcr(Transfer::Bt1886);
+        let lldv_kind = content(Transfer::Bt1886);
         let at = |nits: f64| {
             (0..1024u16)
                 .min_by(|&a, &b| {
@@ -663,13 +780,12 @@ mod tests {
         let over = peak_words(lldv_kind, at(200.0), Some(96));
         assert!(over.ends_with("nits, above the 96 assumed"), "{over}");
         // With input.lldv off the same signal is SDR: a share of white.
-        assert!(peak_words(lldv_kind, at(96.0), None).ends_with("% of white"));
-        let sdr = Kind::Ycbcr(YcbcrColor {
-            matrix: Matrix::Bt709,
-            primaries: Primaries::Bt709,
-            transfer: Transfer::Bt1886,
-        });
-        assert_eq!(peak_words(sdr, 940, Some(96)), "brightest 100% of white");
+        let off = Content::of(ycbcr(Transfer::Bt1886), false);
+        assert!(peak_words(off, at(96.0), None).ends_with("% of white"));
+        assert_eq!(
+            peak_words(bt709(), 940, Some(96)),
+            "brightest 100% of white"
+        );
         assert!((pq_nits(1.0) - 10_000.0).abs() < 1e-6);
         assert!((pq_nits(0.508) - 100.0).abs() < 2.0, "{}", pq_nits(0.508));
         // 4096x2160 at 23.976: 296,703 kHz over 5500 x 2250.
@@ -682,19 +798,17 @@ mod tests {
             interlaced: false,
             preferred: false,
         };
-        let out = output_section(lldv, false, true, follow::Signal::Sdr, mode, None, 96);
+        let out = output_section(lldv, follow::Signal::Sdr, mode, None, 96);
         assert_eq!(out.line, "SDR BT.2020 \u{b7} unchanged from the player");
         assert_eq!(out.detail, "4096 \u{d7} 2160 \u{b7} 23.976");
-        let pq = Some(key(ycbcr(Transfer::Pq)));
-        let mapped = output_section(pq, false, true, follow::Signal::Sdr, mode, None, 96);
+        let pq = Some(content(Transfer::Pq));
+        let mapped = output_section(pq, follow::Signal::Sdr, mode, None, 96);
         assert_eq!(mapped.line, "SDR BT.2020 \u{b7} tone-mapped by cinefit");
-        let waiting = output_section(None, false, true, follow::Signal::Sdr, mode, None, 96);
+        let waiting = output_section(None, follow::Signal::Sdr, mode, None, 96);
         // What went out: SDR full scale is cinefit's white; 94 nits of it
         // is (94/96)^(1/2.4) of the scale.
         let shown = output_section(
             lldv,
-            false,
-            true,
             follow::Signal::Sdr,
             mode,
             Some((94.0f64 / 96.0).powf(1.0 / 2.4)),
@@ -710,10 +824,10 @@ mod tests {
 
     #[test]
     fn hlg_and_sdr() {
-        let (h, out) = output_for(ycbcr(Transfer::Hlg), None, None);
+        let (h, out) = output_for(content(Transfer::Hlg), None, None);
         assert_eq!(h.map(|h| h.eotf), Some(cinefit_kms::Eotf::Hlg));
         assert_eq!(out.transfer, Transfer::Hlg);
-        let (h, out) = output_for(ycbcr(Transfer::Bt1886), None, None);
+        let (h, out) = output_for(bt709(), None, None);
         assert!(h.is_none());
         assert_eq!(
             (out.primaries, out.transfer),
@@ -721,7 +835,7 @@ mod tests {
         );
         // Plain RGB is signalled as SDR for now.
         assert!(
-            output_for(Kind::Rgb(rgb::Format::R210), None, None)
+            output_for(Content::Rgb(rgb::Format::R210), None, None)
                 .0
                 .is_none()
         );
