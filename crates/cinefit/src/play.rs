@@ -687,6 +687,20 @@ struct CropFinder {
     /// The `detect.crop` setting.
     on: bool,
     crops: u64,
+    /// The last frame was one the detector does not read, and the crop went
+    /// to full frame for it.
+    unread: bool,
+}
+
+/// Why the detector does not read frames of this kind; `None` for those it
+/// reads. Each is a crop change's reason and the info panel's CROP detail.
+fn unread_by_detector(kind: Kind) -> Option<&'static str> {
+    match kind {
+        Kind::Ycbcr(_) => None,
+        Kind::Rgb(_) => Some("the detector does not read RGB"),
+        Kind::Tunnel => Some("the detector does not read the Dolby Vision tunnel"),
+        Kind::Unsupported(_) => Some("nothing reads this format"),
+    }
 }
 
 /// What the detector made of one frame.
@@ -772,11 +786,28 @@ impl CropFinder {
                 peak,
             };
         }
+        // A crop belongs to the picture it was found on: held over RGB or the
+        // tunnel, a scope title's crop would trim whatever followed it. Those
+        // have no adapter yet (#69), so they get the full frame. The detector
+        // itself starts again on the next YCbCr frame: a format change is a
+        // new epoch, which resets it.
+        if let Some(why) = unread_by_detector(kind) {
+            let change = (!self.unread && self.det.crop() != Crop::default())
+                .then_some((Crop::default(), why));
+            if change.is_some() {
+                self.crops += 1;
+            }
+            self.unread = true;
+            return Found {
+                source: geo::Source::Rows { top: 0, bottom: 0 },
+                ms: None,
+                change,
+                peak,
+            };
+        }
+        self.unread = false;
         let (mut took, mut change) = (None, None);
-        // YCbCr only: the other formats have no adapter yet, and keep the
-        // last crop.
-        if matches!(kind, Kind::Ycbcr(_))
-            && let Some(b) = bytes
+        if let Some(b) = bytes
             && let Some(v) = V210::new(b, info.width, info.height, info.row_bytes)
         {
             let t0 = Instant::now();
@@ -1219,7 +1250,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // The bar detector reads each YCbCr frame on this thread (about 8 ms at
     // 2160p) and its crop goes to the geometry: the picture at constant
     // image height in the screen's band of the raster. Other formats, which
-    // have no adapter yet, keep the last crop.
+    // have no adapter yet, get the full frame.
     let mut win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
     if cfg.crop {
         info!(
@@ -1234,6 +1265,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         det: Detector::default(),
         on: cfg.crop,
         crops: 0,
+        unread: false,
     };
     // For the info panel: the last ten seconds' timings, and when and why
     // the crop last changed.
@@ -1610,6 +1642,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             last_key.filter(|_| !dark).map(|k| (k.width, k.height)),
                             rows,
                             crop_change.get().map(|(at, why)| (now - at, why)),
+                            last_key
+                                .filter(|_| !dark)
+                                .and_then(|k| unread_by_detector(k.kind)),
                         ),
                         window.borrow_mut().section(now, period),
                     ],
@@ -2121,6 +2156,106 @@ fn describe(kind: Kind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v210 frame, 10-bit luma by row and column, neutral chroma: what the
+    /// detector reads, without the capture card.
+    fn v210(width: u32, height: u32, luma: impl Fn(u32, u32) -> u32) -> (FrameInfo, Vec<u8>) {
+        let row_bytes = (width as usize).div_ceil(6) * 16;
+        let mut bytes = vec![0u8; row_bytes * height as usize];
+        let word = |a: u32, b: u32, c: u32| (a | b << 10 | c << 20).to_le_bytes();
+        for (y, row) in bytes.chunks_mut(row_bytes).enumerate() {
+            let l = |x: u32| if x < width { luma(x, y as u32) } else { 64 };
+            for (g, group) in row.chunks_mut(16).enumerate() {
+                let x = g as u32 * 6;
+                group[0..4].copy_from_slice(&word(512, l(x), 512));
+                group[4..8].copy_from_slice(&word(l(x + 1), 512, l(x + 2)));
+                group[8..12].copy_from_slice(&word(512, l(x + 3), 512));
+                group[12..16].copy_from_slice(&word(l(x + 4), 512, l(x + 5)));
+            }
+        }
+        let info = FrameInfo {
+            width,
+            height,
+            row_bytes,
+            pixel_format: PixelFormat::V210,
+            stream_time: None,
+            duration: None,
+            has_input: true,
+            color: cinefit_decklink::ColorInfo {
+                colorspace: None,
+                eotf: None,
+                hdr: None,
+            },
+            dolby_vision_flagged: false,
+            dolby_vision_bytes: None,
+        };
+        (info, bytes)
+    }
+
+    #[test]
+    fn a_crop_is_not_held_over_input_the_detector_cannot_read() {
+        // A still 2.40 picture in a 1080p frame: 140 rows of bar each side.
+        let (w, h, bar) = (1920, 1080, 140);
+        let (info, scope) = v210(w, h, |x, y| {
+            let hash = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 7;
+            if y < bar || y >= h - bar {
+                64
+            } else {
+                180 + hash % 620
+            }
+        });
+        let mut finder = CropFinder {
+            det: Detector::default(),
+            on: true,
+            crops: 0,
+            unread: false,
+        };
+        let sdr = ycbcr(Transfer::Bt1886);
+        let mut source = geo::Source::Whole;
+        for i in 0..24u32 {
+            source = finder
+                .find(&info, Some(&scope), sdr, f64::from(i) / 24.0, 1)
+                .source;
+        }
+        let geo::Source::Rows { top, bottom } = source else {
+            panic!("no rows: {source:?}");
+        };
+        assert!(top > 0 && bottom > 0, "scope frames never cropped");
+
+        // RGB at a new size, then the tunnel: full frame, and one change
+        // logged for it, not one a frame.
+        let rgb_info = FrameInfo {
+            width: 3840,
+            height: 2160,
+            ..info
+        };
+        let mut changes = Vec::new();
+        for (i, kind) in [
+            Kind::Rgb(rgb::Format::R210),
+            Kind::Rgb(rgb::Format::R210),
+            Kind::Tunnel,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let found = finder.find(&rgb_info, None, kind, 1.0 + i as f64 / 24.0, 2);
+            assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
+            assert!(found.ms.is_none());
+            changes.extend(found.change);
+        }
+        assert_eq!(
+            changes,
+            [(Crop::default(), "the detector does not read RGB")]
+        );
+
+        // YCbCr full-frame picture again, a new epoch: the old crop does not
+        // come back with it.
+        let (_, full) = v210(w, h, |x, y| {
+            180 + ((x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 7) % 620
+        });
+        let found = finder.find(&info, Some(&full), sdr, 2.0, 3);
+        assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
+    }
 
     fn ycbcr(transfer: Transfer) -> Kind {
         Kind::Ycbcr(YcbcrColor {
