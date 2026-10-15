@@ -4,6 +4,8 @@
 mod capture;
 mod compare;
 mod config;
+#[cfg(target_os = "linux")]
+mod content;
 mod follow;
 #[cfg(target_os = "linux")]
 mod menu;
