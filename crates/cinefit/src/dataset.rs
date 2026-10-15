@@ -147,6 +147,19 @@ impl Recorder {
         &self.dir
     }
 
+    /// Adds a line to the session's `session.txt`: what it was (the source,
+    /// later the title, #115). Rare, so written at once.
+    pub fn note(&self, line: &str) {
+        use std::io::Write as _;
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("session.txt"))
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
     /// Hands a record to the writer; never waits. A full queue drops it.
     pub fn record(&mut self, r: Record) {
         if let Some(tx) = &self.tx {

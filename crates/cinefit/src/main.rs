@@ -1,6 +1,8 @@
 // Unsafe code lives in the wrapper crates (cinefit-decklink), behind safe APIs.
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod avr;
 mod capture;
 mod compare;
 mod config;

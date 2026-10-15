@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::avr;
 use crate::config::{self, Config};
 use crate::content::*;
 use crate::dataset;
@@ -346,6 +347,8 @@ struct Dataset {
     /// run, or every [`JUDGE_EVERY`] frames at a cut.
     pending: Vec<(cinefit_detect::readings::Reading, (u32, u32))>,
     judging: Option<std::thread::JoinHandle<()>>,
+    /// The receiver's input by name, noted in each session (#116).
+    source: Option<String>,
 }
 
 /// The signal gone this long ends a viewing: the dataset's session closes,
@@ -370,6 +373,9 @@ impl Dataset {
             {
                 Ok(r) => {
                     info!("dataset: recording to {}", r.dir().display());
+                    if let Some(s) = &self.source {
+                        r.note(&format!("source: {s}"));
+                    }
                     self.recorder = Some(r);
                 }
                 Err(e) => {
@@ -414,6 +420,18 @@ impl Dataset {
 }
 
 impl Dataset {
+    /// The receiver's input changed: noted in the open session, and in
+    /// every session opened after.
+    fn set_source(&mut self, source: Option<String>, t: f64) {
+        if source == self.source {
+            return;
+        }
+        if let (Some(r), Some(s)) = (&self.recorder, &source) {
+            r.note(&format!("at {t:.1} s, source: {s}"));
+        }
+        self.source = source;
+    }
+
     /// Judges the readings so far, on a thread of its own, appending to the
     /// session's `hindsight.csv` and logging a line. `all` false keeps the
     /// shot still going (from its cut) for next time.
@@ -1104,6 +1122,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     rates.dedup();
     // The web page: its own thread, the port from the settings.
     let web = Web::start(cfg.web_port);
+    // The receiver (#116): which input is on, and whether it is on at all.
+    let receiver = avr::Receiver::start(&cfg.denon);
+    let mut last_seen: Option<avr::Seen> = None;
     let mut menu = Menu::new(rates, crate::VERSION.split(' ').next().unwrap_or("?"));
     // A rate-while-waiting change made while waiting: the output follows it
     // (a modeset) until a source comes.
@@ -1296,6 +1317,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     }
                     "osd.banners" => ui.set_banners(cfg.banners),
                     "slate.venue" => ui.set_venue(&cfg.venue),
+                    "avr.denon" => receiver.set_host(&cfg.denon),
                     "output.wait_hz" => wait_changed = dark,
                     _ => {}
                 }
@@ -1346,7 +1368,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let picture = last_key
                     .filter(|_| !dark)
                     .map(|k| (Content::of(k.kind, cfg.lldv), k));
-                let text = InfoText {
+                let mut text = InfoText {
                     sections: vec![
                         input_section(
                             picture.map(|(c, k)| (c, k.width, k.height)),
@@ -1372,6 +1394,15 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         window.borrow_mut().section(now, period),
                     ],
                 };
+                // The receiver's input, first on the IN line's detail.
+                if let Some(s) = &last_seen {
+                    let first = &mut text.sections[0];
+                    first.detail = if s.on {
+                        format!("{} \u{b7} {}", s.source(), first.detail)
+                    } else {
+                        "the receiver is off".into()
+                    };
+                }
                 if let Some(w) = &web {
                     let pill = match last_key.filter(|_| !dark).map(|k| k.kind) {
                         None => "Waiting",
@@ -1412,14 +1443,51 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 counts.signal_losses += 1;
                 // A break in the input: the viewing so far is judged.
                 dataset.judge(true);
-                ui.set_slate(Some(Slate::SignalLost {
-                    since: last_frame_at,
+                ui.set_slate(Some(if last_seen.as_ref().is_some_and(|s| !s.on) {
+                    Slate::ReceiverOff
+                } else {
+                    Slate::SignalLost {
+                        since: last_frame_at,
+                    }
                 }));
                 info!(
                     "{:.1} s: no signal for {} ms: black",
                     run_started.elapsed().as_secs_f64(),
                     last_frame_at.elapsed().as_millis()
                 );
+            }
+            // What the receiver says, when it changes: logged, noted in the
+            // dataset, and on the slate while there is no picture.
+            let seen = receiver.seen();
+            if seen != last_seen {
+                let t = run_started.elapsed().as_secs_f64();
+                match &seen {
+                    Some(s) if s.on => info!("{t:.1} s: receiver on, input {}", s.source()),
+                    Some(_) => info!("{t:.1} s: receiver in standby"),
+                    None if !cfg.denon.is_empty() => info!("{t:.1} s: receiver not answering"),
+                    None => {}
+                }
+                dataset.set_source(
+                    seen.as_ref()
+                        .filter(|s| s.on)
+                        .map(|s| s.source().to_string()),
+                    t,
+                );
+                if dark {
+                    ui.set_slate(Some(if seen.as_ref().is_some_and(|s| !s.on) {
+                        Slate::ReceiverOff
+                    } else {
+                        Slate::SignalLost {
+                            since: last_frame_at,
+                        }
+                    }));
+                }
+                // The receiver to standby: the viewing is over, now.
+                if seen.as_ref().is_some_and(|s| !s.on) && dataset.recorder.is_some() {
+                    info!("{t:.1} s: the receiver is off: the viewing ends");
+                    dataset.end_session();
+                }
+                last_seen = seen;
             }
             if dark && dataset.recorder.is_some() && last_frame_at.elapsed() >= VIEWING_GAP {
                 info!(

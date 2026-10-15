@@ -74,6 +74,9 @@ pub struct Config {
     pub fill_max_ar: Ratio,
     /// The theater's name, on the waiting slate; empty for none.
     pub venue: String,
+    /// The Denon receiver: a hostname or an IP address; empty for none
+    /// (#116).
+    pub denon: String,
     /// A banner on each change of picture type.
     pub banners: bool,
     /// The web page's port on the home network; 0 for none.
@@ -154,6 +157,7 @@ impl Default for Config {
             screen_ar: Ratio::of(2.35),
             fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
+            denon: String::new(),
             banners: true,
             web_port: 8080,
         }
@@ -449,6 +453,16 @@ static SETTINGS: &[Setting] = &[
                and what happens to it; after the projector's resync when the change needs one.",
         get: |c| Value::Name(if c.banners { "on" } else { "off" }.into()),
         set: |c, v| c.banners = name(v) == "on",
+    },
+    Setting {
+        key: "avr.denon",
+        kind: Kind::Text { max: 253 },
+        apply: Apply::Live,
+        help: "The Denon receiver, by hostname or IP address (for example 10.42.1.172): cinefit reads which \
+               input is on, by its name on the receiver, and whether the receiver is on, for the info panel, the \
+               slate and the detector's dataset. Reads only. Empty: none.",
+        get: |c| Value::Name(c.denon.clone()),
+        set: |c, v| c.denon = name(v).trim().to_string(),
     },
     Setting {
         key: "web.port",

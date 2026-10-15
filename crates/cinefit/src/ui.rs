@@ -45,6 +45,8 @@ pub enum Slate {
     NoSignal,
     /// The source went away mid-run.
     SignalLost { since: Instant },
+    /// No picture, and the receiver says it is off (#116).
+    ReceiverOff,
     /// A signal held back until it proves what it is (a possible tunnel).
     Identifying { detail: String },
     /// A format nothing renders, and what to change.
@@ -55,6 +57,11 @@ impl Slate {
     fn text(&self, venue: &str, now: Instant) -> SlateText {
         let (state, detail, tone) = match self {
             Slate::NoSignal => ("No signal", String::new(), Tone::Plain),
+            Slate::ReceiverOff => (
+                "Receiver off",
+                "waiting for it to come on".to_string(),
+                Tone::Plain,
+            ),
             Slate::SignalLost { since } => (
                 "Signal lost",
                 format!("{} \u{b7} waiting for the source", ago(now - *since)),
