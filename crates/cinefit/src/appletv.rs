@@ -24,6 +24,27 @@ pub fn credentials_path() -> PathBuf {
     crate::config::default_path().with_file_name("atv-credentials")
 }
 
+/// Keeps a new pairing: written whole and readable only by its owner, then
+/// moved into place, so the reader never sees half of one.
+pub fn save_credentials(c: &AtvCredentials) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = credentials_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("new");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(c.to_text().as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(tmp, path)
+}
+
 fn credentials() -> Option<AtvCredentials> {
     let text = std::fs::read_to_string(credentials_path()).ok()?;
     AtvCredentials::parse(&text)
@@ -117,6 +138,25 @@ fn run(shared: &Mutex<Shared>) {
             Err(_) => {}
         }
         std::thread::sleep(RETRY);
+    }
+}
+
+/// Whether the Apple TV is what is on screen: with `input` set (the
+/// `atv.input` setting), only while the receiver is on and on that input,
+/// matched by its name or its code. Without a setting, or without word
+/// from the receiver, it cannot be told, and is taken to be.
+pub fn on_screen(input: &str, seen: Option<&crate::avr::Seen>) -> bool {
+    if input.is_empty() {
+        return true;
+    }
+    match seen {
+        None => true,
+        Some(s) => {
+            s.on && (s.input.eq_ignore_ascii_case(input)
+                || s.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(input)))
+        }
     }
 }
 
@@ -263,6 +303,31 @@ mod tests {
             section(&song, SystemTime::UNIX_EPOCH).unwrap().line,
             "A Song \u{b7} A Band"
         );
+    }
+
+    #[test]
+    fn it_is_on_screen_only_on_its_input() {
+        use crate::avr::Seen;
+        let on = |input: &str, name: Option<&str>| Seen {
+            on: true,
+            input: input.into(),
+            name: name.map(Into::into),
+        };
+        let atv = on("MPLAY", Some("Apple TV"));
+        let disc = on("BD", Some("Panasonic BD"));
+        // By name or by code, in any case.
+        assert!(on_screen("Apple TV", Some(&atv)));
+        assert!(on_screen("mplay", Some(&atv)));
+        assert!(!on_screen("Apple TV", Some(&disc)));
+        // The receiver in standby: nothing is.
+        let off = Seen {
+            on: false,
+            ..atv.clone()
+        };
+        assert!(!on_screen("Apple TV", Some(&off)));
+        // No setting, or no word from the receiver: it cannot be told.
+        assert!(on_screen("", Some(&disc)));
+        assert!(on_screen("Apple TV", None));
     }
 
     #[test]

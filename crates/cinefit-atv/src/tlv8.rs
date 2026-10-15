@@ -6,8 +6,11 @@
 
 use std::collections::HashMap;
 
+pub const METHOD: u8 = 0x00;
 pub const IDENTIFIER: u8 = 0x01;
+pub const SALT: u8 = 0x02;
 pub const PUBLIC_KEY: u8 = 0x03;
+pub const PROOF: u8 = 0x04;
 pub const ENCRYPTED_DATA: u8 = 0x05;
 pub const SEQ_NO: u8 = 0x06;
 pub const ERROR: u8 = 0x07;

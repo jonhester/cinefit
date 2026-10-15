@@ -79,6 +79,9 @@ pub struct Config {
     pub denon: String,
     /// The Apple TV: a hostname or an IP address; empty for none (#115).
     pub atv_host: String,
+    /// The receiver input the Apple TV is on, by its name or code; empty
+    /// for any.
+    pub atv_input: String,
     /// A banner on each change of picture type.
     pub banners: bool,
     /// The web page's port on the home network; 0 for none.
@@ -161,6 +164,7 @@ impl Default for Config {
             venue: String::new(),
             denon: String::new(),
             atv_host: String::new(),
+            atv_input: String::new(),
             banners: true,
             web_port: 8080,
         }
@@ -477,6 +481,17 @@ static SETTINGS: &[Setting] = &[
                play. Empty: none.",
         get: |c| Value::Name(c.atv_host.clone()),
         set: |c, v| c.atv_host = name(v).trim().to_string(),
+    },
+    Setting {
+        key: "atv.input",
+        kind: Kind::Text { max: 64 },
+        apply: Apply::Live,
+        help: "The Denon input the Apple TV is plugged into, by its name on the receiver or its code (for \
+               example Apple TV, or MPLAY): what the Apple TV plays is shown, and labels the detector's \
+               dataset, only while the receiver is on it, so a paused show does not linger over a disc. \
+               Empty: always, as without a receiver.",
+        get: |c| Value::Name(c.atv_input.clone()),
+        set: |c, v| c.atv_input = name(v).trim().to_string(),
     },
     Setting {
         key: "web.port",

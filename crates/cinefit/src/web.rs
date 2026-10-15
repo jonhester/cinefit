@@ -12,7 +12,9 @@
 //!
 //! Endpoints: `/` the page; `/api/state` the snapshot;
 //! `POST /api/set` with `{"key": …, "value": …}`; `/api/logs` and
-//! `/api/logs/<name>` the run logs in `~/cinefit-logs`.
+//! `/api/logs/<name>` the run logs in `~/cinefit-logs`; `/api/atv` whether
+//! the Apple TV is paired, and `POST /api/atv/pair/start` and
+//! `/api/atv/pair/finish` with `{"pin": …}` to pair it (#115).
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -37,6 +39,8 @@ struct Shared {
     /// Changes posted from the page, for `play` to apply: key and value as
     /// typed, already checked.
     changes: Mutex<Vec<(String, String)>>,
+    /// An Apple TV pairing begun, waiting for the PIN it shows.
+    pairing: Mutex<Option<cinefit_atv::pair::PairSetup>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -118,6 +122,21 @@ fn serve(s: &Shared, mut request: tiny_http::Request) {
             let (code, reply) = set(s, &body);
             json_response(code, &reply).boxed()
         }
+        (Method::Get, "/api/atv") => json_response(
+            200,
+            &json!({"paired": crate::appletv::credentials_path().exists()}),
+        )
+        .boxed(),
+        (Method::Post, "/api/atv/pair/start") => {
+            let (code, reply) = pair_start(s);
+            json_response(code, &reply).boxed()
+        }
+        (Method::Post, "/api/atv/pair/finish") => {
+            let mut body = String::new();
+            let _ = request.as_reader().take(4096).read_to_string(&mut body);
+            let (code, reply) = pair_finish(s, &body);
+            json_response(code, &reply).boxed()
+        }
         (Method::Get, "/api/logs") => json_response(200, &logs()).boxed(),
         (Method::Get, path) if path.starts_with("/api/logs/") => {
             match log_text(&path["/api/logs/".len()..]) {
@@ -154,6 +173,56 @@ fn set(s: &Shared, body: &str) -> (u16, Json) {
     }
     lock(&s.changes).push((key, value));
     (200, json!({"ok": true}))
+}
+
+/// Asks the Apple TV at `atv.host` to show a PIN.
+fn pair_start(s: &Shared) -> (u16, Json) {
+    let host = lock(&s.config)
+        .as_ref()
+        .map(|c| c.atv_host.clone())
+        .unwrap_or_default();
+    if host.is_empty() {
+        return (400, json!({"error": "set the Apple TV's address first"}));
+    }
+    match cinefit_atv::pair::start(&host) {
+        Ok(p) => {
+            info!("web: Apple TV pairing begun with {host}");
+            *lock(&s.pairing) = Some(p);
+            (200, json!({"ok": true}))
+        }
+        Err(e) => (502, json!({"error": format!("the Apple TV: {e}")})),
+    }
+}
+
+/// The PIN typed in: the pairing finished and kept. A wrong PIN ends it;
+/// the Apple TV shows a new one for the next try.
+fn pair_finish(s: &Shared, body: &str) -> (u16, Json) {
+    let pin = serde_json::from_str::<Json>(body)
+        .ok()
+        .and_then(|j| j.get("pin")?.as_str().map(str::to_string));
+    let Some(pin) = pin.filter(|p| !p.trim().is_empty()) else {
+        return (400, json!({"error": "expected {\"pin\": …}"}));
+    };
+    let Some(pairing) = lock(&s.pairing).take() else {
+        return (409, json!({"error": "press Pair first"}));
+    };
+    match pairing
+        .finish(&pin)
+        .map_err(|e| e.to_string())
+        .and_then(|c| crate::appletv::save_credentials(&c).map_err(|e| e.to_string()))
+    {
+        Ok(()) => {
+            info!("web: Apple TV paired");
+            (200, json!({"ok": true}))
+        }
+        Err(e) => {
+            warn!("web: Apple TV pairing failed: {e}");
+            (
+                400,
+                json!({"error": format!("{e}; press Pair for a new PIN")}),
+            )
+        }
+    }
 }
 
 fn log_dir() -> Option<PathBuf> {
@@ -225,6 +294,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "web.port" => ("Web page", "Port"),
         "avr.denon" => ("Receiver", "Denon AVR (hostname or IP)"),
         "atv.host" => ("Receiver", "Apple TV (hostname or IP)"),
+        "atv.input" => ("Receiver", "Apple TV's receiver input"),
         _ => ("Other", ""),
     }
 }
@@ -282,6 +352,33 @@ mod tests {
         assert_eq!(crop["value"], "on");
         assert_eq!(crop["kind"]["type"], "choice");
         assert_eq!(crop["cost"], "Applies now, no resync");
+    }
+
+    /// The page draws only the sections it lists: a setting placed in one
+    /// it does not list never shows (the Receiver section, 2026-10-15).
+    #[test]
+    fn every_section_is_drawn_by_the_page() {
+        let listed = PAGE
+            .lines()
+            .find(|l| l.starts_with("const PAGES"))
+            .expect("the page lists its sections");
+        for s in config::settings() {
+            let page = place(s.key).0;
+            assert!(
+                listed.contains(&format!("\"{page}\"")),
+                "{page} ({}) is not drawn",
+                s.key
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_needs_an_address_and_a_start() {
+        let s = Shared::default();
+        *lock(&s.config) = Some(Config::default());
+        assert_eq!(pair_start(&s).0, 400, "no address");
+        assert_eq!(pair_finish(&s, r#"{"pin":"1234"}"#).0, 409, "not begun");
+        assert_eq!(pair_finish(&s, "{}").0, 400, "no PIN");
     }
 
     #[test]

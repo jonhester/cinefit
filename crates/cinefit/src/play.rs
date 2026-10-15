@@ -1420,6 +1420,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // app says.
                 if let Some(sec) = apple_tv
                     .now()
+                    .filter(|_| appletv::on_screen(&cfg.atv_input, last_seen.as_ref()))
                     .and_then(|np| appletv::section(&np, std::time::SystemTime::now()))
                 {
                     text.sections.insert(1, sec);
@@ -1490,13 +1491,18 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             // What the receiver says, when it changes: logged, noted in the
             // dataset, and on the slate while there is no picture.
             // What the Apple TV plays, when it changes: logged, and noted
-            // in the dataset.
-            let playing = apple_tv.now().as_ref().and_then(appletv::label);
+            // in the dataset; while the receiver is on another input,
+            // nothing is.
+            let playing = apple_tv
+                .now()
+                .filter(|_| appletv::on_screen(&cfg.atv_input, last_seen.as_ref()))
+                .as_ref()
+                .and_then(appletv::label);
             if playing != last_playing {
                 let t = run_started.elapsed().as_secs_f64();
                 match &playing {
                     Some(p) => info!("{t:.1} s: Apple TV playing: {p}"),
-                    None => info!("{t:.1} s: Apple TV: nothing named playing"),
+                    None => info!("{t:.1} s: Apple TV: nothing named playing, or not on screen"),
                 }
                 dataset.set_playing(playing.clone(), t);
                 last_playing = playing;

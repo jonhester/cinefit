@@ -18,7 +18,9 @@
 
 pub mod conn;
 pub mod hap;
+pub mod pair;
 pub mod proto;
+pub mod srp;
 pub mod stream;
 pub mod tlv8;
 
@@ -422,10 +424,7 @@ pub fn watch(
     stop: &Arc<AtomicBool>,
     mut update: impl FnMut(&NowPlaying),
 ) -> Result<(), Error> {
-    let addr = (host, PORT)
-        .to_socket_addrs()?
-        .next()
-        .ok_or(Error::Protocol("the host has no address"))?;
+    let addr = resolve(host, PORT)?;
     let mut control = Conn::new(connect(addr)?);
     let pv = verify(&mut control, creds)?;
     let rtsp = Rtsp::new(&control)?;
@@ -571,6 +570,17 @@ fn describe(m: &proto::ProtocolMessage) -> String {
         .and_then(|s| s.playback_state)
         .map_or(String::new(), |s| format!(", state {s}"));
     format!(": {app} / {}{state}", player_id(path))
+}
+
+fn resolve(host: &str, port: u16) -> Result<SocketAddr, Error> {
+    (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or(Error::Protocol("the host has no address"))
+}
+
+pub(crate) fn connect_to(host: &str, port: u16) -> Result<TcpStream, Error> {
+    connect(resolve(host, port)?)
 }
 
 fn connect(addr: SocketAddr) -> Result<TcpStream, Error> {
