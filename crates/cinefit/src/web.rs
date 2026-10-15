@@ -225,6 +225,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "web.port" => ("Web page", "Port"),
         "avr.denon" => ("Receiver", "Denon AVR (hostname or IP)"),
         "atv.host" => ("Receiver", "Apple TV (hostname or IP)"),
+        "atv.input" => ("Receiver", "Apple TV's receiver input"),
         _ => ("Other", ""),
     }
 }
