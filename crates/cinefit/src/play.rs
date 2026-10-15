@@ -1441,6 +1441,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
             }
             let flip = out.wait_flip()?;
+            if flip.waited > cinefit_kms::FLIP_LATE {
+                warn!(
+                    "{:.1} s: a flip came {:.0} ms after it was waited for",
+                    run_started.elapsed().as_secs_f64(),
+                    flip.waited.as_secs_f64() * 1000.0
+                );
+            }
             pacing.on_flip(flip.sequence, flip.at);
             front = pending;
             // Nothing is in flight now: the moment for a modeset or new metadata.

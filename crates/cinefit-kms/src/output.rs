@@ -22,9 +22,15 @@ use rustix::event::{PollFd, PollFlags, poll};
 use crate::hdr::HdrStatic;
 use crate::timing::ModeTiming;
 
-/// How long [`Output::wait_flip`] waits: six frame periods at 23.976 Hz, the
-/// slowest rate driven, and far beyond any flip that completes.
-pub const FLIP_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long [`Output::wait_flip`] waits before giving up: the display or
+/// driver has stopped answering. A flip waits for the GPU to finish the frame
+/// it shows, so a GPU stall makes one late; 250 ms, the first figure, ended a
+/// run on 2026-10-15 six seconds in, with a 103 ms upload stall in the same
+/// run, for a restart and a projector resync. A real hang is still caught,
+/// long before systemd's 15 s stop timeout.
+pub const FLIP_TIMEOUT: Duration = Duration::from_secs(2);
+/// A flip this late is reported ([`Flip::waited`]): ten frames at 23.976.
+pub const FLIP_LATE: Duration = Duration::from_millis(400);
 
 /// An open DRM device node.
 struct Card(File);
@@ -204,6 +210,8 @@ pub struct Flip {
     pub sequence: u32,
     /// CLOCK_MONOTONIC, to the microsecond.
     pub at: Duration,
+    /// How long [`Output::wait_flip`] waited for it.
+    pub waited: Duration,
 }
 
 pub struct Output {
@@ -1001,11 +1009,13 @@ impl Output {
     /// the frame loop where nothing reads the stop flag, so a SIGTERM would
     /// end in a kill and the display would never be put back.
     pub fn wait_flip(&self) -> Result<Flip, Error> {
+        let started = Instant::now();
         let flip = wait_readable(self.card.as_fd(), FLIP_TIMEOUT, || {
             Ok(self.card.receive_events()?.find_map(|event| match event {
                 Event::PageFlip(e) => Some(Flip {
                     sequence: e.frame,
                     at: e.duration,
+                    waited: started.elapsed(),
                 }),
                 _ => None,
             }))
