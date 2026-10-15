@@ -543,8 +543,14 @@ fn describe(m: &proto::ProtocolMessage) -> String {
         .set_state
         .as_ref()
         .and_then(|s| s.player_path.as_ref())
-        .or(m.update_content_item.as_ref().and_then(|u| u.player_path.as_ref()))
-        .or(m.set_now_playing_player.as_ref().and_then(|s| s.player_path.as_ref()));
+        .or(m
+            .update_content_item
+            .as_ref()
+            .and_then(|u| u.player_path.as_ref()))
+        .or(m
+            .set_now_playing_player
+            .as_ref()
+            .and_then(|s| s.player_path.as_ref()));
     let Some(path) = path else {
         return String::new();
     };
