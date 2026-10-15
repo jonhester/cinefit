@@ -1467,12 +1467,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     None if !cfg.denon.is_empty() => info!("{t:.1} s: receiver not answering"),
                     None => {}
                 }
-                dataset.set_source(
-                    seen.as_ref()
-                        .filter(|s| s.on)
-                        .map(|s| s.source().to_string()),
-                    t,
-                );
+                let source = seen
+                    .as_ref()
+                    .filter(|s| s.on)
+                    .map(|s| s.source().to_string());
+                ui.set_source(source.clone());
+                dataset.set_source(source, t);
                 if dark {
                     ui.set_slate(Some(if seen.as_ref().is_some_and(|s| !s.on) {
                         Slate::ReceiverOff
