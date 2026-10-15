@@ -63,7 +63,7 @@
 </main>
 <script>
 "use strict";
-const PAGES = ["Picture", "Output", "Screen", "Input", "Web page"];
+const PAGES = ["Picture", "Output", "Screen", "Input", "Receiver", "Web page"];
 // The menu's names for the table's values.
 const NAMES = { on: "On", off: "Off", passthrough: "To the projector",
   sdr2020: "Tone-mapped to SDR BT.2020", limited: "Limited", full: "Full" };
@@ -100,6 +100,49 @@ function control(s) {
   return c;
 }
 
+// Pairing the Apple TV (#115): Pair asks it to show a PIN, which is typed
+// in here. Once is enough unless the Apple TV forgets cinefit.
+function pairing() {
+  const row = el("div", "setting"), top = el("div", "top");
+  const btn = el("button", "", "Pair");
+  top.append(el("span", "", "Apple TV pairing"), btn);
+  const pinRow = el("div", "top"); pinRow.style.display = "none"; pinRow.style.marginTop = "8px";
+  const pin = el("input"); pin.type = "text"; pin.inputMode = "numeric"; pin.placeholder = "PIN on the TV";
+  const ok = el("button", "", "Pair with this PIN");
+  pinRow.append(pin, ok);
+  const err = el("div", "err"), msg = el("div", "help");
+  row.append(top, pinRow, err, msg);
+  async function refresh() {
+    try {
+      const j = await (await fetch("/api/atv", { cache: "no-store" })).json();
+      msg.textContent = j.paired
+        ? "Paired. Pair again only if the Apple TV has forgotten cinefit."
+        : "Not paired: cinefit cannot read what the Apple TV plays until it is. Set its address above first.";
+    } catch (e) {}
+  }
+  btn.onclick = async () => {
+    err.textContent = ""; btn.disabled = true;
+    try {
+      const r = await fetch("/api/atv/pair/start", { method: "POST" }); const j = await r.json();
+      if (!r.ok) err.textContent = j.error || "refused";
+      else { pinRow.style.display = "flex"; pin.value = ""; pin.focus(); msg.textContent = "Type the PIN the Apple TV is showing."; }
+    } catch (e) { err.textContent = "cinefit did not answer"; }
+    btn.disabled = false;
+  };
+  ok.onclick = async () => {
+    err.textContent = ""; ok.disabled = true;
+    try {
+      const r = await fetch("/api/atv/pair/finish", { method: "POST", body: JSON.stringify({ pin: pin.value }) });
+      const j = await r.json();
+      if (!r.ok) err.textContent = j.error || "refused";
+      pinRow.style.display = "none";
+    } catch (e) { err.textContent = "cinefit did not answer"; }
+    ok.disabled = false; refresh();
+  };
+  refresh();
+  return row;
+}
+
 function build(settings) {
   const pages = document.getElementById("pages");
   for (const page of PAGES) {
@@ -114,6 +157,7 @@ function build(settings) {
       d.append(row);
       rows[s.key] = { control: c, err };
     }
+    if (page === "Receiver") d.append(pairing());
     pages.append(d);
   }
   built = true;
