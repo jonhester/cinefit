@@ -24,6 +24,27 @@ pub fn credentials_path() -> PathBuf {
     crate::config::default_path().with_file_name("atv-credentials")
 }
 
+/// Keeps a new pairing: written whole and readable only by its owner, then
+/// moved into place, so the reader never sees half of one.
+pub fn save_credentials(c: &AtvCredentials) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = credentials_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("new");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(c.to_text().as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(tmp, path)
+}
+
 fn credentials() -> Option<AtvCredentials> {
     let text = std::fs::read_to_string(credentials_path()).ok()?;
     AtvCredentials::parse(&text)

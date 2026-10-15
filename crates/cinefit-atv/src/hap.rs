@@ -52,6 +52,15 @@ impl Credentials {
     }
 }
 
+impl Credentials {
+    /// pyatv's form again, for keeping in a file.
+    pub fn to_text(&self) -> String {
+        [&self.ltpk[..], &self.ltsk, &self.atv_id, &self.client_id]
+            .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+            .join(":")
+    }
+}
+
 fn unhex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
@@ -78,13 +87,18 @@ fn nonce(last8: [u8; 8]) -> Nonce {
     *Nonce::from_slice(&n)
 }
 
-fn seal(key: &[u8; 32], last8: [u8; 8], aad: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn seal(key: &[u8; 32], last8: [u8; 8], aad: &[u8], data: &[u8]) -> Vec<u8> {
     ChaCha20Poly1305::new(Key::from_slice(key))
         .encrypt(&nonce(last8), Payload { msg: data, aad })
         .expect("ChaCha20-Poly1305 encryption does not fail")
 }
 
-fn open(key: &[u8; 32], last8: [u8; 8], aad: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
+pub(crate) fn open(
+    key: &[u8; 32],
+    last8: [u8; 8],
+    aad: &[u8],
+    data: &[u8],
+) -> Result<Vec<u8>, Error> {
     ChaCha20Poly1305::new(Key::from_slice(key))
         .decrypt(&nonce(last8), Payload { msg: data, aad })
         .map_err(|_| Error::Crypto("a message did not decrypt"))
@@ -255,6 +269,7 @@ mod tests {
         assert_eq!(c.ltsk, [0x22; 32]);
         assert_eq!(c.atv_id, b"AB");
         assert_eq!(c.client_id, b"cd");
+        assert_eq!(Credentials::parse(&c.to_text()), Some(c.clone()));
         assert!(Credentials::parse("11:22").is_none());
         assert!(Credentials::parse(&s.replace("4142", "414")).is_none());
         // The secret key is not in the debug form.

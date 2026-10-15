@@ -26,11 +26,21 @@ Apple TV and compare their answers.
 | `conn` | `support/http.py`, `support/rtsp.py` |
 | `stream` | `protocols/airplay/channels.py` |
 | `proto` | `protocols/mrp/protobuf/*.proto`, `protocols/mrp/messages.py` |
+| `pair` | `protocols/airplay/auth/hap.py` (pair-setup), `auth/hap_srp.py` |
+| `srp` | `auth/hap_srp.py`, and the SRP library it uses, see below |
 | `lib` (`watch`, `Tracker`) | `protocols/airplay/ap2_session.py`, `protocols/airplay/__init__.py`, `protocols/mrp/protocol.py`, `protocols/mrp/player_state.py` |
+
+The SRP password check behind pairing (`srp`) follows the encodings of
+[srptools](https://github.com/idlesign/srptools) by Igor Starikov
+(BSD-3-Clause), which pyatv uses: the formulas are SRP-6a's (RFC 5054), but
+how each number is turned into bytes before hashing is srptools', and the
+Apple TV accepts exactly that. No srptools code is copied; its output on the
+rig gave the test values in `srp.rs`.
 
 ## Trying it
 
-Pair once with pyatv (`atvremote --protocol airplay pair`), then:
+cinefit pairs from its web page (Receiver, Apple TV pairing). Without
+cinefit, pair once with pyatv (`atvremote --protocol airplay pair`), then:
 
     CINEFIT_ATV_CREDENTIALS=<the AirPlay credentials pyatv printed> \
         cargo run -p cinefit-atv --example now_playing -- <apple-tv-host> [-v]
