@@ -14,10 +14,10 @@
 //!   kept it. A cut one pass saw and the other did not leaves its shot out.
 //! - **A check on each:** the passes' thumbnails, normalised (the tunnel and
 //!   the low-latency picture differ in level, not in what is where), must
-//!   correlate at least [`MIN_CORR`] for the pair, and no less than for
-//!   either neighbour of B's frame, or the pair is dropped as possibly a
-//!   frame off. A still shot, where neighbours are alike, passes: its frames
-//!   are the same picture anyway.
+//!   correlate at least [`MIN_CORR`] for the pair, and no less (by more than
+//!   [`NEIGHBOUR_MARGIN`]) than for either neighbour of B's frame, or the
+//!   pair is dropped as possibly a frame off. A still shot, where neighbours
+//!   are alike, passes: its frames are the same picture anyway.
 
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
@@ -31,6 +31,12 @@ use crate::dataset::THUMB;
 pub const DRIFT: i64 = 3;
 /// The least correlation of a pair's thumbnails.
 pub const MIN_CORR: f64 = 0.9;
+/// How much better a neighbour of B's frame must correlate to make the pair
+/// doubtful. In a still or slow shot the neighbours are as alike as the
+/// frame itself, and a strict "no neighbour better" dropped about half of
+/// them on the first real passes (2026-10-15); a frame truly one off, in a
+/// shot that moves, loses by far more than this.
+pub const NEIGHBOUR_MARGIN: f64 = 0.01;
 
 /// One pass, as its session recorded it.
 #[derive(Debug, Default, Clone)]
@@ -157,7 +163,7 @@ pub fn align(a: &Pass, b: &Pass) -> Found {
                 .iter()
                 .filter_map(|&n| thumb(b, n).and_then(|tn| corr(ta, tn)))
                 .fold(f64::NEG_INFINITY, f64::max);
-            if c < MIN_CORR || c + 1e-9 < neighbours {
+            if c < MIN_CORR || c + NEIGHBOUR_MARGIN < neighbours {
                 found.doubtful += 1;
                 continue;
             }
@@ -260,8 +266,18 @@ pub fn run(
             content(&b, p.b)
         );
     }
+    // Named for both sides, B's session included: two renditions in other
+    // sessions with one content tag (SDR BT.709, SDR BT.2020) must not
+    // overwrite each other.
     let tag = |c: Option<&str>| c.map_or_else(String::new, |c| format!("-{c}"));
-    let out = a_dir.join(format!("pairs{}{}.csv", tag(a_content), tag(b_content)));
+    let b_name = b_dir
+        .file_name()
+        .map_or_else(String::new, |n| format!("-{}", n.to_string_lossy()));
+    let out = a_dir.join(format!(
+        "pairs{}{b_name}{}.csv",
+        tag(a_content),
+        tag(b_content)
+    ));
     std::fs::write(&out, csv)?;
     println!(
         "A: {} cuts, {} frames kept; B: {} cuts, {} frames kept",
