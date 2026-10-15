@@ -75,7 +75,8 @@ pub struct Options {
     /// How long to run; `None` until stopped (Ctrl-C, or SIGTERM from a
     /// service manager).
     pub seconds: Option<f64>,
-    pub device: usize,
+    /// `-d`: the capture device's index for this run, over `input.device`.
+    pub device: Option<usize>,
     pub card: Option<PathBuf>,
     /// The settings this run starts with: the file's, with any --set.
     pub config: crate::config::Config,
@@ -798,14 +799,22 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     };
 
     // Capture first: the output is chosen from what arrives.
+    // The input by its persistent ID (#68), so a card with several inputs
+    // cannot quietly swap one for another.
     let devices = cinefit_decklink::devices()?;
-    let device = devices
-        .get(opts.device)
-        .ok_or_else(|| format!("no device {}: {} found", opts.device, devices.len()))?;
+    let infos: Vec<_> = devices.iter().map(|d| d.info()).collect();
+    let index = crate::device::choose(
+        &infos,
+        crate::device::want(opts.device, &opts.config.input_device)?,
+    )?;
+    let device = &devices[index];
+    let d = &infos[index];
     info!(
-        "capture: device {}: {}",
-        opts.device,
-        device.info().display_name
+        "capture: device {index}: {} ({}), persistent ID {}",
+        d.display_name,
+        d.model_name,
+        d.persistent_id
+            .map_or_else(|| "unreported".into(), |id| format!("{id:#x}"))
     );
     let mailbox = Arc::new(Mailbox::new());
     let format = Arc::new(Mutex::new(None));
