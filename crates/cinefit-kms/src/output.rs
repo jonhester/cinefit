@@ -485,6 +485,50 @@ impl Output {
     }
 
     pub fn create_scanout(&mut self, index: usize) -> Result<usize, Error> {
+        self.create_scanout_as(index, 0)
+    }
+
+    /// The layouts (DRM format modifiers) the primary plane scans the
+    /// scanout format out in, from its `IN_FORMATS`; LINEAR alone if the
+    /// plane does not list them. For `cinefit bench` (#101).
+    ///
+    /// # Errors
+    ///
+    /// If the plane's formats or properties cannot be read.
+    pub fn scanout_modifiers(&self) -> Result<Vec<u64>, Error> {
+        let format = self.scanout_format()? as u32;
+        let props = props_by_name(&self.card, self.plane)?;
+        let Some(&prop) = props.get("IN_FORMATS") else {
+            return Ok(vec![0]);
+        };
+        let values = self
+            .card
+            .get_properties(self.plane)
+            .map_err(io("reading the plane's properties"))?;
+        let (ids, vals) = values.as_props_and_values();
+        let Some(blob) = ids
+            .iter()
+            .zip(vals)
+            .find(|(id, _)| **id == prop)
+            .map(|(_, &v)| v)
+            .filter(|&v| v != 0)
+            .and_then(|v| self.card.get_property_blob(v).ok())
+        else {
+            return Ok(vec![0]);
+        };
+        Ok(crate::display::in_formats(&blob)
+            .and_then(|list| list.into_iter().find(|(f, _)| *f == format))
+            .map_or_else(|| vec![0], |(_, mods)| mods))
+    }
+
+    /// A scanout buffer the size of mode `index` in layout `modifier`, as
+    /// [`Output::create_scanout`] makes in LINEAR: registered as a
+    /// framebuffer, so the plane is known to take it.
+    ///
+    /// # Errors
+    ///
+    /// If GBM cannot allocate it or the driver will not register it.
+    pub fn create_scanout_as(&mut self, index: usize, modifier: u64) -> Result<usize, Error> {
         let (w, h) = self.modes[index].size();
         if self.gbm.is_none() {
             // A duplicate of the card's fd: the same open file, so GEM handles
@@ -503,7 +547,7 @@ impl Output {
                 w.into(),
                 h.into(),
                 format,
-                [gbm::Modifier::Linear].into_iter(),
+                [gbm::Modifier::from(modifier)].into_iter(),
                 gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
             )
             .map_err(io("allocating a GBM scanout buffer"))?;

@@ -311,6 +311,16 @@ fn plane_info(
 
 /// The plane's `IN_FORMATS` blob as (format, modifier names) pairs.
 fn format_modifiers(blob: &[u8]) -> Option<Vec<(u32, Vec<String>)>> {
+    in_formats(blob).map(|list| {
+        list.into_iter()
+            .map(|(f, mods)| (f, mods.into_iter().map(modifier_name).collect()))
+            .collect()
+    })
+}
+
+/// The plane's `IN_FORMATS` blob as (format, modifiers) pairs: the layouts
+/// the plane scans out each format in.
+pub(crate) fn in_formats(blob: &[u8]) -> Option<Vec<(u32, Vec<u64>)>> {
     let u32_at = |o: usize| {
         blob.get(o..o + 4)
             .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
@@ -328,7 +338,7 @@ fn format_modifiers(blob: &[u8]) -> Option<Vec<(u32, Vec<String>)>> {
         .collect::<Option<_>>()?;
     // Each entry: a 64-bit mask of formats, from `offset` in the list, then
     // the modifier.
-    let mut list: Vec<(u32, Vec<String>)> = formats.iter().map(|&f| (f, Vec::new())).collect();
+    let mut list: Vec<(u32, Vec<u64>)> = formats.iter().map(|&f| (f, Vec::new())).collect();
     for m in 0..count_modifiers {
         let at = modifiers_offset + 24 * m;
         let mask = u64_at(at)?;
@@ -338,14 +348,14 @@ fn format_modifiers(blob: &[u8]) -> Option<Vec<(u32, Vec<String>)>> {
             if mask & (1 << bit) != 0
                 && let Some(entry) = list.get_mut(offset + bit)
             {
-                entry.1.push(modifier_name(modifier));
+                entry.1.push(modifier);
             }
         }
     }
     Some(list)
 }
 
-fn modifier_name(m: u64) -> String {
+pub fn modifier_name(m: u64) -> String {
     match m {
         0 => "LINEAR".into(),
         0x00ff_ffff_ffff_ffff => "INVALID".into(),

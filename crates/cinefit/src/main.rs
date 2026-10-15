@@ -4,6 +4,8 @@
 #[cfg(target_os = "linux")]
 mod appletv;
 mod avr;
+#[cfg(target_os = "linux")]
+mod bench;
 mod capture;
 mod compare;
 mod config;
@@ -92,6 +94,18 @@ enum Command {
     /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
     /// an identity render read back and compared. Touches no display.
     Gpu,
+    /// Time a 4K render into a scanout buffer in each layout the display
+    /// plane takes, and check each renders the same picture as LINEAR, with
+    /// a negative control (#101). Off-screen; for clean numbers, stop the
+    /// cinefit service first.
+    Bench {
+        /// Renders timed per layout, after a warm-up.
+        #[arg(short = 'n', long, default_value_t = 300)]
+        frames: usize,
+        /// The DRM device; by default the first with a connected display.
+        #[arg(long)]
+        card: Option<PathBuf>,
+    },
     /// List what each display device offers: connectors and their EDID's
     /// HDR and colorimetry, the HDR properties, and every plane's formats and
     /// modifiers. Reads only, without taking the display, so it is safe while
@@ -263,6 +277,10 @@ fn main() -> ExitCode {
             sessions.iter().try_for_each(|s| hindsight::run(s, worst))
         }
         Command::Gpu => gpu(),
+        #[cfg(target_os = "linux")]
+        Command::Bench { frames, card } => bench::run(frames, card.as_deref()),
+        #[cfg(not(target_os = "linux"))]
+        Command::Bench { .. } => Err("bench needs Linux: DRM, GBM and Vulkan".into()),
         Command::Replay {
             clips,
             compare,
