@@ -231,6 +231,13 @@ pub struct Output {
     /// The blob on the connector now, and one queued for the next flip.
     hdr_blob: Option<u64>,
     pending_hdr_blob: Option<u64>,
+    /// Whether the lit output signals HDR. `None` while nothing is
+    /// committed.
+    hdr_on_screen: Option<bool>,
+    /// Modesets that went through dark first, into or out of HDR, and how
+    /// long the last one left the output dark.
+    relights: u64,
+    last_dark: Option<Duration>,
     /// `None` when the CRTC has no overlay plane that takes ARGB8888.
     overlay: Option<Overlay>,
 }
@@ -391,6 +398,9 @@ impl Output {
             sdr_bt2020: false,
             hdr_blob: None,
             pending_hdr_blob: None,
+            hdr_on_screen: None,
+            relights: 0,
+            last_dark: None,
             overlay,
         }))
     }
@@ -816,14 +826,44 @@ impl Output {
         let overlay_before = self.overlay_state();
         set.extend(self.overlay_props());
         let req = request(&set);
-        // A test commit first: if another program holds the display, nothing
-        // on screen changes before we find out.
+        // Into or out of HDR the output goes dark first and comes up with the
+        // new signalling, as from off, and as a player does when it switches.
+        // At an unchanged mode amdgpu only rewrites the HDR InfoFrame on the
+        // running signal ("Mode change not required"), and a JVC that never
+        // relocks never reads it: on 2026-10-14 one stayed in SDR through
+        // three live switches into HDR10, and in HDR after a live switch
+        // back, while a start from off was followed every time (#103). The
+        // display resyncs on these switches anyway. Other colour changes
+        // (Colorspace alone) stay live.
+        let hdr_now = self.hdr.is_some();
+        let relight = self.modeset && self.hdr_on_screen.is_some_and(|h| h != hdr_now);
+        let dark_from = Instant::now();
+        // A test commit first: if another program holds the display, or the
+        // new state would be refused, nothing on screen changes (or goes
+        // dark) before we find out.
         let result = commit(
             &self.card,
             AtomicCommitFlags::TEST_ONLY | AtomicCommitFlags::ALLOW_MODESET,
             req.clone(),
         )
+        .and_then(|()| {
+            if relight {
+                // Inactive, planes left bound: the next commit lights it.
+                commit(
+                    &self.card,
+                    AtomicCommitFlags::ALLOW_MODESET,
+                    request(&[(crtc, self.props.active, 0)]),
+                )
+            } else {
+                Ok(())
+            }
+        })
         .and_then(|()| commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, req));
+        self.last_dark = None;
+        if relight && result.is_ok() {
+            self.relights += 1;
+            self.last_dark = Some(dark_from.elapsed());
+        }
         if let Err(e) = result {
             self.put_back_overlay(overlay_before);
             for id in [Some(blob), hdr_blob].into_iter().flatten() {
@@ -839,7 +879,20 @@ impl Output {
             let _ = self.card.destroy_property_blob(old);
         }
         self.modeset = true;
+        self.hdr_on_screen = Some(hdr_now);
         Ok(())
+    }
+
+    /// Modesets that took the output dark first, into or out of HDR (see
+    /// [`Self::modeset`]).
+    pub fn relights(&self) -> u64 {
+        self.relights
+    }
+
+    /// How long the last modeset left the output dark, if it went through
+    /// dark: from the inactive commit to the output lit again.
+    pub fn last_dark(&self) -> Option<Duration> {
+        self.last_dark
     }
 
     /// HDR metadata for the next [`Self::modeset`], or `None` for SDR.
@@ -1041,6 +1094,7 @@ impl Output {
         });
         let outcome = outcome?;
         self.modeset = false;
+        self.hdr_on_screen = None;
         if let Some(ov) = self.overlay.as_mut() {
             ov.on_screen = None;
             ov.pending = None;
