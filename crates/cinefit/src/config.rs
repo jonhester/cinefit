@@ -64,6 +64,9 @@ pub struct Config {
     /// Find the black bars and crop them out, placing the picture at
     /// constant image height; off, every frame fills the raster as it came.
     pub crop: bool,
+    /// Record the detector's readings and a small fingerprint of every frame
+    /// shown, for tuning the detector (#91).
+    pub record: bool,
     /// The screen's aspect: the band of the raster that lands on it.
     pub screen_ar: Ratio,
     /// Content wider than this is trimmed at the sides to fill the screen's
@@ -147,6 +150,7 @@ impl Default for Config {
             curve: Curve::Spline,
             source_peak: 0,
             crop: true,
+            record: true,
             screen_ar: Ratio::of(2.35),
             fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
@@ -391,6 +395,15 @@ static SETTINGS: &[Setting] = &[
                screen's band of the raster. off: every frame fills the raster as it came.",
         get: |c| Value::Name(if c.crop { "on" } else { "off" }.into()),
         set: |c, v| c.crop = name(v) == "on",
+    },
+    Setting {
+        key: "detect.record",
+        kind: Kind::Choice(&["on", "off"]),
+        apply: Apply::Live,
+        help: "on: record what the bar detector measured on every frame shown, and a small fingerprint of the \
+               picture, under ~/cinefit-clips/caught, for tuning the detector (about 150 MB a film). No pictures.",
+        get: |c| Value::Name(if c.record { "on" } else { "off" }.into()),
+        set: |c, v| c.record = name(v) == "on",
     },
     Setting {
         key: "geometry.screen_ar",

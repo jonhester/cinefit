@@ -67,6 +67,19 @@ impl Content {
         }
     }
 
+    /// A short name for the dataset's records (#91).
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Sdr(_) => "sdr",
+            Self::Hdr10(_) => "hdr10",
+            Self::Hlg(_) => "hlg",
+            Self::Lldv(_) => "lldv",
+            Self::Tunnel => "tunnel",
+            Self::Rgb(_) => "rgb",
+            Self::Unsupported(_) => "unsupported",
+        }
+    }
+
     /// Low-latency Dolby Vision or the tunnel.
     pub(crate) fn is_dolby_vision(self) -> bool {
         matches!(self, Self::Lldv(_) | Self::Tunnel)

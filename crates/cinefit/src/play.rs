@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, Config};
 use crate::content::*;
+use crate::dataset;
 use crate::follow;
 use crate::menu::Menu;
 use crate::osd::InfoText;
@@ -299,6 +300,8 @@ struct CropFinder {
     /// The last frame was one the detector does not read, and the crop went
     /// to full frame for it.
     unread: bool,
+    /// Make each frame's fingerprint for the dataset (`detect.record`, #91).
+    thumbs: bool,
 }
 
 /// What the detector made of one frame.
@@ -310,6 +313,11 @@ struct Found {
     change: Option<(Crop, &'static str)>,
     /// The frame's brightest luma code (10-bit), YCbCr frames only.
     peak: Option<u16>,
+    /// What the detector measured, and whether it saw a cut, when it ran:
+    /// the dataset's reading (#91).
+    reading: Option<(cinefit_detect::bars::Observation, bool)>,
+    /// The frame's fingerprint for the dataset, YCbCr frames only.
+    thumb: Option<[u8; dataset::THUMB]>,
 }
 
 /// The brightest luma code in a frame, from every 16th row: enough to see
@@ -326,6 +334,56 @@ fn peak_luma(v: &V210<'_>) -> u16 {
     peak
 }
 
+/// The run's dataset session (#91), opened on the first frame recorded.
+#[derive(Default)]
+struct Dataset {
+    recorder: Option<dataset::Recorder>,
+    /// Opening it failed once: not tried again this run.
+    failed: bool,
+    next: u64,
+}
+
+impl Dataset {
+    /// Records one frame, when `on` (the `detect.record` setting).
+    fn record(&mut self, on: bool, found: &Found, t: f64, epoch: u32, content: Content) {
+        if !on || self.failed {
+            return;
+        }
+        if self.recorder.is_none() {
+            match dataset::default_root()
+                .ok_or_else(|| std::io::Error::other("no HOME"))
+                .and_then(|r| dataset::Recorder::start(dataset::session_dir(&r)))
+            {
+                Ok(r) => {
+                    info!("dataset: recording to {}", r.dir().display());
+                    self.recorder = Some(r);
+                }
+                Err(e) => {
+                    warn!("dataset: not recorded: {e}");
+                    self.failed = true;
+                    return;
+                }
+            }
+        }
+        let crop = match found.source {
+            geo::Source::Rows { top, bottom } => (top, bottom),
+            _ => (0, 0),
+        };
+        if let Some(r) = self.recorder.as_mut() {
+            r.record(dataset::Record {
+                index: self.next,
+                time: t,
+                epoch,
+                content: content.tag(),
+                crop,
+                reading: found.reading,
+                thumb: found.thumb,
+            });
+            self.next += 1;
+        }
+    }
+}
+
 impl CropFinder {
     fn find(
         &mut self,
@@ -335,16 +393,22 @@ impl CropFinder {
         t: f64,
         epoch: u32,
     ) -> Found {
-        let peak = bytes
+        let v210 = bytes
             .filter(|_| matches!(kind, Kind::Ycbcr(_)))
-            .and_then(|b| V210::new(b, info.width, info.height, info.row_bytes))
-            .map(|v| peak_luma(&v));
+            .and_then(|b| V210::new(b, info.width, info.height, info.row_bytes));
+        let peak = v210.as_ref().map(peak_luma);
+        let thumb = v210
+            .as_ref()
+            .filter(|_| self.thumbs)
+            .map(|v| dataset::thumbnail(v));
         if !self.on {
             return Found {
                 source: geo::Source::Whole,
                 ms: None,
                 change: None,
                 peak,
+                reading: None,
+                thumb,
             };
         }
         // A crop belongs to the picture it was found on: held over RGB or the
@@ -364,16 +428,17 @@ impl CropFinder {
                 ms: None,
                 change,
                 peak,
+                reading: None,
+                thumb,
             };
         }
         self.unread = false;
-        let (mut took, mut change) = (None, None);
-        if let Some(b) = bytes
-            && let Some(v) = V210::new(b, info.width, info.height, info.row_bytes)
-        {
+        let (mut took, mut change, mut reading) = (None, None, None);
+        if let Some(v) = &v210 {
             let t0 = Instant::now();
-            let d = self.det.push(&v, t, epoch);
+            let (d, obs, cut) = self.det.push_reading(v, t, epoch);
             took = Some(ms(t0));
+            reading = Some((obs, cut));
             if d.changed {
                 self.crops += 1;
                 change = Some((d.crop, d.diag.reason));
@@ -388,6 +453,8 @@ impl CropFinder {
             ms: took,
             change,
             peak,
+            reading,
+            thumb,
         }
     }
 }
@@ -824,7 +891,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         on: cfg.crop,
         crops: 0,
         unread: false,
+        thumbs: cfg.record,
     };
+    // The detector's dataset (#91): a session directory, opened on the first
+    // frame recorded, so a run with nothing coming in leaves none.
+    let mut dataset = Dataset::default();
     // For the info panel: the last ten seconds' timings, and when and why
     // the crop last changed.
     let window = RefCell::new(Window::default());
@@ -864,6 +935,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 (0.0, 1),
             )?;
             noted(&found, &first_info, 0.0);
+            // Recorded too: the policy saw it, so a replay of the readings
+            // must see it as well to reach the same crops.
+            if let Some(content) = start_content {
+                dataset.record(cfg.record, &found, 0.0, 1, content);
+            }
             let source = found.source;
             let view = view_for(
                 (first_info.width, first_info.height),
@@ -1130,6 +1206,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // here.
                 match key {
                     "detect.crop" => finder.on = cfg.crop,
+                    "detect.record" => finder.thumbs = cfg.record,
                     "geometry.screen_ar" => {
                         win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
                         ui.set_band((win.y, win.h));
@@ -1386,6 +1463,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     let started = Instant::now();
                     let t = run_started.elapsed().as_secs_f64();
                     let frame_info = *frame.info();
+                    let epoch = counts.format_changes as u32 + returns + 1;
                     let (found, uploaded) = detect_and_upload(
                         &pl,
                         &mut finder,
@@ -1394,9 +1472,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         last_tunnel.as_ref(),
                         &mut sources,
                         &mut stages,
-                        (t, counts.format_changes as u32 + returns + 1),
+                        (t, epoch),
                     )?;
                     noted(&found, &frame_info, t);
+                    dataset.record(cfg.record, &found, t, epoch, content);
                     let source = found.source;
                     last_source = source;
                     let view = view_for(
@@ -1622,6 +1701,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         counts.metadata,
         counts.refused
     );
+    if let Some(r) = dataset.recorder {
+        match r.finish() {
+            Ok(s) => info!(
+                "dataset: {} frames recorded to {}, {} dropped",
+                s.frames,
+                s.dir.display(),
+                s.dropped
+            ),
+            Err(e) => warn!("dataset: writing failed: {e}"),
+        }
+    }
     if cfg.crop {
         let shares: Vec<String> = finder
             .det
@@ -1781,6 +1871,7 @@ mod tests {
             on: true,
             crops: 0,
             unread: false,
+            thumbs: false,
         };
         let sdr = Kind::Ycbcr(YcbcrColor {
             matrix: Matrix::Bt2020Nc,

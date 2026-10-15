@@ -6,6 +6,8 @@ mod compare;
 mod config;
 #[cfg(target_os = "linux")]
 mod content;
+#[cfg(target_os = "linux")]
+mod dataset;
 mod follow;
 #[cfg(target_os = "linux")]
 mod menu;
