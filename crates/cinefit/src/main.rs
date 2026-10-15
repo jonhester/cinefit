@@ -249,6 +249,12 @@ enum Command {
         /// render, with the display untouched.
         #[arg(long)]
         dry_run: bool,
+        /// Scan out of LINEAR buffers, as before #101, instead of the tiled
+        /// layout the display and the GPU agree on: for comparing the two.
+        /// (A tiled layout that fails to render, or renders wrongly, is
+        /// caught at start and LINEAR used without it.)
+        #[arg(long)]
+        linear_scanout: bool,
     },
     /// Show what the remote's and keyboards' buttons mean to cinefit, as
     /// they are pressed. Takes the keyboards from anything else while it
@@ -354,6 +360,7 @@ fn main() -> ExitCode {
             sets,
             no_pstate,
             dry_run,
+            linear_scanout,
         } => {
             let file = config.clone().unwrap_or_else(config::default_path);
             load_config(config.as_deref(), &sets).and_then(|config| {
@@ -366,8 +373,11 @@ fn main() -> ExitCode {
                     card,
                     config,
                     (file, saved),
-                    !no_pstate,
-                    dry_run,
+                    Switches {
+                        pstate: !no_pstate,
+                        dry_run,
+                        linear_scanout,
+                    },
                 ))
             })
         }
@@ -797,8 +807,7 @@ fn play_options(
     card: Option<PathBuf>,
     config: config::Config,
     file: (PathBuf, config::Config),
-    pstate: bool,
-    dry_run: bool,
+    switches: Switches,
 ) -> play::Options {
     play::Options {
         seconds,
@@ -806,9 +815,17 @@ fn play_options(
         card,
         config,
         file,
-        pstate,
-        dry_run,
+        pstate: switches.pstate,
+        dry_run: switches.dry_run,
+        linear_scanout: switches.linear_scanout,
     }
+}
+
+/// `play`'s one-run switches, as flags so none is left on in a file.
+struct Switches {
+    pstate: bool,
+    dry_run: bool,
+    linear_scanout: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -823,8 +840,7 @@ fn play_options(
     _card: Option<PathBuf>,
     _config: config::Config,
     _file: (PathBuf, config::Config),
-    _pstate: bool,
-    _dry_run: bool,
+    _switches: Switches,
 ) {
 }
 

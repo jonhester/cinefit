@@ -87,6 +87,124 @@ pub struct Options {
     /// Everything up to the modeset (pre-roll, mode, signalling, the first
     /// render into a scanout buffer), then stop: the display is not touched.
     pub dry_run: bool,
+    /// LINEAR scanout buffers, as before #101, for comparing.
+    pub linear_scanout: bool,
+}
+
+/// The scanout buffers, each imported as a render target: the buffers'
+/// indices, the targets, their pixel format and the layout GBM chose.
+type Scanouts<'p> = (Vec<usize>, Vec<cinefit_render::Texture<'p>>, u32, u64);
+
+/// Why a set of scanout buffers could not be made, and the layout to blame
+/// when there is one.
+struct Failed {
+    layout: Option<u64>,
+    error: Box<dyn Error>,
+}
+
+/// Renders a picture that places every pixel by position into `target`
+/// (scanout buffer `frame`) and reads it back through GBM, which detiles: a
+/// layout the renderer writes wrongly comes back moved or scrambled. Once at
+/// start; about a tenth of a second at 4K.
+pub(crate) fn renders_right(
+    out: &cinefit_kms::Output,
+    pl: &Placebo,
+    frame: usize,
+    target: &cinefit_render::Texture<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let d = out.export(frame)?;
+    let (w, h) = (d.width as usize, d.height as usize);
+    // Red counts across, green down, blue the 256-pixel block: no two
+    // pixels within a block alike, and blocks told apart.
+    let px = |x: usize, y: usize| [x as u8, y as u8, ((x / 256) * 16 + y / 256) as u8, 255];
+    let rgba: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).flat_map(move |x| px(x, y)))
+        .collect();
+    let src = pl.upload_rgba8(w as u32, h as u32, &rgba)?;
+    pl.render(&src, target, 0.0)?;
+    let fourcc = d.fourcc;
+    let wrong = out.read_scanout(frame, |bytes, stride| {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let o = y * stride + x * 4;
+                let got = cinefit_kms::scanout::decode(
+                    fourcc,
+                    bytes[o..o + 4].try_into().expect("4 bytes"),
+                )
+                .map_or([0; 3], |c| c.map(|v| (v * 255.0).round() as u8));
+                let want = px(x, y);
+                (0..3).any(|c| got[c].abs_diff(want[c]) > 1)
+            })
+            .count()
+    })?;
+    if wrong > 0 {
+        return Err(format!(
+            "a test picture came back with {wrong} of {} pixels wrong",
+            w * h
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Makes [`BUFFERS`] scanout buffers for mode `index` in a layout from
+/// `modifiers`, and imports each for the renderer.
+fn scanouts<'p>(
+    out: &mut cinefit_kms::Output,
+    pl: &'p Placebo,
+    index: usize,
+    modifiers: &[u64],
+) -> Result<Scanouts<'p>, Failed> {
+    let unblamed = |e: Box<dyn Error>| Failed {
+        layout: None,
+        error: e,
+    };
+    let (mut buffers, mut targets) = (Vec::new(), Vec::new());
+    let (mut fourcc, mut modifier) = (0, 0);
+    for i in 0..BUFFERS {
+        let b = match out.create_scanout_in(index, modifiers) {
+            Ok(b) => b,
+            Err(cinefit_kms::Error::Planes(m, n)) => {
+                return Err(Failed {
+                    layout: Some(m),
+                    error: format!("a layout of {n} planes").into(),
+                });
+            }
+            Err(e) => return Err(unblamed(e.into())),
+        };
+        let d = out.export(b).map_err(|e| unblamed(e.into()))?;
+        // One layout for all: the log names one, and the read-back for the
+        // info panel takes one.
+        if i > 0 && (d.fourcc, d.modifier) != (fourcc, modifier) {
+            return Err(unblamed(
+                format!(
+                    "GBM chose {} for one buffer and {} for another",
+                    cinefit_kms::modifier_name(modifier),
+                    cinefit_kms::modifier_name(d.modifier)
+                )
+                .into(),
+            ));
+        }
+        (fourcc, modifier) = (d.fourcc, d.modifier);
+        targets.push(
+            pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+                fd: d.fd.as_fd(),
+                width: d.width,
+                height: d.height,
+                fourcc: d.fourcc,
+                modifier: d.modifier,
+                stride: d.stride,
+                offset: d.offset,
+            })
+            .map_err(|e| Failed {
+                layout: Some(d.modifier),
+                error: format!("the renderer will not import it: {e}").into(),
+            })?,
+        );
+        buffers.push(b);
+    }
+    Ok((buffers, targets, fourcc, modifier))
 }
 
 /// Hands frames from the SDK's thread to the mailbox.
@@ -975,25 +1093,77 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     };
 
     let pl = Placebo::new()?;
-    let mut buffers = Vec::new();
-    // The scanout buffers' pixel format, to read one back for the info panel.
-    let mut scan_fourcc = 0;
-    let mut targets = Vec::new();
-    for _ in 0..BUFFERS {
-        let b = out.create_scanout(index)?;
-        let d = out.export(b)?;
-        scan_fourcc = d.fourcc;
-        targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
-            fd: d.fd.as_fd(),
-            width: d.width,
-            height: d.height,
-            fourcc: d.fourcc,
-            modifier: d.modifier,
-            stride: d.stride,
-            offset: d.offset,
-        })?);
-        buffers.push(b);
-    }
+    // The scanout buffers in the layout GBM picks from the plane's list
+    // (#101): tiled where the GPU has one, which `cinefit bench` measured
+    // 20% faster to render into than LINEAR on the RX 6400 and the same
+    // picture to the bit. A layout the renderer will not import, or any other
+    // failure, falls back to LINEAR, as before.
+    let tiled = if opts.linear_scanout {
+        None
+    } else {
+        out.scanout_modifiers()
+            .ok()
+            .filter(|m| m.iter().any(|&m| m != 0))
+    };
+    // GBM picks from the list; a layout that cannot be used (several
+    // planes, refused by the renderer, or rendering wrongly) is taken out
+    // and GBM asked again, down to LINEAR. A failure no layout can be blamed
+    // for goes straight to LINEAR.
+    let before = out.scanout_count();
+    let mut mods = tiled.unwrap_or_else(|| vec![0]);
+    let made = loop {
+        let attempt = scanouts(&mut out, &pl, index, &mods).and_then(|s| {
+            // Imported is not proof it renders: a test picture through each
+            // buffer, read back, must come out right. On a GPU where a tiled
+            // render failed or scrambled, play would otherwise fail at every
+            // restart, or show a scrambled picture.
+            for (&frame, target) in s.0.iter().zip(&s.1) {
+                renders_right(&out, &pl, frame, target).map_err(|e| Failed {
+                    layout: Some(s.3),
+                    error: e,
+                })?;
+            }
+            Ok(s)
+        });
+        match attempt {
+            Ok(s) => break Ok(s),
+            Err(f) if mods == [0] => break Err(f.error),
+            Err(f) => {
+                out.discard_scanouts(before);
+                match f.layout.filter(|&m| m != 0) {
+                    Some(m) => {
+                        info!(
+                            "scanout: {} not usable ({}); asking for another",
+                            cinefit_kms::modifier_name(m),
+                            f.error
+                        );
+                        mods.retain(|&x| x != m);
+                        if mods.iter().all(|&x| x == 0) {
+                            mods = vec![0];
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "scanout: the tiled layouts failed ({}); LINEAR, as before",
+                            f.error
+                        );
+                        mods = vec![0];
+                    }
+                }
+            }
+        }
+    };
+    let (buffers, targets, scan_fourcc, modifier) = made?;
+    info!(
+        "scanout: {} {}{}",
+        String::from_utf8_lossy(&scan_fourcc.to_le_bytes()),
+        cinefit_kms::modifier_name(modifier),
+        if opts.linear_scanout {
+            " (--linear-scanout)"
+        } else {
+            ""
+        }
+    );
 
     // The first picture is rendered before the modeset, so the display's
     // first frame is the source's.

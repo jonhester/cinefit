@@ -66,6 +66,10 @@ pub enum Error {
     /// The operation needs the other kind of frame: CPU-drawn ones are drawn,
     /// GBM ones exported and read back.
     NotScanout,
+    /// GBM chose a layout of several planes (a compressed one, with its
+    /// metadata beside it), which the export and the renderer's import do
+    /// not handle: the layout, and how many planes.
+    Planes(u64, u32),
     /// A queued flip did not complete in time: the display or the driver has
     /// stopped answering.
     NoFlip(Duration),
@@ -85,6 +89,11 @@ impl fmt::Display for Error {
             Error::MissingProperty(p) => write!(f, "the driver has no {p} property"),
             Error::Busy => f.write_str("another program holds the display (DRM master)"),
             Error::NotScanout => f.write_str("wrong kind of frame for this operation"),
+            Error::Planes(m, n) => write!(
+                f,
+                "GBM chose {}, a layout of {n} planes",
+                crate::modifier_name(*m)
+            ),
             Error::NoFlip(waited) => write!(
                 f,
                 "no page-flip event within {} ms: the display or driver stopped answering",
@@ -529,6 +538,21 @@ impl Output {
     ///
     /// If GBM cannot allocate it or the driver will not register it.
     pub fn create_scanout_as(&mut self, index: usize, modifier: u64) -> Result<usize, Error> {
+        self.create_scanout_in(index, &[modifier])
+    }
+
+    /// A scanout buffer the size of mode `index` in whichever of `modifiers`
+    /// GBM thinks best for the plane (#101): given the plane's list, a tiled
+    /// layout where the GPU has one, which it renders into faster than
+    /// LINEAR. A layout of more than one plane (a compressed one, with its
+    /// metadata beside it) is refused: the export and the renderer's import
+    /// handle one.
+    ///
+    /// # Errors
+    ///
+    /// If GBM cannot allocate any of them, it chose a layout of several
+    /// planes, or the driver will not register it.
+    pub fn create_scanout_in(&mut self, index: usize, modifiers: &[u64]) -> Result<usize, Error> {
         let (w, h) = self.modes[index].size();
         if self.gbm.is_none() {
             // A duplicate of the card's fd: the same open file, so GEM handles
@@ -547,10 +571,13 @@ impl Output {
                 w.into(),
                 h.into(),
                 format,
-                [gbm::Modifier::from(modifier)].into_iter(),
+                modifiers.iter().map(|&m| gbm::Modifier::from(m)),
                 gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
             )
             .map_err(io("allocating a GBM scanout buffer"))?;
+        if bo.plane_count() != 1 {
+            return Err(Error::Planes(bo.modifier().into(), bo.plane_count()));
+        }
         let fb = self
             .card
             .add_planar_framebuffer(&bo, FbCmd2Flags::MODIFIERS)
@@ -560,6 +587,23 @@ impl Output {
             fb,
         });
         Ok(self.frames.len() - 1)
+    }
+
+    /// How many scanout buffers have been made.
+    pub fn scanout_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Releases the scanout buffers made after the first `keep`: a set that
+    /// cannot be used is given back before another is made. Only those not
+    /// on screen: call it before the first modeset.
+    pub fn discard_scanouts(&mut self, keep: usize) {
+        for f in self.frames.drain(keep.min(self.frames.len())..) {
+            let _ = self.card.destroy_framebuffer(f.fb);
+            if let FrameBuffer::Dumb(b) = f.buffer {
+                let _ = self.card.destroy_dumb_buffer(b);
+            }
+        }
     }
 
     /// Whether this output has an overlay plane for on-screen text.
