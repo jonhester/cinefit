@@ -508,6 +508,18 @@ impl Dataset {
             {
                 Ok(r) => {
                     info!("dataset: recording to {}", r.dir().display());
+                    // The splitter's EDID, which decides what the player
+                    // sends: a pairing pass's label (#109). Up to two seconds
+                    // over USB, so on a thread of its own.
+                    let dir = r.dir().to_path_buf();
+                    let _ = std::thread::Builder::new()
+                        .name("splitter".into())
+                        .spawn(move || {
+                            if let Some(line) = crate::splitter::note() {
+                                info!("dataset: {line}");
+                                dataset::note_in(&dir, &line);
+                            }
+                        });
                     if let Some(s) = &self.source {
                         r.note(&format!("source: {s}"));
                     }

@@ -27,6 +27,7 @@ mod record;
 mod replay;
 #[cfg(target_os = "linux")]
 mod runlog;
+mod splitter;
 #[cfg(target_os = "linux")]
 mod status;
 #[cfg(target_os = "linux")]

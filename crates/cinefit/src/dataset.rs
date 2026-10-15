@@ -103,6 +103,17 @@ pub fn thumbnail(f: &dyn Samples) -> [u8; THUMB] {
     out
 }
 
+/// Adds a line to `session.txt` in session `dir`, from any thread.
+pub fn note_in(dir: &Path, line: &str) {
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("session.txt"))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// The session directory for a run starting now: `caught/<UTC date-time>`
 /// under `root`.
 pub fn session_dir(root: &Path) -> PathBuf {
@@ -185,14 +196,7 @@ impl Recorder {
     /// Adds a line to the session's `session.txt`: what it was (the source,
     /// later the title, #115). Rare, so written at once.
     pub fn note(&self, line: &str) {
-        use std::io::Write as _;
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.dir.join("session.txt"))
-        {
-            let _ = writeln!(f, "{line}");
-        }
+        note_in(&self.dir, line);
     }
 
     /// Hands a record to the writer; never waits. A full queue drops it.
