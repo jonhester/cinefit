@@ -278,7 +278,9 @@ impl Recorder {
         }
         k.clip
             .offer_as(index, Duration::from_secs_f64(time.max(0.0)), info, bytes);
-        let _ = writeln!(k.why, "{index},{time:.3},{why}");
+        // At once: a few lines a minute, and a look at a pass still running
+        // (cinefit pairs) should see them.
+        let _ = writeln!(k.why, "{index},{time:.3},{why}").and_then(|()| k.why.flush());
         k.kept += 1;
     }
 

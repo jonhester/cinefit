@@ -104,6 +104,13 @@ enum Command {
         a: PathBuf,
         /// The second pass's.
         b: PathBuf,
+        /// Only the first session's frames of this content (tunnel, lldv,
+        /// sdr, hdr10): for a session holding several passes.
+        #[arg(long)]
+        a_content: Option<String>,
+        /// The same for the second session.
+        #[arg(long)]
+        b_content: Option<String>,
     },
     /// Time a 4K render into a scanout buffer in each layout the display
     /// plane takes, and check each renders the same picture as LINEAR, with
@@ -294,7 +301,12 @@ fn main() -> ExitCode {
             sessions.iter().try_for_each(|s| hindsight::run(s, worst))
         }
         Command::Gpu => gpu(),
-        Command::Pairs { a, b } => pairs::run(&a, &b),
+        Command::Pairs {
+            a,
+            b,
+            a_content,
+            b_content,
+        } => pairs::run((&a, a_content.as_deref()), (&b, b_content.as_deref())),
         #[cfg(target_os = "linux")]
         Command::Bench { frames, card } => bench::run(frames, card.as_deref()),
         #[cfg(not(target_os = "linux"))]

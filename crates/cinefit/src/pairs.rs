@@ -174,8 +174,10 @@ pub fn align(a: &Pass, b: &Pass) -> Found {
 }
 
 /// Reads a session's pass: `frames.csv` (cuts, content, which frames have a
-/// thumbnail), `thumbs.bin`, and `frames/kept.csv`.
-pub fn load(session: &Path) -> Result<Pass, Box<dyn Error>> {
+/// thumbnail), `thumbs.bin`, and `frames/kept.csv`. With `content`, only the
+/// frames of that content (`tunnel`, `lldv`, `sdr`, ...): one session can
+/// hold several passes of different kinds, played back to back.
+pub fn load(session: &Path, content: Option<&str>) -> Result<Pass, Box<dyn Error>> {
     let frames = std::fs::read_to_string(session.join("frames.csv"))?;
     let thumbs = std::fs::read(session.join("thumbs.bin"))?;
     let mut pass = Pass::default();
@@ -195,14 +197,23 @@ pub fn load(session: &Path) -> Result<Pass, Box<dyn Error>> {
             .into());
         }
         let index: u64 = f[0].parse()?;
-        pass.content.insert(index, f[3].to_string());
-        if f[7] == "1" {
+        // Read in order whatever the content, to stay in step with
+        // thumbs.bin.
+        let thumb = if f[7] == "1" {
             let Some(t) = thumbs.get(next_thumb * THUMB..(next_thumb + 1) * THUMB) else {
                 break;
             };
-            pass.thumbs
-                .insert(index, t.try_into().expect("THUMB bytes"));
             next_thumb += 1;
+            Some(<[u8; THUMB]>::try_from(t).expect("THUMB bytes"))
+        } else {
+            None
+        };
+        if content.is_some_and(|c| c != f[3]) {
+            continue;
+        }
+        pass.content.insert(index, f[3].to_string());
+        if let Some(t) = thumb {
+            pass.thumbs.insert(index, t);
         }
         if f[8] == "1" {
             pass.cuts.push(index);
@@ -210,20 +221,31 @@ pub fn load(session: &Path) -> Result<Pass, Box<dyn Error>> {
     }
     let kept = std::fs::read_to_string(session.join("frames").join("kept.csv")).unwrap_or_default();
     for line in kept.lines().skip(1) {
-        if let Some(i) = line.split(',').next().and_then(|i| i.parse().ok()) {
+        if let Some(i) = line.split(',').next().and_then(|i| i.parse().ok())
+            && pass.content.contains_key(&i)
+        {
             pass.kept.insert(i);
         }
     }
     Ok(pass)
 }
 
-/// `cinefit pairs A B`: pairs the two sessions' kept frames and writes
-/// `pairs.csv` into A, naming B.
-pub fn run(a_dir: &Path, b_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let (a, b) = (load(a_dir)?, load(b_dir)?);
+/// `cinefit pairs A B`: pairs the two sessions' kept frames, each limited to
+/// a content if given, and writes `pairs[-<a>-<b>].csv` into A.
+pub fn run(
+    (a_dir, a_content): (&Path, Option<&str>),
+    (b_dir, b_content): (&Path, Option<&str>),
+) -> Result<(), Box<dyn Error>> {
+    let (a, b) = (load(a_dir, a_content)?, load(b_dir, b_content)?);
     let found = align(&a, &b);
     let content = |p: &Pass, f: u64| p.content.get(&f).cloned().unwrap_or_default();
-    let mut csv = format!("# A {}\n# B {}\n", a_dir.display(), b_dir.display());
+    let mut csv = format!(
+        "# A {} {}\n# B {} {}\n",
+        a_dir.display(),
+        a_content.unwrap_or("(all)"),
+        b_dir.display(),
+        b_content.unwrap_or("(all)")
+    );
     csv.push_str("a,b,shot,k,corr,a_content,b_content\n");
     for p in &found.pairs {
         let _ = writeln!(
@@ -238,7 +260,8 @@ pub fn run(a_dir: &Path, b_dir: &Path) -> Result<(), Box<dyn Error>> {
             content(&b, p.b)
         );
     }
-    let out = a_dir.join("pairs.csv");
+    let tag = |c: Option<&str>| c.map_or_else(String::new, |c| format!("-{c}"));
+    let out = a_dir.join(format!("pairs{}{}.csv", tag(a_content), tag(b_content)));
     std::fs::write(&out, csv)?;
     println!(
         "A: {} cuts, {} frames kept; B: {} cuts, {} frames kept",
