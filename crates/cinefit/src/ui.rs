@@ -45,6 +45,8 @@ pub enum Slate {
     NoSignal,
     /// The source went away mid-run.
     SignalLost { since: Instant },
+    /// No picture, and the receiver says it is off (#116).
+    ReceiverOff,
     /// A signal held back until it proves what it is (a possible tunnel).
     Identifying { detail: String },
     /// A format nothing renders, and what to change.
@@ -55,6 +57,11 @@ impl Slate {
     fn text(&self, venue: &str, now: Instant) -> SlateText {
         let (state, detail, tone) = match self {
             Slate::NoSignal => ("No signal", String::new(), Tone::Plain),
+            Slate::ReceiverOff => (
+                "Receiver off",
+                "waiting for it to come on".to_string(),
+                Tone::Plain,
+            ),
             Slate::SignalLost { since } => (
                 "Signal lost",
                 format!("{} \u{b7} waiting for the source", ago(now - *since)),
@@ -215,6 +222,8 @@ pub struct Ui {
     last_banner: Option<BannerText>,
     waiting: Option<(BannerText, Waiting)>,
     showing: Option<(BannerText, Instant)>,
+    /// The receiver's input (#116), first on a banner's detail.
+    source: Option<String>,
     /// The last drawing logged: a slate redrawn each minute for its time
     /// logs once.
     logged: String,
@@ -267,6 +276,7 @@ impl Ui {
             last_banner: None,
             waiting: None,
             showing: None,
+            source: None,
             logged: String::new(),
         }
     }
@@ -322,6 +332,17 @@ impl Ui {
     }
 
     /// Banners on or off, from the menu.
+    /// The receiver's input changed (#116). Put on a banner as it goes up,
+    /// not when it is queued: the first one waits out a resync, by when the
+    /// receiver has answered. A new input is a change of its own, so the
+    /// same picture from it has a banner again.
+    pub fn set_source(&mut self, source: Option<String>) {
+        if source != self.source {
+            self.source = source;
+            self.last_banner = None;
+        }
+    }
+
     pub fn set_banners(&mut self, on: bool) {
         self.banners = on;
         if !on {
@@ -461,7 +482,10 @@ impl Ui {
             Some((_, Waiting::Resync(since))) => now - *since >= RESYNC_WAIT,
             None => false,
         };
-        if due && let Some((text, _)) = self.waiting.take() {
+        if due && let Some((mut text, _)) = self.waiting.take() {
+            if let Some(s) = &self.source {
+                text.detail = format!("{s} \u{b7} {}", text.detail);
+            }
             self.showing = Some((text, now));
         }
         let Some((text, from)) = &self.showing else {
@@ -552,6 +576,7 @@ mod tests {
             last_banner: None,
             waiting: None,
             showing: None,
+            source: None,
             logged: String::new(),
         }
     }
@@ -584,6 +609,29 @@ mod tests {
         // The same picture again is no change: no second banner.
         ui.picture(text("HDR10"), false, t0 + Duration::from_secs(10));
         assert!(ui.want(t0 + Duration::from_secs(10)).0.is_none());
+    }
+
+    #[test]
+    fn a_banner_names_the_input_and_a_new_input_is_a_change() {
+        let mut ui = bare(true);
+        let t0 = Instant::now();
+        ui.picture(text("HDR10"), true, t0);
+        // The receiver answers while the banner waits for the resync.
+        ui.set_source(Some("Apple TV".into()));
+        let shown = ui.want(t0 + RESYNC_WAIT);
+        assert!(
+            matches!(&shown.0, Some(Content::Banner(t)) if t.detail == "Apple TV \u{b7} 4K 23.976"),
+            "{shown:?}"
+        );
+        // The same picture from another input has its own banner.
+        let t1 = t0 + Duration::from_secs(20);
+        ui.set_source(Some("Panasonic BD".into()));
+        ui.picture(text("HDR10"), false, t1);
+        let again = ui.want(t1);
+        assert!(
+            matches!(&again.0, Some(Content::Banner(t)) if t.detail == "Panasonic BD \u{b7} 4K 23.976"),
+            "{again:?}"
+        );
     }
 
     #[test]

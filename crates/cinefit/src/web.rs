@@ -223,6 +223,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "input.rgb_range" => ("Input", "RGB range"),
         "input.lldv" => ("Input", "Dolby Vision low latency"),
         "web.port" => ("Web page", "Port"),
+        "avr.denon" => ("Receiver", "Denon AVR (hostname or IP)"),
         _ => ("Other", ""),
     }
 }

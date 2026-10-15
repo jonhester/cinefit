@@ -319,6 +319,33 @@ impl<'f> Style<'f> {
     }
 }
 
+/// `text` in at most two lines of `width` pixels, broken at its " · "
+/// separators; a second line still too wide ends in an ellipsis.
+pub fn wrap(font: &Font, size: f32, text: &str, width: f32) -> Vec<String> {
+    const SEP: &str = " \u{b7} ";
+    if measure(font, size, text) <= width {
+        return vec![text.to_string()];
+    }
+    let parts: Vec<&str> = text.split(SEP).collect();
+    // As many parts on the first line as fit, at least one.
+    let mut n = 1;
+    while n < parts.len() && measure(font, size, &parts[..=n].join(SEP)) <= width {
+        n += 1;
+    }
+    let first = parts[..n].join(SEP);
+    if n == parts.len() {
+        return vec![first];
+    }
+    let mut second = parts[n..].join(SEP);
+    if measure(font, size, &second) > width {
+        while !second.is_empty() && measure(font, size, &format!("{second}\u{2026}")) > width {
+            second.pop();
+        }
+        second.push('\u{2026}');
+    }
+    vec![first, second]
+}
+
 /// The width of `text` in `font` at `size` pixels.
 pub fn measure(font: &Font, size: f32, text: &str) -> f32 {
     let mut w = 0.0;
@@ -600,17 +627,25 @@ pub fn info(c: &mut Canvas<'_>, fonts: &Fonts, area: Area, text: &InfoText) {
             y + 2.0 * INFO_LINE * s,
             &sec.line,
         );
-        c.text(
-            Style::new(
-                &fonts.regular,
-                INFO_DETAIL * s,
-                palette::secondary(),
-                Align::Left,
-            ),
-            x,
-            y + 3.25 * INFO_LINE * s,
-            &sec.detail,
-        );
+        // A detail too wide for the panel goes on to a second line at its
+        // separators; the section has room for two.
+        let width = area.w as f32 - 2.0 * INFO_PAD * s;
+        for (i, part) in wrap(&fonts.regular, INFO_DETAIL * s, &sec.detail, width)
+            .iter()
+            .enumerate()
+        {
+            c.text(
+                Style::new(
+                    &fonts.regular,
+                    INFO_DETAIL * s,
+                    palette::secondary(),
+                    Align::Left,
+                ),
+                x,
+                y + 3.25 * INFO_LINE * s + i as f32 * 1.25 * INFO_DETAIL * s,
+                part,
+            );
+        }
         y += INFO_SECTION * s;
     }
 }
@@ -856,6 +891,26 @@ pub fn test_card(c: &mut Canvas<'_>, fonts: &Fonts, enc: Encoding) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_detail_wraps_at_its_separators() {
+        let fonts = Fonts::load();
+        let f = &fonts.regular;
+        let text = "Apple TV \u{b7} 3840 \u{d7} 2160 \u{b7} 23.976 \u{b7} YCbCr 4:2:2 10-bit \u{b7} brightest 128 nits, above the 96 assumed";
+        let width = measure(f, 30.0, text) * 0.6;
+        let lines = wrap(f, 30.0, text, width);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| measure(f, 30.0, l) <= width),
+            "{lines:?}"
+        );
+        // Broken at a separator: nothing lost, nothing split mid-part.
+        assert_eq!(lines.join(" \u{b7} "), text);
+        // Short text stays one line; text too long for two ends in "...".
+        assert_eq!(wrap(f, 30.0, "SDR", width), ["SDR"]);
+        let narrow = wrap(f, 30.0, text, measure(f, 30.0, text) * 0.3);
+        assert!(narrow[1].ends_with('\u{2026}'), "{narrow:?}");
+    }
+
     use super::*;
 
     #[test]
