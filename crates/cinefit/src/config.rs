@@ -220,7 +220,26 @@ pub struct Setting {
     pub apply: Apply,
     pub help: &'static str,
     get: fn(&Config) -> Value,
-    set: fn(&mut Config, &Value),
+    set: Set,
+}
+
+/// A value as a setting's kind has checked it.
+enum Checked<'a> {
+    Int(i64),
+    Float(f64),
+    Name(&'a str),
+    Ratio(Ratio),
+}
+
+/// A setting's setter, taking the value as its kind has already checked
+/// it: a whole number, a number, a name or a ratio. There is no loose
+/// conversion that could turn a value of the wrong type into 0 or "" (#100).
+#[derive(Clone, Copy)]
+enum Set {
+    Int(fn(&mut Config, i64)),
+    Float(fn(&mut Config, f64)),
+    Name(fn(&mut Config, &str)),
+    Ratio(fn(&mut Config, Ratio)),
 }
 
 /// A setting's value, as the file and the command line hold it.
@@ -241,43 +260,12 @@ impl fmt::Display for Value {
     }
 }
 
-fn int(v: &Value) -> i64 {
-    match v {
-        Value::Int(v) => *v,
-        Value::Float(v) => *v as i64,
-        Value::Name(_) => 0,
-    }
-}
-
-fn name(v: &Value) -> &str {
-    match v {
-        Value::Name(n) => n,
-        Value::Int(_) | Value::Float(_) => "",
-    }
-}
-
-fn float(v: &Value) -> f64 {
-    match v {
-        Value::Float(v) => *v,
-        Value::Int(v) => *v as f64,
-        Value::Name(_) => 0.0,
-    }
-}
-
 /// A ratio's value as the file writes it: a number, or `"W:H"` as given.
 fn ratio_value(r: Ratio) -> Value {
     if r.h == 1.0 {
         Value::Float(r.w)
     } else {
         Value::Name(r.to_string())
-    }
-}
-
-fn ratio(v: &Value) -> Ratio {
-    match v {
-        Value::Name(t) => Ratio::parse(t).unwrap_or(Ratio::of(0.0)),
-        Value::Float(x) => Ratio::of(*x),
-        Value::Int(n) => Ratio::of(*n as f64),
     }
 }
 
@@ -291,7 +279,7 @@ static SETTINGS: &[Setting] = &[
         apply: Apply::Start,
         help: "The panel's width in pixels: the output's size. 4096 for a 17:9 4K projector.",
         get: |c| Value::Int(c.width.into()),
-        set: |c, v| c.width = int(v) as u16,
+        set: Set::Int(|c, v| c.width = v as u16),
     },
     Setting {
         key: "output.height",
@@ -302,7 +290,7 @@ static SETTINGS: &[Setting] = &[
         apply: Apply::Start,
         help: "The panel's height in pixels.",
         get: |c| Value::Int(c.height.into()),
-        set: |c, v| c.height = int(v) as u16,
+        set: Set::Int(|c, v| c.height = v as u16),
     },
     Setting {
         key: "output.mode",
@@ -320,13 +308,13 @@ static SETTINGS: &[Setting] = &[
                 .into(),
             )
         },
-        set: |c, v| {
-            c.mode = if name(v) == "passthrough" {
+        set: Set::Name(|c, v| {
+            c.mode = if v == "passthrough" {
                 OutputMode::Passthrough
             } else {
                 OutputMode::Sdr2020
             }
-        },
+        }),
     },
     Setting {
         key: "output.white_nits",
@@ -336,7 +324,7 @@ static SETTINGS: &[Setting] = &[
                Also the peak a player's low-latency Dolby Vision is mapped to, which passes one to one: set \
                it to what the EDID upstream declares (96 for the usual low-latency Dolby Vision EDIDs).",
         get: |c| Value::Int(c.white_nits.into()),
-        set: |c, v| c.white_nits = int(v) as u16,
+        set: Set::Int(|c, v| c.white_nits = v as u16),
     },
     Setting {
         key: "output.wait_hz",
@@ -347,7 +335,7 @@ static SETTINGS: &[Setting] = &[
         apply: Apply::Modeset,
         help: "The output's rate while no source is playing, with black on screen. A source that starts at the same rate (and SDR) comes up without a resync: 23.976 for an Apple TV set to 23.976, 59.94 for a player whose menus are 59.94.",
         get: |c| Value::Float(c.wait_hz),
-        set: |c, v| c.wait_hz = float(v),
+        set: Set::Float(|c, v| c.wait_hz = v),
     },
     Setting {
         key: "input.rgb_range",
@@ -364,13 +352,13 @@ static SETTINGS: &[Setting] = &[
                 .into(),
             )
         },
-        set: |c, v| {
-            c.rgb_range = if name(v) == "full" {
+        set: Set::Name(|c, v| {
+            c.rgb_range = if v == "full" {
                 Levels::Full
             } else {
                 Levels::Limited
             }
-        },
+        }),
     },
     Setting {
         key: "input.lldv",
@@ -379,7 +367,7 @@ static SETTINGS: &[Setting] = &[
         help: "on: YCbCr input labelled SDR BT.2020 is a player's low-latency Dolby Vision, PQ already mapped \
                to output.white_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
         get: |c| Value::Name(if c.lldv { "on" } else { "off" }.into()),
-        set: |c, v| c.lldv = name(v) == "on",
+        set: Set::Name(|c, v| c.lldv = v == "on"),
     },
     Setting {
         key: "tonemap.curve",
@@ -387,7 +375,7 @@ static SETTINGS: &[Setting] = &[
         apply: Apply::Live,
         help: "The tone curve for HDR into SDR output: libplacebo's, by name.",
         get: |c| Value::Name(c.curve.name().into()),
-        set: |c, v| c.curve = Curve::from_name(name(v)).unwrap_or(Curve::Spline),
+        set: Set::Name(|c, v| c.curve = Curve::from_name(v).unwrap_or(Curve::Spline)),
     },
     Setting {
         key: "tonemap.source_peak",
@@ -396,7 +384,7 @@ static SETTINGS: &[Setting] = &[
         help: "The HDR10 source's peak, in nits, that the curve maps from, in place of its MaxCLL or \
                mastering peak; 0 uses the metadata.",
         get: |c| Value::Int(c.source_peak.into()),
-        set: |c, v| c.source_peak = int(v) as u16,
+        set: Set::Int(|c, v| c.source_peak = v as u16),
     },
     Setting {
         key: "detect.crop",
@@ -405,7 +393,7 @@ static SETTINGS: &[Setting] = &[
         help: "on: find the black bars and crop them out, the picture placed at constant image height in the \
                screen's band of the raster. off: every frame fills the raster as it came.",
         get: |c| Value::Name(if c.crop { "on" } else { "off" }.into()),
-        set: |c, v| c.crop = name(v) == "on",
+        set: Set::Name(|c, v| c.crop = v == "on"),
     },
     Setting {
         key: "detect.record",
@@ -414,7 +402,7 @@ static SETTINGS: &[Setting] = &[
         help: "on: record what the bar detector measured on every frame shown, and a small fingerprint of the \
                picture, under ~/cinefit-clips/caught, for tuning the detector (about 150 MB a film). No pictures.",
         get: |c| Value::Name(if c.record { "on" } else { "off" }.into()),
-        set: |c, v| c.record = name(v) == "on",
+        set: Set::Name(|c, v| c.record = v == "on"),
     },
     Setting {
         key: "geometry.screen_ar",
@@ -427,7 +415,7 @@ static SETTINGS: &[Setting] = &[
         help: "The screen's aspect ratio: with the lens set so the raster's width fills the screen, the band of \
                the raster that lands on it. 2.35 for a 2.35:1 screen; a ratio may be written \"16:9\".",
         get: |c| ratio_value(c.screen_ar),
-        set: |c, v| c.screen_ar = ratio(v),
+        set: Set::Ratio(|c, v| c.screen_ar = v),
     },
     Setting {
         key: "geometry.fill_max_ar",
@@ -441,7 +429,7 @@ static SETTINGS: &[Setting] = &[
                sliver at each side (2.39 and 2.40 on a 2.35 screen give up about 1% a side and show no bars). \
                Wider content (2.55, 2.76) keeps its full width with thin bars inside the screen. 0 is off.",
         get: |c| ratio_value(c.fill_max_ar),
-        set: |c, v| c.fill_max_ar = ratio(v),
+        set: Set::Ratio(|c, v| c.fill_max_ar = v),
     },
     Setting {
         key: "slate.venue",
@@ -450,7 +438,7 @@ static SETTINGS: &[Setting] = &[
         help: "The theater's name, shown on the waiting slate above what cinefit is waiting for. Empty: no \
                name, only the state.",
         get: |c| Value::Name(c.venue.clone()),
-        set: |c, v| c.venue = name(v).trim().to_string(),
+        set: Set::Name(|c, v| c.venue = v.trim().to_string()),
     },
     Setting {
         key: "osd.banners",
@@ -459,7 +447,7 @@ static SETTINGS: &[Setting] = &[
         help: "on: a short banner when the picture type changes (Dolby Vision, HDR10, SDR), saying what came in \
                and what happens to it; after the projector's resync when the change needs one.",
         get: |c| Value::Name(if c.banners { "on" } else { "off" }.into()),
-        set: |c, v| c.banners = name(v) == "on",
+        set: Set::Name(|c, v| c.banners = v == "on"),
     },
     Setting {
         key: "avr.denon",
@@ -469,7 +457,7 @@ static SETTINGS: &[Setting] = &[
                input is on, by its name on the receiver, and whether the receiver is on, for the info panel, the \
                slate and the detector's dataset. Reads only. Empty: none.",
         get: |c| Value::Name(c.denon.clone()),
-        set: |c, v| c.denon = name(v).trim().to_string(),
+        set: Set::Name(|c, v| c.denon = v.trim().to_string()),
     },
     Setting {
         key: "atv.host",
@@ -480,7 +468,7 @@ static SETTINGS: &[Setting] = &[
                the pairing is kept in atv-credentials beside this file. Some apps say nothing of what they \
                play. Empty: none.",
         get: |c| Value::Name(c.atv_host.clone()),
-        set: |c, v| c.atv_host = name(v).trim().to_string(),
+        set: Set::Name(|c, v| c.atv_host = v.trim().to_string()),
     },
     Setting {
         key: "atv.input",
@@ -491,7 +479,7 @@ static SETTINGS: &[Setting] = &[
                dataset, only while the receiver is on it, so a paused show does not linger over a disc. \
                Empty: always, as without a receiver.",
         get: |c| Value::Name(c.atv_input.clone()),
-        set: |c, v| c.atv_input = name(v).trim().to_string(),
+        set: Set::Name(|c, v| c.atv_input = v.trim().to_string()),
     },
     Setting {
         key: "web.port",
@@ -500,7 +488,7 @@ static SETTINGS: &[Setting] = &[
         help: "The port of the web page with cinefit's status and settings, open to the home network: \
                http://<this machine>:8080. 0: no web page. Above 1023, as it runs without root.",
         get: |c| Value::Int(c.web_port.into()),
-        set: |c, v| c.web_port = int(v) as u16,
+        set: Set::Int(|c, v| c.web_port = v as u16),
     },
 ];
 
@@ -558,27 +546,46 @@ impl Setting {
             value: v.to_string(),
             range: self.range(),
         };
-        match (self.kind, v) {
-            (Kind::Int { min, max }, Value::Int(n)) if (min..=max).contains(n) => {}
-            (Kind::Choice(names), Value::Name(n)) if names.contains(&n.as_str()) => {}
-            (Kind::Float { min, max }, Value::Float(x)) if (min..=max).contains(x) => {}
-            // A whole number where a ratio goes: 2 for 2.0.
-            (Kind::Float { min, max }, Value::Int(n)) if (min..=max).contains(&(*n as f64)) => {}
+        // The value as its kind takes it, once checked; `None` if it is not.
+        let checked = match (self.kind, v) {
+            (Kind::Int { min, max }, Value::Int(n)) if (min..=max).contains(n) => {
+                Some(Checked::Int(*n))
+            }
+            (Kind::Choice(names), Value::Name(n)) if names.contains(&n.as_str()) => {
+                Some(Checked::Name(n))
+            }
+            (Kind::Float { min, max }, Value::Float(x)) if (min..=max).contains(x) => {
+                Some(Checked::Float(*x))
+            }
+            // A whole number where a number goes: 2 for 2.0.
+            (Kind::Float { min, max }, Value::Int(n)) if (min..=max).contains(&(*n as f64)) => {
+                Some(Checked::Float(*n as f64))
+            }
             // Control characters would draw as nothing, or break the file.
             (Kind::Text { max }, Value::Name(t))
-                if t.chars().count() <= max && !t.chars().any(char::is_control) => {}
-            (Kind::Ratio { min, max, off }, v)
-                if {
-                    let r = match v {
-                        Value::Name(t) => Ratio::parse(t),
-                        Value::Float(x) => Some(Ratio::of(*x)),
-                        Value::Int(n) => Some(Ratio::of(*n as f64)),
-                    };
-                    r.is_some_and(|r| (min..=max).contains(&r.value()) || (off && r.value() == 0.0))
-                } => {}
+                if t.chars().count() <= max && !t.chars().any(char::is_control) =>
+            {
+                Some(Checked::Name(t))
+            }
+            (Kind::Ratio { min, max, off }, v) => match v {
+                Value::Name(t) => Ratio::parse(t),
+                Value::Float(x) => Some(Ratio::of(*x)),
+                Value::Int(n) => Some(Ratio::of(*n as f64)),
+            }
+            .filter(|r| (min..=max).contains(&r.value()) || (off && r.value() == 0.0))
+            .map(Checked::Ratio),
+            _ => None,
+        };
+        // A setter of another type than its kind would be a mistake in the
+        // table: refused like a bad value, never defaulted (and a test puts
+        // every setting's own value through, so it cannot ship).
+        match (self.set, checked.ok_or_else(bad)?) {
+            (Set::Int(f), Checked::Int(n)) => f(c, n),
+            (Set::Float(f), Checked::Float(x)) => f(c, x),
+            (Set::Name(f), Checked::Name(n)) => f(c, n),
+            (Set::Ratio(f), Checked::Ratio(r)) => f(c, r),
             _ => return Err(bad()),
         }
-        (self.set)(c, v);
         Ok(())
     }
 }
@@ -920,6 +927,52 @@ mod tests {
                 current = section;
             }
         }
+    }
+
+    /// Every setter takes the type its kind checks (#100): each setting's
+    /// own value, and a changed one, go through `put` and read back. A
+    /// setter of the wrong type would be refused here instead of writing 0.
+    #[test]
+    fn every_setting_takes_its_own_value_and_reads_back() {
+        let mut c = Config::default();
+        for s in settings() {
+            let own = (s.get)(&c);
+            s.put(&mut c, &own)
+                .unwrap_or_else(|e| panic!("{}: its own value {own:?} refused: {e}", s.key));
+            assert_eq!((s.get)(&c), own, "{}", s.key);
+            // Another value of the kind, where there is one.
+            let other = match s.kind {
+                Kind::Int { min, .. } => Some(Value::Int(min)),
+                Kind::Float { max, .. } => Some(Value::Float(max)),
+                Kind::Choice(names) => names.last().map(|n| Value::Name((*n).into())),
+                Kind::Text { .. } => Some(Value::Name("x".into())),
+                Kind::Ratio { min, .. } => Some(Value::Float(min)),
+            };
+            if let Some(v) = other {
+                s.put(&mut c, &v)
+                    .unwrap_or_else(|e| panic!("{}: {v:?} refused: {e}", s.key));
+                assert_eq!((s.get)(&c), v, "{}", s.key);
+            }
+        }
+    }
+
+    /// A value of the wrong type is an error, not a zero or an empty name.
+    #[test]
+    fn a_value_of_the_wrong_type_is_refused() {
+        let mut c = Config::default();
+        let find = |k: &str| settings().iter().find(|s| s.key == k).unwrap();
+        assert!(
+            find("output.width")
+                .put(&mut c, &Value::Name("wide".into()))
+                .is_err()
+        );
+        assert!(find("slate.venue").put(&mut c, &Value::Int(3)).is_err());
+        assert!(
+            find("output.wait_hz")
+                .put(&mut c, &Value::Name("24".into()))
+                .is_err()
+        );
+        assert_eq!(c, Config::default(), "nothing changed");
     }
 
     #[test]
