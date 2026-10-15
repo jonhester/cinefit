@@ -151,9 +151,19 @@ fn scanouts<'p>(
 ) -> Result<Scanouts<'p>, Box<dyn Error>> {
     let (mut buffers, mut targets) = (Vec::new(), Vec::new());
     let (mut fourcc, mut modifier) = (0, 0);
-    for _ in 0..BUFFERS {
+    for i in 0..BUFFERS {
         let b = out.create_scanout_in(index, modifiers)?;
         let d = out.export(b)?;
+        // One layout for all: the log names one, and the read-back for the
+        // info panel takes one.
+        if i > 0 && (d.fourcc, d.modifier) != (fourcc, modifier) {
+            return Err(format!(
+                "GBM chose {} for one buffer and {} for another",
+                cinefit_kms::modifier_name(modifier),
+                cinefit_kms::modifier_name(d.modifier)
+            )
+            .into());
+        }
         (fourcc, modifier) = (d.fourcc, d.modifier);
         targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
             fd: d.fd.as_fd(),
@@ -1070,11 +1080,16 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let before = out.scanout_count();
     let made = match &tiled {
         Some(mods) => scanouts(&mut out, &pl, index, mods)
-            // Imported is not proof it renders: a test picture through the
-            // first buffer, read back, must come out right, or LINEAR. On a
-            // GPU where a tiled render failed or scrambled, play would
-            // otherwise fail at every restart, or show a scrambled picture.
-            .and_then(|s| renders_right(&out, &pl, s.0[0], &s.1[0]).map(|()| s))
+            // Imported is not proof it renders: a test picture through each
+            // buffer, read back, must come out right, or LINEAR. On a GPU
+            // where a tiled render failed or scrambled, play would otherwise
+            // fail at every restart, or show a scrambled picture.
+            .and_then(|s| {
+                for (&frame, target) in s.0.iter().zip(&s.1) {
+                    renders_right(&out, &pl, frame, target)?;
+                }
+                Ok(s)
+            })
             .or_else(|e| {
                 warn!("scanout: the tiled layouts failed ({e}); LINEAR, as before");
                 out.discard_scanouts(before);
