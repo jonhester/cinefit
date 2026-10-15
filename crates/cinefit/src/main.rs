@@ -20,6 +20,7 @@ mod hindsight;
 mod menu;
 #[cfg(target_os = "linux")]
 mod osd;
+mod pairs;
 #[cfg(target_os = "linux")]
 mod play;
 mod record;
@@ -94,6 +95,15 @@ enum Command {
     /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
     /// an identity render read back and compared. Touches no display.
     Gpu,
+    /// Pair the frames two passes of a title both kept (#109): a Dolby
+    /// Vision tunnel pass and a low-latency one, each recorded with
+    /// detect.pair_every. Writes pairs.csv into the first session.
+    Pairs {
+        /// The first pass's session directory (under ~/cinefit-clips/caught).
+        a: PathBuf,
+        /// The second pass's.
+        b: PathBuf,
+    },
     /// Time a 4K render into a scanout buffer in each layout the display
     /// plane takes, and check each renders the same picture as LINEAR, with
     /// a negative control (#101). Off-screen; for clean numbers, stop the
@@ -283,6 +293,7 @@ fn main() -> ExitCode {
             sessions.iter().try_for_each(|s| hindsight::run(s, worst))
         }
         Command::Gpu => gpu(),
+        Command::Pairs { a, b } => pairs::run(&a, &b),
         #[cfg(target_os = "linux")]
         Command::Bench { frames, card } => bench::run(frames, card.as_deref()),
         #[cfg(not(target_os = "linux"))]
