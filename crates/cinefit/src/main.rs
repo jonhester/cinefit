@@ -14,6 +14,7 @@ mod content;
 #[cfg(target_os = "linux")]
 mod dataset;
 mod device;
+mod dovi_meta;
 mod follow;
 mod hindsight;
 #[cfg(target_os = "linux")]
@@ -96,6 +97,13 @@ enum Command {
     /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
     /// an identity render read back and compared. Touches no display.
     Gpu,
+    /// The Dolby Vision metadata of a session's kept tunnel frames (#109):
+    /// the grade's range, each shot's brightness and the colourist's trims.
+    /// Writes dovi.csv into the session.
+    Dovi {
+        /// The session directory (under ~/cinefit-clips/caught).
+        session: PathBuf,
+    },
     /// Pair the frames two passes of a title both kept (#109): a Dolby
     /// Vision tunnel pass and a low-latency one, each recorded with
     /// detect.pair_every. Writes pairs.csv into the first session.
@@ -301,6 +309,7 @@ fn main() -> ExitCode {
             sessions.iter().try_for_each(|s| hindsight::run(s, worst))
         }
         Command::Gpu => gpu(),
+        Command::Dovi { session } => dovi_meta::run(&session),
         Command::Pairs {
             a,
             b,
