@@ -514,7 +514,7 @@ fn read_data(
             data.send(&Frame::reply(frame.seqno).encode())?;
         }
         for m in frame.messages()? {
-            debug!("atv: message type {:?}", m.r#type);
+            debug!("atv: message type {:?}{}", m.r#type, describe(&m));
             if !ready && m.r#type == Some(proto::DEVICE_INFO) {
                 ready = true;
                 info!("atv: connected");
@@ -534,6 +534,31 @@ fn read_data(
         }
     }
     Ok(())
+}
+
+/// For the debug log: which app and player a message is about, and its
+/// play state, so each player's reports can be told apart.
+fn describe(m: &proto::ProtocolMessage) -> String {
+    let path = m
+        .set_state
+        .as_ref()
+        .and_then(|s| s.player_path.as_ref())
+        .or(m.update_content_item.as_ref().and_then(|u| u.player_path.as_ref()))
+        .or(m.set_now_playing_player.as_ref().and_then(|s| s.player_path.as_ref()));
+    let Some(path) = path else {
+        return String::new();
+    };
+    let app = path
+        .client
+        .as_ref()
+        .and_then(|c| c.bundle_identifier.as_deref())
+        .unwrap_or("?");
+    let state = m
+        .set_state
+        .as_ref()
+        .and_then(|s| s.playback_state)
+        .map_or(String::new(), |s| format!(", state {s}"));
+    format!(": {app} / {}{state}", player_id(path))
 }
 
 fn connect(addr: SocketAddr) -> Result<TcpStream, Error> {
