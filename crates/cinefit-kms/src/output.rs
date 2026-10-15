@@ -66,6 +66,10 @@ pub enum Error {
     /// The operation needs the other kind of frame: CPU-drawn ones are drawn,
     /// GBM ones exported and read back.
     NotScanout,
+    /// GBM chose a layout of several planes (a compressed one, with its
+    /// metadata beside it), which the export and the renderer's import do
+    /// not handle: the layout, and how many planes.
+    Planes(u64, u32),
     /// A queued flip did not complete in time: the display or the driver has
     /// stopped answering.
     NoFlip(Duration),
@@ -85,6 +89,11 @@ impl fmt::Display for Error {
             Error::MissingProperty(p) => write!(f, "the driver has no {p} property"),
             Error::Busy => f.write_str("another program holds the display (DRM master)"),
             Error::NotScanout => f.write_str("wrong kind of frame for this operation"),
+            Error::Planes(m, n) => write!(
+                f,
+                "GBM chose {}, a layout of {n} planes",
+                crate::modifier_name(*m)
+            ),
             Error::NoFlip(waited) => write!(
                 f,
                 "no page-flip event within {} ms: the display or driver stopped answering",
@@ -567,14 +576,7 @@ impl Output {
             )
             .map_err(io("allocating a GBM scanout buffer"))?;
         if bo.plane_count() != 1 {
-            return Err(Error::Io {
-                what: "allocating a GBM scanout buffer",
-                source: io::Error::other(format!(
-                    "GBM chose a layout of {} planes ({})",
-                    bo.plane_count(),
-                    crate::modifier_name(bo.modifier().into())
-                )),
-            });
+            return Err(Error::Planes(bo.modifier().into(), bo.plane_count()));
         }
         let fb = self
             .card

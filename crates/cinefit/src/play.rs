@@ -95,6 +95,13 @@ pub struct Options {
 /// indices, the targets, their pixel format and the layout GBM chose.
 type Scanouts<'p> = (Vec<usize>, Vec<cinefit_render::Texture<'p>>, u32, u64);
 
+/// Why a set of scanout buffers could not be made, and the layout to blame
+/// when there is one.
+struct Failed {
+    layout: Option<u64>,
+    error: Box<dyn Error>,
+}
+
 /// Renders a picture that places every pixel by position into `target`
 /// (scanout buffer `frame`) and reads it back through GBM, which detiles: a
 /// layout the renderer writes wrongly comes back moved or scrambled. Once at
@@ -148,32 +155,53 @@ fn scanouts<'p>(
     pl: &'p Placebo,
     index: usize,
     modifiers: &[u64],
-) -> Result<Scanouts<'p>, Box<dyn Error>> {
+) -> Result<Scanouts<'p>, Failed> {
+    let unblamed = |e: Box<dyn Error>| Failed {
+        layout: None,
+        error: e,
+    };
     let (mut buffers, mut targets) = (Vec::new(), Vec::new());
     let (mut fourcc, mut modifier) = (0, 0);
     for i in 0..BUFFERS {
-        let b = out.create_scanout_in(index, modifiers)?;
-        let d = out.export(b)?;
+        let b = match out.create_scanout_in(index, modifiers) {
+            Ok(b) => b,
+            Err(cinefit_kms::Error::Planes(m, n)) => {
+                return Err(Failed {
+                    layout: Some(m),
+                    error: format!("a layout of {n} planes").into(),
+                });
+            }
+            Err(e) => return Err(unblamed(e.into())),
+        };
+        let d = out.export(b).map_err(|e| unblamed(e.into()))?;
         // One layout for all: the log names one, and the read-back for the
         // info panel takes one.
         if i > 0 && (d.fourcc, d.modifier) != (fourcc, modifier) {
-            return Err(format!(
-                "GBM chose {} for one buffer and {} for another",
-                cinefit_kms::modifier_name(modifier),
-                cinefit_kms::modifier_name(d.modifier)
-            )
-            .into());
+            return Err(unblamed(
+                format!(
+                    "GBM chose {} for one buffer and {} for another",
+                    cinefit_kms::modifier_name(modifier),
+                    cinefit_kms::modifier_name(d.modifier)
+                )
+                .into(),
+            ));
         }
         (fourcc, modifier) = (d.fourcc, d.modifier);
-        targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
-            fd: d.fd.as_fd(),
-            width: d.width,
-            height: d.height,
-            fourcc: d.fourcc,
-            modifier: d.modifier,
-            stride: d.stride,
-            offset: d.offset,
-        })?);
+        targets.push(
+            pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+                fd: d.fd.as_fd(),
+                width: d.width,
+                height: d.height,
+                fourcc: d.fourcc,
+                modifier: d.modifier,
+                stride: d.stride,
+                offset: d.offset,
+            })
+            .map_err(|e| Failed {
+                layout: Some(d.modifier),
+                error: format!("the renderer will not import it: {e}").into(),
+            })?,
+        );
         buffers.push(b);
     }
     Ok((buffers, targets, fourcc, modifier))
@@ -1077,25 +1105,53 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             .ok()
             .filter(|m| m.iter().any(|&m| m != 0))
     };
+    // GBM picks from the list; a layout that cannot be used (several
+    // planes, refused by the renderer, or rendering wrongly) is taken out
+    // and GBM asked again, down to LINEAR. A failure no layout can be blamed
+    // for goes straight to LINEAR.
     let before = out.scanout_count();
-    let made = match &tiled {
-        Some(mods) => scanouts(&mut out, &pl, index, mods)
+    let mut mods = tiled.unwrap_or_else(|| vec![0]);
+    let made = loop {
+        let attempt = scanouts(&mut out, &pl, index, &mods).and_then(|s| {
             // Imported is not proof it renders: a test picture through each
-            // buffer, read back, must come out right, or LINEAR. On a GPU
-            // where a tiled render failed or scrambled, play would otherwise
-            // fail at every restart, or show a scrambled picture.
-            .and_then(|s| {
-                for (&frame, target) in s.0.iter().zip(&s.1) {
-                    renders_right(&out, &pl, frame, target)?;
-                }
-                Ok(s)
-            })
-            .or_else(|e| {
-                warn!("scanout: the tiled layouts failed ({e}); LINEAR, as before");
+            // buffer, read back, must come out right. On a GPU where a tiled
+            // render failed or scrambled, play would otherwise fail at every
+            // restart, or show a scrambled picture.
+            for (&frame, target) in s.0.iter().zip(&s.1) {
+                renders_right(&out, &pl, frame, target).map_err(|e| Failed {
+                    layout: Some(s.3),
+                    error: e,
+                })?;
+            }
+            Ok(s)
+        });
+        match attempt {
+            Ok(s) => break Ok(s),
+            Err(f) if mods == [0] => break Err(f.error),
+            Err(f) => {
                 out.discard_scanouts(before);
-                scanouts(&mut out, &pl, index, &[0])
-            }),
-        None => scanouts(&mut out, &pl, index, &[0]),
+                match f.layout.filter(|&m| m != 0) {
+                    Some(m) => {
+                        info!(
+                            "scanout: {} not usable ({}); asking for another",
+                            cinefit_kms::modifier_name(m),
+                            f.error
+                        );
+                        mods.retain(|&x| x != m);
+                        if mods.iter().all(|&x| x == 0) {
+                            mods = vec![0];
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "scanout: the tiled layouts failed ({}); LINEAR, as before",
+                            f.error
+                        );
+                        mods = vec![0];
+                    }
+                }
+            }
+        }
     };
     let (buffers, targets, scan_fourcc, modifier) = made?;
     info!(
