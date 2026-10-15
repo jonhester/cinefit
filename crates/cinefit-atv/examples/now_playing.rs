@@ -37,10 +37,12 @@ fn main() {
     let result = cinefit_atv::watch(&host, &creds, &stop, |np| {
         let pos = np.position_at(SystemTime::now()).map(|p| format!("{p:.3}"));
         println!(
-            "{} | {:?} | {:?} | series {:?} s{:?}e{:?} | {:?} of {:?} s (measured {:?}, rate {:?}) | ids {:?} {:?} | media {:?}",
+            "{} [{}] | {:?} | {:?} by {:?} | series {:?} s{:?}e{:?} | {:?} of {:?} s (measured {:?}, rate {:?}) | ids {:?} {:?} | media {:?}",
             np.app_name.as_deref().or(np.app.as_deref()).unwrap_or("?"),
+            np.player.as_deref().unwrap_or("?"),
             np.state,
             np.title,
+            np.artist,
             np.series,
             np.season,
             np.episode,

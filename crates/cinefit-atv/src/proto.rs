@@ -14,6 +14,9 @@ pub const CLIENT_UPDATES_CONFIG: i32 = 16;
 pub const GET_KEYBOARD_SESSION: i32 = 24;
 pub const SET_CONNECTION_STATE: i32 = 38;
 pub const SET_NOW_PLAYING_CLIENT: i32 = 46;
+pub const SET_NOW_PLAYING_PLAYER: i32 = 47;
+pub const REMOVE_CLIENT: i32 = 53;
+pub const REMOVE_PLAYER: i32 = 54;
 pub const UPDATE_CLIENT: i32 = 55;
 pub const UPDATE_CONTENT_ITEM: i32 = 56;
 
@@ -37,6 +40,12 @@ pub struct ProtocolMessage {
     pub set_connection_state: Option<SetConnectionState>,
     #[prost(message, optional, tag = "50")]
     pub set_now_playing_client: Option<SetNowPlayingClient>,
+    #[prost(message, optional, tag = "51")]
+    pub set_now_playing_player: Option<SetNowPlayingPlayer>,
+    #[prost(message, optional, tag = "57")]
+    pub remove_client: Option<RemoveClient>,
+    #[prost(message, optional, tag = "58")]
+    pub remove_player: Option<RemovePlayer>,
     #[prost(message, optional, tag = "60")]
     pub update_content_item: Option<UpdateContentItem>,
 }
@@ -153,6 +162,8 @@ pub struct ContentItem {
 pub struct ContentItemMetadata {
     #[prost(string, optional, tag = "1")]
     pub title: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    pub track_artist_name: Option<String>,
     #[prost(int32, optional, tag = "10")]
     pub season_number: Option<i32>,
     #[prost(int32, optional, tag = "11")]
@@ -180,6 +191,34 @@ pub struct ContentItemMetadata {
 pub struct PlayerPath {
     #[prost(message, optional, tag = "2")]
     pub client: Option<NowPlayingClient>,
+    #[prost(message, optional, tag = "3")]
+    pub player: Option<NowPlayingPlayer>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct NowPlayingPlayer {
+    #[prost(string, optional, tag = "1")]
+    pub identifier: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetNowPlayingPlayer {
+    #[prost(message, optional, tag = "1")]
+    pub player_path: Option<PlayerPath>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveClient {
+    #[prost(message, optional, tag = "1")]
+    pub client: Option<NowPlayingClient>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemovePlayer {
+    #[prost(message, optional, tag = "1")]
+    pub player_path: Option<PlayerPath>,
 }
 
 #[derive(Clone, PartialEq, Message)]

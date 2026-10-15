@@ -130,8 +130,11 @@ pub struct NowPlaying {
     /// The app's bundle identifier (`com.disney.disneyplus`).
     pub app: Option<String>,
     pub app_name: Option<String>,
+    /// The player within the app this describes.
+    pub player: Option<String>,
     pub state: Option<State>,
     pub title: Option<String>,
+    pub artist: Option<String>,
     pub series: Option<String>,
     pub season: Option<i32>,
     pub episode: Option<i32>,
@@ -145,8 +148,6 @@ pub struct NowPlaying {
     pub store_id: Option<i64>,
     /// 1 audio, 2 video.
     pub media_type: Option<i32>,
-    /// The queue item these fields describe: a new one starts afresh.
-    pub item: Option<String>,
 }
 
 impl NowPlaying {
@@ -162,27 +163,6 @@ impl NowPlaying {
             .map_or(0.0, |d| d.as_secs_f64());
         Some(elapsed + since * f64::from(self.rate.unwrap_or(0.0)))
     }
-
-    fn merge(&mut self, m: &proto::ContentItemMetadata) {
-        fn set<T: Clone>(to: &mut Option<T>, from: &Option<T>) {
-            if from.is_some() {
-                to.clone_from(from);
-            }
-        }
-        set(&mut self.title, &m.title);
-        set(&mut self.series, &m.series_name);
-        set(&mut self.season, &m.season_number);
-        set(&mut self.episode, &m.episode_number);
-        set(&mut self.duration, &m.duration);
-        set(&mut self.elapsed, &m.elapsed_time);
-        set(&mut self.rate, &m.playback_rate);
-        set(&mut self.content_id, &m.content_identifier);
-        set(&mut self.store_id, &m.itunes_store_identifier);
-        set(&mut self.media_type, &m.media_type);
-        if let Some(t) = m.elapsed_time_timestamp {
-            self.elapsed_at = Some(cocoa(t));
-        }
-    }
 }
 
 /// Apple's time: seconds since 2001-01-01 UTC.
@@ -191,108 +171,240 @@ pub fn cocoa(secs: f64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(EPOCH_2001) + Duration::from_secs_f64(secs.max(0.0))
 }
 
-/// Each app's state, kept apart: the Apple TV reports for every app that
-/// has a player, and says which one is in front.
-///
-/// Simplified from pyatv's `protocols/mrp/player_state.py` (MIT): one
-/// player per app, where pyatv keeps each app's players apart.
+/// The player an app reports for when it has not said which: pyatv's
+/// `DEFAULT_PLAYER_ID`.
+const DEFAULT_PLAYER: &str = "MediaRemote-DefaultPlayer";
+
+/// One player's state: its reported play state, and its queue with the
+/// position of the current item in it.
+#[derive(Debug, Default, Clone)]
+struct Player {
+    state: Option<i32>,
+    items: Vec<proto::ContentItem>,
+    location: usize,
+}
+
+impl Player {
+    fn metadata(&self) -> Option<&proto::ContentItemMetadata> {
+        self.items.get(self.location)?.metadata.as_ref()
+    }
+
+    /// pyatv's reading of the play state (`PlayerState.playback_state`):
+    /// paused with nothing queued is nothing at all; a rate of 1 is
+    /// playing, any other but 0 is seeking; at rate 0 the reported state
+    /// stands, as apps leave it at 0 while playing.
+    fn state(&self) -> Option<State> {
+        let reported = State::from_wire(self.state?)?;
+        let meta = self.metadata();
+        if reported == State::Paused {
+            return meta.map(|_| State::Paused);
+        }
+        if reported != State::Playing {
+            return Some(reported);
+        }
+        Some(match meta.and_then(|m| m.playback_rate) {
+            None => State::Playing,
+            Some(r) if r.abs() < 1e-6 => State::Playing,
+            Some(r) if (r - 1.0).abs() < 1e-6 => State::Playing,
+            Some(_) => State::Seeking,
+        })
+    }
+}
+
+/// An app with players.
+#[derive(Debug, Default)]
+struct App {
+    name: Option<String>,
+    players: HashMap<String, Player>,
+    /// The player it said is in front; else its default player.
+    active: Option<String>,
+}
+
+/// Every app's and player's state, kept apart: the Apple TV reports for
+/// each player of each app, says which app is in front, and which player
+/// within it. Follows pyatv's `protocols/mrp/player_state.py` (MIT).
 #[derive(Debug, Default)]
 pub struct Tracker {
     front: Option<String>,
-    apps: HashMap<String, (Option<String>, NowPlaying)>,
+    apps: HashMap<String, App>,
+}
+
+fn player_id(path: &proto::PlayerPath) -> String {
+    path.player
+        .as_ref()
+        .and_then(|p| p.identifier.clone())
+        .unwrap_or_default()
 }
 
 impl Tracker {
-    /// What the app in front is playing.
+    /// What the app in front is playing, from its active player.
     pub fn now(&self) -> Option<NowPlaying> {
-        let front = self.front.as_ref()?;
-        let mut np = self
-            .apps
-            .get(front)
-            .map(|(_, np)| np.clone())
+        let id = self.front.as_ref()?;
+        let app = self.apps.get(id);
+        let player_name = app.and_then(|a| {
+            a.active.clone().or_else(|| {
+                a.players
+                    .contains_key(DEFAULT_PLAYER)
+                    .then(|| DEFAULT_PLAYER.into())
+            })
+        });
+        let player = app
+            .zip(player_name.as_ref())
+            .and_then(|(a, p)| a.players.get(p))
+            .cloned()
             .unwrap_or_default();
-        np.app = Some(front.clone());
-        Some(np)
+        let m = player.metadata().cloned().unwrap_or_default();
+        Some(NowPlaying {
+            app: Some(id.clone()),
+            app_name: app.and_then(|a| a.name.clone()),
+            player: player_name,
+            state: player.state(),
+            title: m.title,
+            artist: m.track_artist_name,
+            series: m.series_name,
+            season: m.season_number,
+            episode: m.episode_number,
+            duration: m.duration,
+            elapsed: m.elapsed_time,
+            elapsed_at: m.elapsed_time_timestamp.map(cocoa),
+            rate: m.playback_rate,
+            content_id: m.content_identifier,
+            store_id: m.itunes_store_identifier,
+            media_type: m.media_type,
+        })
     }
 
-    fn app(&mut self, client: Option<&proto::NowPlayingClient>) -> Option<&mut NowPlaying> {
+    fn app(&mut self, client: Option<&proto::NowPlayingClient>) -> Option<&mut App> {
         let client = client?;
-        let id = client.bundle_identifier.clone()?;
-        let entry = self.apps.entry(id.clone()).or_default();
-        entry.1.app = Some(id);
+        let app = self
+            .apps
+            .entry(client.bundle_identifier.clone().unwrap_or_default())
+            .or_default();
         if client.display_name.is_some() {
-            entry.1.app_name.clone_from(&client.display_name);
+            app.name.clone_from(&client.display_name);
         }
-        Some(&mut entry.1)
+        Some(app)
     }
 
-    /// Takes one message; true if what is in front may have changed.
+    fn player(&mut self, path: Option<&proto::PlayerPath>) -> Option<&mut Player> {
+        let path = path?;
+        let id = player_id(path);
+        Some(
+            self.app(path.client.as_ref())?
+                .players
+                .entry(id)
+                .or_default(),
+        )
+    }
+
+    /// Takes one message; true if it may have changed what is in front.
     pub fn apply(&mut self, m: &proto::ProtocolMessage) -> bool {
         if let Some(c) = m
             .set_now_playing_client
             .as_ref()
             .and_then(|s| s.client.as_ref())
         {
-            self.front.clone_from(&c.bundle_identifier);
+            self.front = Some(c.bundle_identifier.clone().unwrap_or_default());
             self.app(Some(c));
             return true;
         }
+        if let Some(path) = m
+            .set_now_playing_player
+            .as_ref()
+            .and_then(|s| s.player_path.as_ref())
+        {
+            let id = player_id(path);
+            if let Some(app) = self.app(path.client.as_ref()) {
+                app.players.entry(id.clone()).or_default();
+                app.active = Some(id);
+            }
+            return true;
+        }
         if let Some(s) = &m.set_state {
-            let Some(np) = self.app(s.player_path.as_ref().and_then(|p| p.client.as_ref())) else {
+            let Some(player) = self.player(s.player_path.as_ref()) else {
                 return false;
             };
-            if let Some(st) = s.playback_state {
-                np.state = State::from_wire(st);
+            if s.playback_state.is_some() {
+                player.state = s.playback_state;
             }
+            // A queue replaces the one before, whole.
             if let Some(q) = &s.playback_queue {
-                let at = q
+                player.items.clone_from(&q.content_items);
+                player.location = q
                     .location
                     .and_then(|l| usize::try_from(l).ok())
                     .unwrap_or(0);
-                if let Some(item) = q.content_items.get(at).or(q.content_items.first()) {
-                    // A different item starts afresh; the same one is updated.
-                    if item.identifier != np.item {
-                        let (app, name, state) = (np.app.take(), np.app_name.take(), np.state);
-                        *np = NowPlaying {
-                            app,
-                            app_name: name,
-                            state,
-                            ..Default::default()
-                        };
-                        np.item.clone_from(&item.identifier);
-                    }
-                    if let Some(meta) = &item.metadata {
-                        np.merge(meta);
-                    }
-                }
-            }
-            if let Some(info) = &s.now_playing_info {
-                // The older summary, for what the queue did not say.
-                np.title = np.title.take().or(info.title.clone());
-                np.duration = np.duration.or(info.duration);
-                if np.elapsed.is_none() {
-                    np.elapsed = info.elapsed_time;
-                    np.rate = info.playback_rate;
-                    np.elapsed_at = info.timestamp.map(cocoa);
-                }
             }
             return true;
         }
         if let Some(u) = &m.update_content_item {
-            let Some(np) = self.app(u.player_path.as_ref().and_then(|p| p.client.as_ref())) else {
+            let Some(player) = self.player(u.player_path.as_ref()) else {
                 return false;
             };
-            for item in &u.content_items {
-                if item.identifier == np.item
-                    && let Some(meta) = &item.metadata
+            for update in &u.content_items {
+                for item in player
+                    .items
+                    .iter_mut()
+                    .filter(|i| i.identifier == update.identifier)
                 {
-                    np.merge(meta);
+                    if let Some(new) = &update.metadata {
+                        merge(item.metadata.get_or_insert_with(Default::default), new);
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(c) = m.remove_client.as_ref().and_then(|r| r.client.as_ref()) {
+            let id = c.bundle_identifier.clone().unwrap_or_default();
+            self.apps.remove(&id);
+            if self.front.as_ref() == Some(&id) {
+                self.front = None;
+            }
+            return true;
+        }
+        if let Some(path) = m
+            .remove_player
+            .as_ref()
+            .and_then(|r| r.player_path.as_ref())
+        {
+            let id = player_id(path);
+            if let Some(app) = path.client.as_ref().and_then(|c| {
+                self.apps
+                    .get_mut(&c.bundle_identifier.clone().unwrap_or_default())
+            }) {
+                app.players.remove(&id);
+                if app.active.as_ref() == Some(&id) {
+                    app.active = None;
                 }
             }
             return true;
         }
         false
     }
+}
+
+/// An update's fields over what an item had: only those it carries.
+fn merge(to: &mut proto::ContentItemMetadata, from: &proto::ContentItemMetadata) {
+    fn set<T: Clone>(to: &mut Option<T>, from: &Option<T>) {
+        if from.is_some() {
+            to.clone_from(from);
+        }
+    }
+    set(&mut to.title, &from.title);
+    set(&mut to.track_artist_name, &from.track_artist_name);
+    set(&mut to.season_number, &from.season_number);
+    set(&mut to.episode_number, &from.episode_number);
+    set(&mut to.duration, &from.duration);
+    set(&mut to.elapsed_time, &from.elapsed_time);
+    set(&mut to.playback_rate, &from.playback_rate);
+    set(&mut to.content_identifier, &from.content_identifier);
+    set(
+        &mut to.itunes_store_identifier,
+        &from.itunes_store_identifier,
+    );
+    set(&mut to.series_name, &from.series_name);
+    set(&mut to.media_type, &from.media_type);
+    set(&mut to.elapsed_time_timestamp, &from.elapsed_time_timestamp);
 }
 
 /// Reads one Apple TV until the connection ends, calling `update` with what
@@ -609,10 +721,16 @@ mod tests {
     use super::*;
     use proto::*;
 
-    fn client(id: &str) -> Option<PlayerPath> {
+    const TV: &str = "com.apple.TVWatchList";
+
+    fn path(player: &str) -> Option<PlayerPath> {
         Some(PlayerPath {
             client: Some(NowPlayingClient {
-                bundle_identifier: Some(id.into()),
+                bundle_identifier: Some(TV.into()),
+                display_name: None,
+            }),
+            player: Some(NowPlayingPlayer {
+                identifier: Some(player.into()),
                 display_name: None,
             }),
         })
@@ -625,46 +743,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_app_in_front_and_its_item_are_followed() {
-        let mut t = Tracker::default();
-        // State for an app not yet in front is kept, not shown.
-        let set = ProtocolMessage {
+    fn set_state(player: &str, state: Option<i32>, items: Vec<ContentItem>) -> ProtocolMessage {
+        ProtocolMessage {
             set_state: Some(SetState {
-                player_path: client("com.apple.TVWatchList"),
-                playback_state: Some(1),
-                playback_queue: Some(PlaybackQueue {
+                player_path: path(player),
+                playback_state: state,
+                playback_queue: (!items.is_empty()).then_some(PlaybackQueue {
                     location: Some(0),
-                    content_items: vec![item(
-                        "a",
-                        ContentItemMetadata {
-                            title: Some("Episode".into()),
-                            duration: Some(1882.2),
-                            elapsed_time: Some(825.3),
-                            elapsed_time_timestamp: Some(813_733_151.4),
-                            playback_rate: Some(0.0),
-                            ..Default::default()
-                        },
-                    )],
+                    content_items: items,
                 }),
                 ..Default::default()
             }),
             ..message(SET_STATE)
-        };
-        assert!(t.apply(&set));
-        assert_eq!(t.now(), None);
-        let front = ProtocolMessage {
+        }
+    }
+
+    fn front() -> ProtocolMessage {
+        ProtocolMessage {
             set_now_playing_client: Some(SetNowPlayingClient {
                 client: Some(NowPlayingClient {
-                    bundle_identifier: Some("com.apple.TVWatchList".into()),
+                    bundle_identifier: Some(TV.into()),
                     display_name: Some("TV".into()),
                 }),
             }),
             ..message(SET_NOW_PLAYING_CLIENT)
+        }
+    }
+
+    #[test]
+    fn the_app_in_front_and_its_player_are_followed() {
+        let mut t = Tracker::default();
+        let episode = ContentItemMetadata {
+            title: Some("Episode".into()),
+            duration: Some(1882.2),
+            elapsed_time: Some(825.3),
+            elapsed_time_timestamp: Some(813_733_151.4),
+            playback_rate: Some(0.0),
+            ..Default::default()
         };
-        assert!(t.apply(&front));
+        // State for an app not yet in front is kept, not shown.
+        t.apply(&set_state(
+            DEFAULT_PLAYER,
+            Some(1),
+            vec![item("a", episode)],
+        ));
+        assert_eq!(t.now(), None);
+        t.apply(&front());
         let np = t.now().unwrap();
         assert_eq!(np.app_name.as_deref(), Some("TV"));
+        assert_eq!(np.player.as_deref(), Some(DEFAULT_PLAYER));
+        // Playing at rate 0 stays playing, as pyatv reads it.
         assert_eq!(np.state, Some(State::Playing));
         assert_eq!(np.title.as_deref(), Some("Episode"));
         // 2026-10-15 04:59:11 UTC, as the Apple TV app sent it.
@@ -673,8 +801,17 @@ mod tests {
         // At rate 0 the position stays where it was measured.
         assert_eq!(np.position_at(SystemTime::now()), Some(825.3));
 
-        // An update to the same item changes only what it carries.
-        let update = ProtocolMessage {
+        // Another player of the same app, paused, changes nothing in front
+        // (seen live on 2026-10-15: the Music app said paused while playing).
+        t.apply(&set_state(
+            "other",
+            Some(2),
+            vec![item("x", ContentItemMetadata::default())],
+        ));
+        assert_eq!(t.now().unwrap().state, Some(State::Playing));
+
+        // An update to the item changes only what it carries.
+        t.apply(&ProtocolMessage {
             update_content_item: Some(UpdateContentItem {
                 content_items: vec![item(
                     "a",
@@ -684,39 +821,71 @@ mod tests {
                         ..Default::default()
                     },
                 )],
-                player_path: client("com.apple.TVWatchList"),
+                player_path: path(DEFAULT_PLAYER),
             }),
             ..message(UPDATE_CONTENT_ITEM)
-        };
-        t.apply(&update);
+        });
         let np = t.now().unwrap();
         assert_eq!((np.elapsed, np.rate), (Some(895.8), Some(1.0)));
         assert_eq!(np.title.as_deref(), Some("Episode"));
         let later = np.elapsed_at.unwrap() + Duration::from_secs(10);
         assert_eq!(np.position_at(later), Some(905.8));
 
-        // A new item starts afresh: nothing of the old one carries over.
-        let next = ProtocolMessage {
-            set_state: Some(SetState {
-                player_path: client("com.apple.TVWatchList"),
-                playback_queue: Some(PlaybackQueue {
-                    location: Some(0),
-                    content_items: vec![item(
-                        "b",
-                        ContentItemMetadata {
-                            title: Some("Next".into()),
-                            ..Default::default()
-                        },
-                    )],
-                }),
-                ..Default::default()
+        // The app says another player is in front: that one is shown.
+        t.apply(&ProtocolMessage {
+            set_now_playing_player: Some(SetNowPlayingPlayer {
+                player_path: path("other"),
             }),
-            ..message(SET_STATE)
-        };
-        t.apply(&next);
+            ..message(SET_NOW_PLAYING_PLAYER)
+        });
+        let np = t.now().unwrap();
+        assert_eq!(
+            (np.player.as_deref(), np.state),
+            (Some("other"), Some(State::Paused))
+        );
+
+        // A new queue replaces the old one, whole.
+        t.apply(&set_state(
+            "other",
+            None,
+            vec![item(
+                "b",
+                ContentItemMetadata {
+                    title: Some("Next".into()),
+                    ..Default::default()
+                },
+            )],
+        ));
         let np = t.now().unwrap();
         assert_eq!(np.title.as_deref(), Some("Next"));
         assert_eq!((np.elapsed, np.duration), (None, None));
-        assert_eq!(np.app_name.as_deref(), Some("TV"));
+
+        // That player goes: back to the default one.
+        t.apply(&ProtocolMessage {
+            remove_player: Some(RemovePlayer {
+                player_path: path("other"),
+            }),
+            ..message(REMOVE_PLAYER)
+        });
+        assert_eq!(t.now().unwrap().title.as_deref(), Some("Episode"));
+        // Paused with nothing queued is nothing at all; any rate but 0 or
+        // 1 is seeking.
+        let empty = Player {
+            state: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(empty.state(), None);
+        let fast = Player {
+            state: Some(1),
+            items: vec![item(
+                "c",
+                ContentItemMetadata {
+                    playback_rate: Some(2.0),
+                    ..Default::default()
+                },
+            )],
+            location: 0,
+        };
+        assert_eq!(fast.state(), Some(State::Seeking));
     }
 }
