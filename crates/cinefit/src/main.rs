@@ -18,6 +18,8 @@ mod runlog;
 #[cfg(target_os = "linux")]
 mod status;
 #[cfg(target_os = "linux")]
+mod times;
+#[cfg(target_os = "linux")]
 mod tunnel_check;
 #[cfg(target_os = "linux")]
 mod ui;
