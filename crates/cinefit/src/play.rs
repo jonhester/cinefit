@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::appletv;
 use crate::avr;
 use crate::config::{self, Config};
 use crate::content::*;
@@ -349,6 +350,8 @@ struct Dataset {
     judging: Option<std::thread::JoinHandle<()>>,
     /// The receiver's input by name, noted in each session (#116).
     source: Option<String>,
+    /// What the Apple TV plays, by name, noted in each session (#115).
+    playing: Option<String>,
 }
 
 /// The signal gone this long ends a viewing: the dataset's session closes,
@@ -375,6 +378,9 @@ impl Dataset {
                     info!("dataset: recording to {}", r.dir().display());
                     if let Some(s) = &self.source {
                         r.note(&format!("source: {s}"));
+                    }
+                    if let Some(p) = &self.playing {
+                        r.note(&format!("playing: {p}"));
                     }
                     self.recorder = Some(r);
                 }
@@ -430,6 +436,18 @@ impl Dataset {
             r.note(&format!("at {t:.1} s, source: {s}"));
         }
         self.source = source;
+    }
+
+    /// What the Apple TV plays changed: noted in the open session, and in
+    /// every session opened after.
+    fn set_playing(&mut self, playing: Option<String>, t: f64) {
+        if playing == self.playing {
+            return;
+        }
+        if let (Some(r), Some(p)) = (&self.recorder, &playing) {
+            r.note(&format!("at {t:.1} s, playing: {p}"));
+        }
+        self.playing = playing;
     }
 
     /// Judges the readings so far, on a thread of its own, appending to the
@@ -1124,6 +1142,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let web = Web::start(cfg.web_port);
     // The receiver (#116): which input is on, and whether it is on at all.
     let receiver = avr::Receiver::start(&cfg.denon);
+    // The Apple TV (#115): what it is playing, by name.
+    let apple_tv = appletv::AppleTv::start(&cfg.atv_host);
+    let mut last_playing: Option<String> = None;
     let mut last_seen: Option<avr::Seen> = None;
     let mut menu = Menu::new(rates, crate::VERSION.split(' ').next().unwrap_or("?"));
     // A rate-while-waiting change made while waiting: the output follows it
@@ -1318,6 +1339,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     "osd.banners" => ui.set_banners(cfg.banners),
                     "slate.venue" => ui.set_venue(&cfg.venue),
                     "avr.denon" => receiver.set_host(&cfg.denon),
+                    "atv.host" => apple_tv.set_host(&cfg.atv_host),
                     "output.wait_hz" => wait_changed = dark,
                     _ => {}
                 }
@@ -1394,6 +1416,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         window.borrow_mut().section(now, period),
                     ],
                 };
+                // What the Apple TV plays, under what comes in, when its
+                // app says.
+                if let Some(sec) = apple_tv
+                    .now()
+                    .and_then(|np| appletv::section(&np, std::time::SystemTime::now()))
+                {
+                    text.sections.insert(1, sec);
+                }
                 // The receiver's input, first on the IN line's detail.
                 if let Some(s) = &last_seen {
                     let first = &mut text.sections[0];
@@ -1459,6 +1489,18 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             }
             // What the receiver says, when it changes: logged, noted in the
             // dataset, and on the slate while there is no picture.
+            // What the Apple TV plays, when it changes: logged, and noted
+            // in the dataset.
+            let playing = apple_tv.now().as_ref().and_then(appletv::label);
+            if playing != last_playing {
+                let t = run_started.elapsed().as_secs_f64();
+                match &playing {
+                    Some(p) => info!("{t:.1} s: Apple TV playing: {p}"),
+                    None => info!("{t:.1} s: Apple TV: nothing named playing"),
+                }
+                dataset.set_playing(playing.clone(), t);
+                last_playing = playing;
+            }
             let seen = receiver.seen();
             if seen != last_seen {
                 let t = run_started.elapsed().as_secs_f64();

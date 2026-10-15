@@ -77,6 +77,8 @@ pub struct Config {
     /// The Denon receiver: a hostname or an IP address; empty for none
     /// (#116).
     pub denon: String,
+    /// The Apple TV: a hostname or an IP address; empty for none (#115).
+    pub atv_host: String,
     /// A banner on each change of picture type.
     pub banners: bool,
     /// The web page's port on the home network; 0 for none.
@@ -158,6 +160,7 @@ impl Default for Config {
             fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
             denon: String::new(),
+            atv_host: String::new(),
             banners: true,
             web_port: 8080,
         }
@@ -463,6 +466,17 @@ static SETTINGS: &[Setting] = &[
                slate and the detector's dataset. Reads only. Empty: none.",
         get: |c| Value::Name(c.denon.clone()),
         set: |c, v| c.denon = name(v).trim().to_string(),
+    },
+    Setting {
+        key: "atv.host",
+        kind: Kind::Text { max: 253 },
+        apply: Apply::Live,
+        help: "The Apple TV, by hostname or IP address: cinefit reads what it is playing (the title, the app, \
+               where in it), for the info panel and the detector's dataset. Reads only. It needs pairing once; \
+               the pairing is kept in atv-credentials beside this file. Some apps say nothing of what they \
+               play. Empty: none.",
+        get: |c| Value::Name(c.atv_host.clone()),
+        set: |c, v| c.atv_host = name(v).trim().to_string(),
     },
     Setting {
         key: "web.port",

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cinefit-atv = { path = "../cinefit-atv" }
 cinefit-decklink = { path = "../cinefit-decklink" }
 cinefit-detect = { path = "../cinefit-detect" }
 cinefit-dovi = { path = "../cinefit-dovi" }
