@@ -210,6 +210,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "detect.crop" => ("Picture", "Crop black bars"),
         "geometry.fill_max_ar" => ("Picture", "Fill the screen up to"),
         "osd.banners" => ("Picture", "Banners"),
+        "detect.record" => ("Picture", "Record for detector tuning"),
         "output.mode" => ("Output", "HDR10"),
         "output.wait_hz" => ("Output", "Rate while waiting"),
         "output.white_nits" => ("Output", "SDR white and low-latency Dolby Vision, nits"),
