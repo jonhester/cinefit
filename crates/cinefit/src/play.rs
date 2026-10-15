@@ -341,7 +341,21 @@ struct Dataset {
     /// Opening it failed once: not tried again this run.
     failed: bool,
     next: u64,
+    /// The readings since the last judging, with the crop shown on each:
+    /// judged in hindsight (#91) when the input goes dark, at the end of the
+    /// run, or every [`JUDGE_EVERY`] frames at a cut.
+    pending: Vec<(cinefit_detect::readings::Reading, (u32, u32))>,
+    judging: Option<std::thread::JoinHandle<()>>,
 }
+
+/// The signal gone this long ends a viewing: the dataset's session closes,
+/// and the next frame opens a new one. Short drops (a player changing HDR or
+/// rate at a title's start, 1-3 s) stay within one.
+const VIEWING_GAP: Duration = Duration::from_secs(10);
+
+/// About half an hour at 24p: a film with no break in its signal is judged
+/// in pieces, each ending at a cut, so memory stays bounded.
+const JUDGE_EVERY: usize = 24 * 60 * 30;
 
 impl Dataset {
     /// Records one frame, when `on` (the `detect.record` setting).
@@ -369,6 +383,21 @@ impl Dataset {
             geo::Source::Rows { top, bottom } => (top, bottom),
             _ => (0, 0),
         };
+        if let Some((obs, cut)) = found.reading {
+            self.pending.push((
+                cinefit_detect::readings::Reading {
+                    index: self.next,
+                    time: t,
+                    epoch,
+                    obs,
+                    cut,
+                },
+                crop,
+            ));
+            if self.pending.len() >= JUDGE_EVERY {
+                self.judge(false);
+            }
+        }
         if let Some(r) = self.recorder.as_mut() {
             r.record(dataset::Record {
                 index: self.next,
@@ -380,6 +409,60 @@ impl Dataset {
                 thumb: found.thumb,
             });
             self.next += 1;
+        }
+    }
+}
+
+impl Dataset {
+    /// Judges the readings so far, on a thread of its own, appending to the
+    /// session's `hindsight.csv` and logging a line. `all` false keeps the
+    /// shot still going (from its cut) for next time.
+    fn judge(&mut self, all: bool) {
+        let Some(dir) = self.recorder.as_ref().map(|r| r.dir().to_path_buf()) else {
+            self.pending.clear();
+            return;
+        };
+        let keep_from = if all {
+            self.pending.len()
+        } else {
+            self.pending.iter().rposition(|(r, _)| r.cut).unwrap_or(0)
+        };
+        if keep_from == 0 {
+            return;
+        }
+        let rest = self.pending.split_off(keep_from);
+        let batch = std::mem::replace(&mut self.pending, rest);
+        // One at a time, so the file's shots stay in order.
+        if let Some(previous) = self.judging.take() {
+            let _ = previous.join();
+        }
+        self.judging = std::thread::Builder::new()
+            .name("hindsight".into())
+            .spawn(move || match crate::hindsight::append(&dir, &batch) {
+                Ok(summary) => info!("hindsight: {summary}"),
+                Err(e) => warn!("hindsight: not written: {e}"),
+            })
+            .ok();
+    }
+
+    /// Ends the viewing: the last judging, then its session closed. The next
+    /// frame recorded opens a new one.
+    fn end_session(&mut self) {
+        self.judge(true);
+        if let Some(j) = self.judging.take() {
+            let _ = j.join();
+        }
+        self.next = 0;
+        if let Some(r) = self.recorder.take() {
+            match r.finish() {
+                Ok(s) => info!(
+                    "dataset: {} frames recorded to {}, {} dropped",
+                    s.frames,
+                    s.dir.display(),
+                    s.dropped
+                ),
+                Err(e) => warn!("dataset: writing failed: {e}"),
+            }
         }
     }
 }
@@ -1327,6 +1410,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 ready = Some(free);
                 dark = true;
                 counts.signal_losses += 1;
+                // A break in the input: the viewing so far is judged.
+                dataset.judge(true);
                 ui.set_slate(Some(Slate::SignalLost {
                     since: last_frame_at,
                 }));
@@ -1335,6 +1420,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     run_started.elapsed().as_secs_f64(),
                     last_frame_at.elapsed().as_millis()
                 );
+            }
+            if dark && dataset.recorder.is_some() && last_frame_at.elapsed() >= VIEWING_GAP {
+                info!(
+                    "{:.1} s: no signal for {} s: the viewing ends",
+                    run_started.elapsed().as_secs_f64(),
+                    VIEWING_GAP.as_secs()
+                );
+                dataset.end_session();
             }
             if let Some(frame) = taken {
                 if dark {
@@ -1701,17 +1794,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         counts.metadata,
         counts.refused
     );
-    if let Some(r) = dataset.recorder {
-        match r.finish() {
-            Ok(s) => info!(
-                "dataset: {} frames recorded to {}, {} dropped",
-                s.frames,
-                s.dir.display(),
-                s.dropped
-            ),
-            Err(e) => warn!("dataset: writing failed: {e}"),
-        }
-    }
+    dataset.end_session();
     if cfg.crop {
         let shares: Vec<String> = finder
             .det
