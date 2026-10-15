@@ -87,6 +87,40 @@ pub struct Options {
     /// Everything up to the modeset (pre-roll, mode, signalling, the first
     /// render into a scanout buffer), then stop: the display is not touched.
     pub dry_run: bool,
+    /// LINEAR scanout buffers, as before #101, for comparing.
+    pub linear_scanout: bool,
+}
+
+/// The scanout buffers, each imported as a render target: the buffers'
+/// indices, the targets, their pixel format and the layout GBM chose.
+type Scanouts<'p> = (Vec<usize>, Vec<cinefit_render::Texture<'p>>, u32, u64);
+
+/// Makes [`BUFFERS`] scanout buffers for mode `index` in a layout from
+/// `modifiers`, and imports each for the renderer.
+fn scanouts<'p>(
+    out: &mut cinefit_kms::Output,
+    pl: &'p Placebo,
+    index: usize,
+    modifiers: &[u64],
+) -> Result<Scanouts<'p>, Box<dyn Error>> {
+    let (mut buffers, mut targets) = (Vec::new(), Vec::new());
+    let (mut fourcc, mut modifier) = (0, 0);
+    for _ in 0..BUFFERS {
+        let b = out.create_scanout_in(index, modifiers)?;
+        let d = out.export(b)?;
+        (fourcc, modifier) = (d.fourcc, d.modifier);
+        targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+            fd: d.fd.as_fd(),
+            width: d.width,
+            height: d.height,
+            fourcc: d.fourcc,
+            modifier: d.modifier,
+            stride: d.stride,
+            offset: d.offset,
+        })?);
+        buffers.push(b);
+    }
+    Ok((buffers, targets, fourcc, modifier))
 }
 
 /// Hands frames from the SDK's thread to the mailbox.
@@ -975,25 +1009,38 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     };
 
     let pl = Placebo::new()?;
-    let mut buffers = Vec::new();
-    // The scanout buffers' pixel format, to read one back for the info panel.
-    let mut scan_fourcc = 0;
-    let mut targets = Vec::new();
-    for _ in 0..BUFFERS {
-        let b = out.create_scanout(index)?;
-        let d = out.export(b)?;
-        scan_fourcc = d.fourcc;
-        targets.push(pl.import_dmabuf(&cinefit_render::DmaBufTarget {
-            fd: d.fd.as_fd(),
-            width: d.width,
-            height: d.height,
-            fourcc: d.fourcc,
-            modifier: d.modifier,
-            stride: d.stride,
-            offset: d.offset,
-        })?);
-        buffers.push(b);
-    }
+    // The scanout buffers in the layout GBM picks from the plane's list
+    // (#101): tiled where the GPU has one, which `cinefit bench` measured
+    // 20% faster to render into than LINEAR on the RX 6400 and the same
+    // picture to the bit. A layout the renderer will not import, or any other
+    // failure, falls back to LINEAR, as before.
+    let tiled = if opts.linear_scanout {
+        None
+    } else {
+        out.scanout_modifiers()
+            .ok()
+            .filter(|m| m.iter().any(|&m| m != 0))
+    };
+    let before = out.scanout_count();
+    let made = match &tiled {
+        Some(mods) => scanouts(&mut out, &pl, index, mods).or_else(|e| {
+            warn!("scanout: the tiled layouts failed ({e}); LINEAR, as before");
+            out.discard_scanouts(before);
+            scanouts(&mut out, &pl, index, &[0])
+        }),
+        None => scanouts(&mut out, &pl, index, &[0]),
+    };
+    let (buffers, targets, scan_fourcc, modifier) = made?;
+    info!(
+        "scanout: {} {}{}",
+        String::from_utf8_lossy(&scan_fourcc.to_le_bytes()),
+        cinefit_kms::modifier_name(modifier),
+        if opts.linear_scanout {
+            " (--linear-scanout)"
+        } else {
+            ""
+        }
+    );
 
     // The first picture is rendered before the modeset, so the display's
     // first frame is the source's.
