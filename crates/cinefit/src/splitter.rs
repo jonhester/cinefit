@@ -76,10 +76,14 @@ pub fn parse(reply: &str) -> Option<u32> {
         .and_then(|n| n.trim().parse().ok())
 }
 
-/// What the switch position means, where it is known: the rig's own
-/// positions, as the owner set them up (2026-10-13).
+/// What the index means on the rig's custom firmware (~/ezcoo-fw, the
+/// CF_7.1-TVLED_5.1-LLDV96 image): presets 30 and 28 are its slots 1 and 31.
+/// Another image means other EDIDs at the same indices: the note names the
+/// index first for that reason.
 pub fn name(index: u32) -> Option<&'static str> {
     match index {
+        30 => Some("4K7.1: Dolby Vision TV-led, the tunnel"),
+        28 => Some("4K5.1: low-latency Dolby Vision at 96 nits"),
         32 => Some("copy: the capture card's own EDID, no Dolby Vision"),
         _ => None,
     }
