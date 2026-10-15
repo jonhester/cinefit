@@ -82,6 +82,15 @@ enum Command {
     /// Check the GPU path: libplacebo on Vulkan, dma-buf import support, and
     /// an identity render read back and compared. Touches no display.
     Gpu,
+    /// List what each display device offers: connectors and their EDID's
+    /// HDR and colorimetry, the HDR properties, and every plane's formats and
+    /// modifiers. Reads only, without taking the display, so it is safe while
+    /// cinefit or anything else is showing a picture.
+    Display {
+        /// A DRM device such as /dev/dri/card1; default: every card.
+        #[arg(long)]
+        card: Option<PathBuf>,
+    },
     /// Show a test pattern on the display and measure flip pacing. Needs the
     /// display to itself: nothing else may be driving it.
     Pattern {
@@ -225,6 +234,7 @@ enum Command {
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Probe { edid } => probe(edid),
+        Command::Display { card } => display(card.as_deref()),
         Command::Gpu => gpu(),
         Command::Replay {
             clips,
@@ -326,6 +336,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn display(_card: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
+    Err("display output is Linux only".into())
+}
+
+#[cfg(target_os = "linux")]
+fn display(card: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
+    print!("{}", cinefit_kms::describe_displays(card)?);
+    Ok(())
 }
 
 fn probe(edid: bool) -> Result<(), Box<dyn std::error::Error>> {
