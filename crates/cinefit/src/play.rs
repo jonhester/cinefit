@@ -1213,6 +1213,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut finished: Vec<(String, Duration, cinefit_kms::Pacing)> = Vec::new();
     let mut mode_name = mode.to_string();
     let mut latest_want: Option<follow::Want> = None;
+    // The HDR10 metadata carried over frames that come without it (#61).
+    let mut pq_meta = None;
     let (mut front, mut pending) = (0usize, 0usize);
     ui.update(&mut out, enc, Instant::now());
     out.flip(buffers[front])?;
@@ -1630,21 +1632,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 } else {
                     // What the output should be for this frame, for the policy after
                     // the next flip. The rate is the input's, as the card reported it.
-                    // A PQ frame without its metadata block is not a change of
-                    // metadata: the card attaches it only to frames it flags, and
-                    // treating its absence as zeros would flap the output.
-                    let pq_without_metadata =
-                        matches!(content, Content::Hdr10(_)) && frame.info().color.hdr.is_none();
+                    // An HDR10 frame without its metadata block carries the last
+                    // one on, so every frame's rate reaches the policy (#61).
+                    let hdr_meta = carried_hdr(content, frame.info().color.hdr, &mut pq_meta);
                     if !matches!(k.kind, Kind::Unsupported(_))
-                        && !pq_without_metadata
                         && let Some(f) = *format.lock().unwrap_or_else(PoisonError::into_inner)
                     {
-                        let (hdr, _) = output_in(
-                            cfg.mode,
-                            content,
-                            frame.info().color.hdr.as_ref(),
-                            last_tunnel.as_ref(),
-                        );
+                        let (hdr, _) =
+                            output_in(cfg.mode, content, hdr_meta.as_ref(), last_tunnel.as_ref());
                         let want = follow::Want {
                             rate_mhz: rate_mhz(&f),
                             signal: signal_of(hdr),
