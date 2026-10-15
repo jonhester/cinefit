@@ -348,6 +348,11 @@ struct Dataset {
     judging: Option<std::thread::JoinHandle<()>>,
 }
 
+/// The signal gone this long ends a viewing: the dataset's session closes,
+/// and the next frame opens a new one. Short drops (a player changing HDR or
+/// rate at a title's start, 1-3 s) stay within one.
+const VIEWING_GAP: Duration = Duration::from_secs(10);
+
 /// About half an hour at 24p: a film with no break in its signal is judged
 /// in pieces, each ending at a cut, so memory stays bounded.
 const JUDGE_EVERY: usize = 24 * 60 * 30;
@@ -440,13 +445,15 @@ impl Dataset {
             .ok();
     }
 
-    /// The last judging, then the recorder closed.
-    fn finish(mut self) {
+    /// Ends the viewing: the last judging, then its session closed. The next
+    /// frame recorded opens a new one.
+    fn end_session(&mut self) {
         self.judge(true);
         if let Some(j) = self.judging.take() {
             let _ = j.join();
         }
-        if let Some(r) = self.recorder {
+        self.next = 0;
+        if let Some(r) = self.recorder.take() {
             match r.finish() {
                 Ok(s) => info!(
                     "dataset: {} frames recorded to {}, {} dropped",
@@ -1414,6 +1421,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     last_frame_at.elapsed().as_millis()
                 );
             }
+            if dark && dataset.recorder.is_some() && last_frame_at.elapsed() >= VIEWING_GAP {
+                info!(
+                    "{:.1} s: no signal for {} s: the viewing ends",
+                    run_started.elapsed().as_secs_f64(),
+                    VIEWING_GAP.as_secs()
+                );
+                dataset.end_session();
+            }
             if let Some(frame) = taken {
                 if dark {
                     returns += 1;
@@ -1779,7 +1794,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         counts.metadata,
         counts.refused
     );
-    dataset.finish();
+    dataset.end_session();
     if cfg.crop {
         let shares: Vec<String> = finder
             .det
