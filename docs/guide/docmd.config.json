@@ -143,6 +143,11 @@
           "icon": "hammer"
         },
         {
+          "title": "FAQ",
+          "path": "/faq/",
+          "icon": "circle-help"
+        },
+        {
           "title": "Troubleshooting",
           "path": "/troubleshooting/",
           "icon": "life-buoy"
