@@ -125,9 +125,10 @@ pub fn session_dir(root: &Path) -> PathBuf {
     root.join("caught").join(stamp)
 }
 
-/// Where sessions go by default: `~/cinefit-clips`.
+/// Where sessions go by default: `~/cinefit-clips`, or the packaged
+/// service's `/var/lib/cinefit` ([`crate::places`]).
 pub fn default_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("cinefit-clips"))
+    crate::places::clips_root()
 }
 
 /// A session being written.

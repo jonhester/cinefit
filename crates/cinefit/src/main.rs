@@ -22,6 +22,7 @@ mod menu;
 #[cfg(target_os = "linux")]
 mod osd;
 mod pairs;
+mod places;
 #[cfg(target_os = "linux")]
 mod play;
 mod record;
@@ -260,7 +261,8 @@ enum Command {
         /// The DRM device; by default the first with a connected display.
         #[arg(long)]
         card: Option<PathBuf>,
-        /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml.
+        /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml,
+        /// or /etc/cinefit/cinefit.toml where the package is installed.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Override one setting for this run, as KEY=VALUE (repeatable;
@@ -292,7 +294,8 @@ enum Command {
     },
     /// List every setting: its value, range, what a change costs, and help.
     Settings {
-        /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml.
+        /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml,
+        /// or /etc/cinefit/cinefit.toml where the package is installed.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Print the settings as a complete, commented settings file instead.

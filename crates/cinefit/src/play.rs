@@ -503,7 +503,9 @@ impl Dataset {
         }
         if self.recorder.is_none() {
             match dataset::default_root()
-                .ok_or_else(|| std::io::Error::other("no HOME"))
+                .ok_or_else(|| {
+                    std::io::Error::other("no directory for recordings: HOME is not set")
+                })
                 .and_then(|r| dataset::Recorder::start(dataset::session_dir(&r)))
             {
                 Ok(r) => {

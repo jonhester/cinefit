@@ -25,9 +25,10 @@ use time::format_description::well_known::Rfc3339;
 /// by level, because it is an error.
 pub const FILE_ONLY: &str = "cinefit::file_only";
 
-/// The directory runs are logged in: `~/cinefit-logs`.
+/// The directory runs are logged in: `~/cinefit-logs`, or the packaged
+/// service's `/var/log/cinefit` ([`crate::places`]).
 pub fn default_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("cinefit-logs"))
+    crate::places::log_dir()
 }
 
 /// Logs to the terminal and to a new file in `dir`, named
@@ -35,7 +36,7 @@ pub fn default_dir() -> Option<PathBuf> {
 /// none: the terminal gets its lines either way.
 pub fn init(dir: Option<&Path>, prefix: &str) -> Result<PathBuf, String> {
     let file = dir
-        .ok_or_else(|| "HOME is not set".to_string())
+        .ok_or_else(|| "no log directory: HOME is not set".to_string())
         .and_then(|d| create(d, prefix).map_err(|e| format!("{}: {e}", d.display())));
     let (path, file) = match file {
         Ok((path, f)) => (Ok(path), Some(f)),

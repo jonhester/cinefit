@@ -19,7 +19,8 @@
 //! file they could be left on and forgotten.
 //!
 //! The file is `~/.config/cinefit-rs/cinefit.toml`, apart from the C++
-//! version's `~/.config/cinefit/cinefit.toml` until this one replaces it.
+//! version's `~/.config/cinefit/cinefit.toml` until this one replaces it;
+//! installed as a package, `/etc/cinefit/cinefit.toml` ([`crate::places`]).
 //!
 //! Pure: no hardware types, so it is tested anywhere.
 
@@ -666,13 +667,10 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The settings file's usual place.
+/// The settings file's usual place: `/etc/cinefit` for the packaged
+/// service, the home directory otherwise ([`crate::places`]).
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("cinefit-rs").join("cinefit.toml")
+    crate::places::config_file()
 }
 
 /// Reads settings from TOML text over the defaults. Unknown keys are errors:
