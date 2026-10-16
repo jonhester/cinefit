@@ -1,6 +1,6 @@
 ---
 title: "Installing"
-description: "Install cinefit on Ubuntu 26.04: the DeckLink driver, then the cinefit package, which sets up the system service, its user and its folders."
+description: "Install cinefit on Ubuntu 26.04 LTS: the DeckLink driver, then the cinefit package, which sets up the system service, its user and its folders."
 ---
 
 # Installing
