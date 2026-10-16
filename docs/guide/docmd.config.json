@@ -52,7 +52,7 @@
   "navigation": [
     {
       "title": "What cinefit is",
-      "path": "/",
+      "path": "/overview/",
       "icon": "film"
     },
     {
