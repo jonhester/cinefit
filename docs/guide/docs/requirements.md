@@ -11,11 +11,11 @@ A cinefit system is a PC in your rack, between your sources and your projector. 
 
 ## 1. A PC {#pc}
 
-<div class="setting need"><p>Runs Ubuntu and cinefit, with no desktop: cinefit starts by itself when the PC powers on, and after setup it needs no monitor or keyboard of its own. Any recent desktop will do.</p><dl><div><dt>Needs</dt><dd>Two PCIe slots, one for each card below; Ubuntu 26.04</dd></div><div><dt>CPU</dt><dd>From about 2015 on (Intel Haswell, AMD Excavator or Zen) for the published builds; older ones can <a href="/build-from-source/">build from source</a></dd></div><div><dt>Check</dt><dd>Room and airflow for two cards</dd></div></dl></div>
+<p>Runs Ubuntu and cinefit, with no desktop: cinefit starts by itself when the PC powers on, and after setup it needs no monitor or keyboard of its own. Any recent desktop will do.</p><ul class="need-facts"><li><span class="k">Needs</span><span>Two PCIe slots, one for each card below; Ubuntu 26.04</span></li><li><span class="k">CPU</span><span>From about 2015 on (Intel Haswell, AMD Excavator or Zen) for the published builds; older ones can <a href="/build-from-source/">build from source</a></span></li><li><span class="k">Check</span><span>Room and airflow for two cards</span></li></ul>
 
 ## 2. A graphics card {#gpu}
 
-<div class="setting need"><p>Scales, crops and colors every frame, and drives the projector. Developed and tested on an <strong>AMD Radeon RX 6400</strong>, chosen on purpose as a modest card: if cinefit runs well on it, most AMD cards will do.</p><dl><div><dt>Needs</dt><dd>An AMD card with Vulkan and HDMI out</dd></div><div><dt>Tested</dt><dd>RX 6400 only</dd></div><div><dt>Not tried</dt><dd>NVIDIA, Intel</dd></div></dl></div>
+<p>Scales, crops and colors every frame, and drives the projector. Developed and tested on an <strong>AMD Radeon RX 6400</strong>, chosen on purpose as a modest card: if cinefit runs well on it, most AMD cards will do.</p><ul class="need-facts"><li><span class="k">Needs</span><span>An AMD card with Vulkan and HDMI out</span></li><li><span class="k">Tested</span><span>RX 6400 only</span></li><li><span class="k">Not tried</span><span>NVIDIA, Intel</span></li></ul>
 
 <div class="options-label">Options</div>
 
@@ -23,7 +23,7 @@ A cinefit system is a PC in your rack, between your sources and your projector. 
 
 ## 3. A capture card {#capture}
 
-<div class="setting need"><p>How the picture gets into the PC: a <strong>Blackmagic DeckLink</strong> card with an HDMI input.</p><dl><div><dt>Needs</dt><dd>Blackmagic's Desktop Video driver, 16.0 or newer</dd></div><div><dt>Check</dt><dd>The frame rates it captures at 4K: films need 24, a source left at 60 needs 60</dd></div><div><dt>Tested</dt><dd>Mini Recorder 4K only</dd></div></dl></div>
+<p>How the picture gets into the PC: a <strong>Blackmagic DeckLink</strong> card with an HDMI input.</p><ul class="need-facts"><li><span class="k">Needs</span><span>Blackmagic's Desktop Video driver, 16.0 or newer</span></li><li><span class="k">Check</span><span>The frame rates it captures at 4K: films need 24, a source left at 60 needs 60</span></li><li><span class="k">Tested</span><span>Mini Recorder 4K only</span></li></ul>
 
 <div class="options-label">Options</div>
 
@@ -31,15 +31,15 @@ A cinefit system is a PC in your rack, between your sources and your projector. 
 
 ## 4. A source the capture card accepts {#source}
 
-<div class="setting need"><p>The capture card takes only signals without HDCP copy protection, which most commercial players apply; cinefit does not remove or bypass it. An HDMI splitter in front of the card also decides which kind of HDR the player sends.</p><dl><div><dt>Needs</dt><dd>A signal without HDCP</dd></div><div><dt>Then</dt><dd>An HDMI splitter whose EDID you can choose, and HDMI cables rated for 18 Gbps</dd></div><div><dt>More</dt><dd><a href="/signal-chain/">The signal chain</a> explains both</dd></div></dl></div>
+<p>The capture card takes only signals without HDCP copy protection, which most commercial players apply; cinefit does not remove or bypass it. An HDMI splitter in front of the card also decides which kind of HDR the player sends.</p><ul class="need-facts"><li><span class="k">Needs</span><span>A signal without HDCP</span></li><li><span class="k">Then</span><span>An HDMI splitter whose EDID you can choose, and HDMI cables rated for 18 Gbps</span></li><li><span class="k">More</span><span><a href="/signal-chain/">The signal chain</a> explains both</span></li></ul>
 
 ## 5. A projector or TV {#display}
 
-<div class="setting need"><p>Anything with an HDMI input. cinefit starts out set for a 4096x2160 projector on a 2.35:1 scope screen, and two settings adapt it to yours. Tested with a JVC 4096x2160 projector.</p><dl><div><dt>Needs</dt><dd>HDMI in; its native resolution at 24 Hz (nearly every 4K display has it)</dd></div><div><dt>Then</dt><dd>Set <a href="/settings/#output-width">the panel size</a> and <a href="/settings/#geometry-screen-ar">the screen ratio</a></dd></div><div><dt>Check</dt><dd>For constant image height, a scope screen and a lens that zooms</dd></div></dl></div>
+<p>Anything with an HDMI input. cinefit starts out set for a 4096x2160 projector on a 2.35:1 scope screen, and two settings adapt it to yours. Tested with a JVC 4096x2160 projector.</p><ul class="need-facts"><li><span class="k">Needs</span><span>HDMI in; its native resolution at 24 Hz (nearly every 4K display has it)</span></li><li><span class="k">Then</span><span>Set <a href="/settings/#output-width">the panel size</a> and <a href="/settings/#geometry-screen-ar">the screen ratio</a></span></li><li><span class="k">Check</span><span>For constant image height, a scope screen and a lens that zooms</span></li></ul>
 
 ## 6. A remote (optional) {#remote}
 
-<div class="setting need"><p>Any remote, through a small USB receiver that turns its buttons into keyboard keys. A plain USB keyboard works too, and the <a href="/web-page/">web page</a> works from a phone.</p><dl><div><dt>Needs</dt><dd>A free USB port</dd></div><div><dt>Then</dt><dd>Teach it the keys in <a href="/using/">Remote and menu</a></dd></div><div><dt>Tested</dt><dd>flirc, with a universal remote</dd></div></dl></div>
+<p>Any remote, through a small USB receiver that turns its buttons into keyboard keys. A plain USB keyboard works too, and the <a href="/web-page/">web page</a> works from a phone.</p><ul class="need-facts"><li><span class="k">Needs</span><span>A free USB port</span></li><li><span class="k">Then</span><span>Teach it the keys in <a href="/using/">Remote and menu</a></span></li><li><span class="k">Tested</span><span>flirc, with a universal remote</span></li></ul>
 
 <div class="options-label">Options</div>
 
