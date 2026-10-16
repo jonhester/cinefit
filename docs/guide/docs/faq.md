@@ -11,9 +11,11 @@ description: "Common questions about cinefit: what it costs, Dolby Vision and HD
 
 A video processor for a home theater that runs on a Linux PC you build: it captures what your player sends, crops away the black bars so every film is as tall as your screen, handles HDR10 and Dolby Vision, and drives the projector directly. [What cinefit is](/overview/) has the whole picture.
 
-### What does it cost?
+### Is it really free?
 
-Nothing. cinefit is open source, under the Apache-2.0 or MIT license, your choice. You buy the parts ([What you need](/requirements/)); buying them through the guide's Amazon links supports the project at no cost to you.
+Yes. cinefit is open source, under the Apache-2.0 or MIT license, your choice: no price, no subscription, no license key, no paid tier and no features held back. Everything else it needs is free too: Ubuntu, and Blackmagic's Desktop Video driver for the capture card.
+
+What costs money is the hardware ([What you need](/requirements/)). The only way the project earns anything is the guide's Amazon links, which pay a small commission on what you buy through them, at no cost to you, and say so where they appear. Buying elsewhere works just as well.
 
 ### Is it a finished product?
 
