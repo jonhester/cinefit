@@ -58,3 +58,10 @@ figure.shot.phones img { width: calc(50% - 8px); min-width: 220px; max-width: 32
 @media (max-width: 640px) { .setting dl { grid-template-columns: 1fr; gap: 8px; } }
 .setting ul { margin: 0 0 12px; padding-left: 1.1em; }
 .setting li { margin: 4px 0; }
+
+/* The parts on What you need: the settings cards, with links. */
+:root { --tag-untried: #efeff2; --tag-untried-t: #5b5b66; }
+[data-theme="dark"] { --tag-untried: #26262d; --tag-untried-t: #a3a3ad; }
+.tag-untried { background: var(--tag-untried); color: var(--tag-untried-t); }
+.setting.part .links { margin-top: 12px; font-size: 0.9em; }
+.disclosure { font-size: 0.88em; color: var(--fig-dim); border-left: 3px solid var(--fig-hot-line); padding: 4px 0 4px 12px; }
