@@ -7,8 +7,13 @@ description: "cinefit is a headless Linux video processor for home theater proje
 
 cinefit is a video processor for a home theater, running on an ordinary Linux PC with no desktop. It sits between your sources and your projector:
 
-```text
-player or streamer -> receiver -> HDMI splitter -> capture card -> [cinefit PC] -> projector
+```mermaid
+flowchart LR
+    source([Player or streamer]) --> avr[Receiver] --> splitter[HDMI splitter] --> card
+    subgraph pc [The cinefit PC]
+        card[Capture card] --> cinefit[cinefit] --> gpu[GPU output]
+    end
+    gpu --> display([Projector])
 ```
 
 Every frame that arrives on the capture card is:

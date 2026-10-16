@@ -5,9 +5,15 @@ description: "How to connect sources, an AV receiver, an HDCP-stripping HDMI spl
 
 # The signal chain
 
-```text
-player / streamer -> AV receiver -> HDMI splitter -> DeckLink input
-                                                     cinefit PC GPU -> projector
+```mermaid
+flowchart LR
+    source([Player or streamer]) --> avr["AV receiver<br/>(optional)"] --> splitter["HDMI splitter<br/>(strips HDCP)"]
+    splitter -- protected output --> tv([Another display, optional])
+    splitter -- HDCP removed --> card
+    subgraph pc [The cinefit PC]
+        card[DeckLink input] --> gpu[GPU output]
+    end
+    gpu --> display([Projector])
 ```
 
 The receiver is optional; it is there for audio, and cinefit can read its input names ([Receiver and Apple TV](/integrations/)).
