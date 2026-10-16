@@ -31,6 +31,6 @@ The **slate** is shown whenever there is no picture: **No signal**, **Signal los
 
 ### Your theater's name
 
-Above the state, the slate shows your theater's name: **The Screening Room** in the picture below stands in for yours. Set it on the [web page](/web-page/) (**Screen**, then **Theater name**) or as [`slate.venue`](/settings/#slate-venue) in the settings file, up to 40 characters. It changes at once, with no restart. Left empty, the slate shows only the state.
+Above the state, the slate shows your theater's name, where the picture below says **Your theater's name here**. Set it on the [web page](/web-page/) (**Screen**, then **Theater name**) or as [`slate.venue`](/settings/#slate-venue) in the settings file, up to 40 characters. It changes at once, with no restart. Left empty, the slate shows only the state.
 
-<figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: The Screening Room, and under it No signal, small, in the lower left corner" width="2400" height="1021" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name you set, and the state under it, small, in one corner.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: Your theater's name here, and under it No signal, small, in the lower left corner" width="2400" height="1021" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name you set, and the state under it, small, in one corner.</figcaption></figure>

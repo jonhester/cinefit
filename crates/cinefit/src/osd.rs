@@ -1049,7 +1049,13 @@ mod preview {
         let (w, h) = (4096, 2160);
         let band = (209, 1742);
         let states = [
-            ("No signal", "", Tone::Plain, "The Screening Room"),
+            // The user guide's screenshot of the slate (docs/guide/figs/osd.py).
+            (
+                "No signal",
+                "",
+                Tone::Plain,
+                "Your theater\u{2019}s name here",
+            ),
             ("No signal", "", Tone::Plain, ""),
             (
                 "Signal lost",
