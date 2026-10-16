@@ -46,6 +46,8 @@ jobs:
           cache-dependency-path: docs/guide/package-lock.json
       - run: npm ci --ignore-scripts
       - run: npx docmd validate
+      # The version on every page: the tag's, or unreleased for a PR.
+      - run: python3 stamp-version.py ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       - run: npx docmd build
       # Production is the project's `main` branch in Cloudflare's terms;
       # any other branch name is a preview, here aliased as next. Which of

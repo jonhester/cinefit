@@ -94,6 +94,6 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
 <footer class="bottom">
   <p>Film frames: <em>Charade</em> (1963), public domain in the US; <em>Tears of Steel</em> &copy; Blender Foundation, <a href="https://mango.blender.org">mango.blender.org</a>, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.</p>
   <p>cinefit is open source, under Apache-2.0 or MIT. Developed on an AMD RX 6400, a DeckLink Mini Recorder 4K and a JVC projector; other hardware is untested.</p>
-  <p><a href="/overview/">Guide</a> · <a href="/install/">Install</a> · <a href="/troubleshooting/">Troubleshooting</a> · <a href="https://github.com/jonhester/cinefit">GitHub</a> · <a href="https://ko-fi.com/jonhester">Tip jar</a></p>
+  <p><span class="version">Unreleased: built from main</span> · <a href="/overview/">Guide</a> · <a href="/install/">Install</a> · <a href="/troubleshooting/">Troubleshooting</a> · <a href="https://github.com/jonhester/cinefit">GitHub</a> · <a href="https://ko-fi.com/jonhester">Tip jar</a></p>
 </footer>
 </div>

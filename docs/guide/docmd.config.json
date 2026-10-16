@@ -31,13 +31,29 @@
     },
     "footer": {
       "style": "minimal",
-      "content": "cinefit is dual licensed under Apache-2.0 and MIT. As an Amazon Associate, cinefit's author earns from qualifying purchases.",
+      "content": "Guide for Unreleased: built from main. cinefit is dual licensed under Apache-2.0 and MIT. As an Amazon Associate, cinefit's author earns from qualifying purchases.",
       "branding": false
     },
     "editLink": {
       "enabled": true,
       "baseUrl": "https://github.com/jonhester/cinefit/edit/main/docs/guide/docs",
       "text": "Edit this page"
+    },
+    "banners": {
+      "sidebar-top": {
+        "content": "**Unreleased: built from main**",
+        "type": "info",
+        "dismissible": false
+      },
+      "top": {
+        "content": "This guide is built from unreleased code. The current release's guide is at cinefit.org.",
+        "type": "warning",
+        "dismissible": false,
+        "link": {
+          "url": "https://cinefit.org/",
+          "text": "Go to the released guide"
+        }
+      }
     }
   },
   "theme": {
