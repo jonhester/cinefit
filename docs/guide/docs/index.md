@@ -11,7 +11,7 @@ components:
   theme: false
   themeMode: false
   spa: false
-customHead: '<link rel="stylesheet" href="/assets/css/landing.css">'
+customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="apple-touch-icon" href="/assets/images/apple-touch-icon.png">'
 ---
 <div class="landing">
 <header class="top">

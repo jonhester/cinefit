@@ -172,5 +172,6 @@
     "ai": {
       "enabled": false
     }
-  }
+  },
+  "favicon": "/assets/images/favicon.svg"
 }
