@@ -33,7 +33,7 @@ slate says "Can't show this format". Here is cinefit probe and the journal: ...
 ```
 
 ::: callout warning "Check what it tells you"
-An assistant can be confidently wrong, especially about root commands and EDID changes. Before running anything with `sudo`, or anything that changes the splitter's or capture card's EDID, check it against this guide. The [Settings reference](/settings/) is generated from cinefit's own code and is the authority on setting names and values.
+An assistant can be confidently wrong, especially about root commands and EDID changes. Before running anything with `sudo`, or anything that changes the splitter's or capture card's EDID, check it against this guide. The [Settings](/settings/) is generated from cinefit's own code and is the authority on setting names and values.
 :::
 
 Before pasting logs or the settings file in public, remove anything private: addresses on your network, and the Apple TV's titles.

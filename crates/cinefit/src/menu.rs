@@ -54,6 +54,16 @@ enum Row {
     },
 }
 
+/// Whether the menu offers `key`: the user guide's settings page says so.
+#[cfg(test)]
+pub(crate) fn offers(key: &str) -> bool {
+    (0..PAGES.len()).any(|p| {
+        rows(p)
+            .iter()
+            .any(|r| matches!(r, Row::Setting { key: k, .. } if *k == key))
+    })
+}
+
 fn rows(page: usize) -> &'static [Row] {
     const PICTURE: &[Row] = &[
         Row::Setting {

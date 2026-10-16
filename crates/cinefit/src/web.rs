@@ -274,7 +274,7 @@ fn log_text(name: &str) -> Option<String> {
 
 /// Where each setting appears on the page, under which label: the menu's
 /// pages, plus the settings only the page offers.
-fn place(key: &str) -> (&'static str, &'static str) {
+pub(crate) fn place(key: &str) -> (&'static str, &'static str) {
     match key {
         "detect.crop" => ("Picture", "Crop black bars"),
         "geometry.fill_max_ar" => ("Picture", "Fill the screen up to"),

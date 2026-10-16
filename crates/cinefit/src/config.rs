@@ -801,60 +801,113 @@ pub fn render_changed(c: &Config) -> String {
 }
 
 /// The user guide's settings page, as Markdown: every row with its help,
-/// range, default and cost. The guide is generated from the table so that it
-/// cannot describe a setting the binary does not have; a test fails when the
-/// committed page differs (`CINEFIT_UPDATE_GUIDE=1 cargo test -p cinefit
-/// config` rewrites it).
+/// values, default and cost, grouped and named as the web page shows them,
+/// and marked where the on-screen menu offers it too. The guide is generated
+/// from the table so that it cannot describe a setting the binary does not
+/// have; a test fails when the committed page differs
+/// (`CINEFIT_UPDATE_GUIDE=1 cargo test -p cinefit config` rewrites it).
 #[cfg(test)]
 fn render_markdown() -> String {
+    // The detector's own settings, which most people leave alone, go last
+    // under a heading of their own rather than among the picture's.
+    const TUNING: &[&str] = &["detect.record", "detect.frames_gb", "detect.pair_every"];
+    const GROUPS: &[(&str, &str)] = &[
+        ("Picture", ""),
+        ("Output", ""),
+        ("Screen", ""),
+        ("Input", ""),
+        (
+            "Receiver",
+            "For the [receiver and Apple TV](/integrations/) integrations.",
+        ),
+        ("Web page", ""),
+        (
+            "Detector tuning",
+            "For improving cinefit's bar detector; most people leave these alone. Recording \
+             is on by default and keeps what the detector measured, a little each film, and some \
+             frames within a disk limit; turn it off with the first setting here.",
+        ),
+    ];
     let d = Config::default();
     let mut out = String::from(
-        "---\ntitle: \"Settings reference\"\ndescription: \"Every cinefit setting: what it does, \
-         its values, its default and what changing it costs.\"\n---\n\n\
+        "---\ntitle: \"Settings\"\ndescription: \"Every cinefit setting: what it does, its \
+         values, its default and what changing it costs.\"\n---\n\n\
          <!-- Generated from crates/cinefit/src/config.rs: edit the table there, then run \
          CINEFIT_UPDATE_GUIDE=1 cargo test -p cinefit config -->\n\n\
-         # Settings reference\n\n\
-         Settings live in `/etc/cinefit/cinefit.toml` (in `~/.config/cinefit-rs/` when cinefit \
-         runs from your home directory), one `[section]` per group below. A file that is not there \
-         means every setting is at its default, and the file only needs the settings you change. \
-         The on-screen menu and the web page change the same settings and save them to the same \
-         file; to edit it by hand, `sudo -u cinefit editor /etc/cinefit/cinefit.toml`. `cinefit settings` prints them all with their current \
-         values, and `cinefit settings --toml` prints a complete file to start from.\n\n\
-         Each setting says what changing it costs while cinefit is running:\n\n\
-         - **Immediately**: the next frame uses it, with no interruption.\n\
-         - **Immediately, with a resync**: the output is set up again, and the display blanks \
-         for a few seconds while it locks on to the new signal.\n\
-         - **When cinefit starts**: read once at startup; restart the service to apply it.\n",
+         # Settings\n\n\
+         Every setting, grouped as on the [web page](/web-page/), where all of them can be \
+         changed. Those marked **in the menu** are on the remote's [menu](/using/#menu) too. \
+         Both save to the settings file, `/etc/cinefit/cinefit.toml`, which holds only what you \
+         have changed; `cinefit settings` lists every setting with its current value.\n\n\
+         A change costs one of three things:\n\n\
+         - **applies now**: the next frame uses it.\n\
+         - **resyncs the display**: the display blanks for a few seconds while it locks on.\n\
+         - **applies at the next start**: restart the service (`sudo systemctl restart \
+         cinefit`).\n",
     );
-    let mut section = "";
-    for s in SETTINGS {
-        let (sec, name) = s.key.split_once('.').expect("keys are section.name");
-        if sec != section {
-            out.push_str(&format!("\n## [{sec}]\n"));
-            section = sec;
+    let quote = |v: &str| format!("`{v}`");
+    for (group, intro) in GROUPS {
+        let rows: Vec<&Setting> = SETTINGS
+            .iter()
+            .filter(|s| {
+                let tuning = TUNING.contains(&s.key);
+                if *group == "Detector tuning" {
+                    tuning
+                } else {
+                    !tuning && crate::web::place(s.key).0 == *group
+                }
+            })
+            .collect();
+        assert!(!rows.is_empty(), "no settings in {group}");
+        out.push_str(&format!("\n## {group}\n"));
+        if !intro.is_empty() {
+            out.push_str(&format!("\n{intro}\n"));
         }
-        let default = match s.get(&d) {
-            Value::Name(n) if n.is_empty() => "empty".to_string(),
-            Value::Name(n) => format!("`\"{n}\"`"),
-            v => format!("`{v}`"),
-        };
-        let applies = match s.apply {
-            Apply::Live => "immediately",
-            Apply::Modeset => "immediately, with a resync",
-            Apply::Start => "when cinefit starts",
-        };
-        // `<` opens a tag in Markdown: help text may say `<this machine>`.
-        // Each heading carries its key as its anchor, `output-width`, so
-        // links to a setting survive the page being reorganized.
-        let help = s.help.replace('<', "&lt;");
-        out.push_str(&format!(
-            "\n### {} {{#{}}}\n\n{help}\n\n\
-             - In the file: `{name}` under `[{sec}]`\n- Values: {}\n- Default: {default}\n\
-             - Applies: {applies}\n",
-            s.key,
-            s.key.replace(['.', '_'], "-"),
-            s.range(),
-        ));
+        for s in rows {
+            let label = crate::web::place(s.key).1;
+            let values = match s.kind {
+                Kind::Int { min, max } => format!("{min} to {max}"),
+                Kind::Float { min, max } => format!("{min} to {max}"),
+                Kind::Choice(names) => match names.split_last() {
+                    Some((last, [])) => quote(last),
+                    Some((last, rest)) => format!(
+                        "{} or {}",
+                        rest.iter().map(|n| quote(n)).collect::<Vec<_>>().join(", "),
+                        quote(last)
+                    ),
+                    None => String::new(),
+                },
+                Kind::Text { max } => format!("text, up to {max} characters"),
+                Kind::Ratio { min, max, off } => format!(
+                    "{min} to {max}, as a number or W:H{}",
+                    if off { ", or 0 for off" } else { "" }
+                ),
+            };
+            let default = match s.get(&d) {
+                Value::Name(n) if n.is_empty() => "empty".to_string(),
+                v => quote(&v.to_string()),
+            };
+            let applies = match s.apply {
+                Apply::Live => "applies now",
+                Apply::Modeset => "resyncs the display",
+                Apply::Start => "applies at the next start",
+            };
+            let menu = if crate::menu::offers(s.key) {
+                " \u{b7} **in the menu**"
+            } else {
+                ""
+            };
+            // `<` opens a tag in Markdown: help text may say `<this machine>`.
+            let help = s.help.replace('<', "&lt;");
+            // The key is the anchor, `#output-width`, so links survive a
+            // label or a group changing.
+            out.push_str(&format!(
+                "\n### {label} {{#{}}}\n\n{help}\n\n\
+                 `{}` \u{b7} {values} \u{b7} default {default} \u{b7} {applies}{menu}\n",
+                s.key.replace(['.', '_'], "-"),
+                s.key,
+            ));
+        }
     }
     out
 }

@@ -43,7 +43,7 @@ width = 3840
 screen_ar = 2.39
 ```
 
-Every setting is in the [Settings reference](/settings/). Restart the service to pick up the panel size:
+Every setting is in the [Settings](/settings/). Restart the service to pick up the panel size:
 
 ```sh
 sudo systemctl restart cinefit
