@@ -11,7 +11,7 @@ Besides the [menu](/using/#menu), cinefit draws three things over the picture or
 
 **Info** on the [remote](/using/) shows what cinefit is doing, refreshed every second, and closes after 30 seconds or on **Back**:
 
-<figure class="shot"><img src="/assets/images/osd-info.png" alt="The info panel: IN Dolby Vision low latency, 3840 x 2160, 23.976, YCbCr 4:2:2 10-bit; OUT SDR BT.2020, unchanged from the player; CROP 2.40:1, 280 / 279 rows, zoom in 12 s ago; LAST 10 S 240 shown, 0 repeated, frame work 7.9 ms of 41.7" width="1143" height="1090" loading="lazy"><figcaption>The info panel as cinefit draws it, over a film: low-latency Dolby Vision coming in, a 2.40:1 film cropped, no frames repeated. Picture: <em>Tears of Steel</em> &copy; Blender Foundation, mango.blender.org, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-info.png" alt="The info panel: IN Dolby Vision low latency, 3840 x 2160, 23.976, YCbCr 4:2:2 10-bit; OUT SDR BT.2020, unchanged from the player; CROP 2.40:1, 280 / 279 rows, zoom in 12 s ago; LAST 10 S 240 shown, 0 repeated, frame work 7.9 ms of 41.7" width="1143" height="1090" loading="lazy"><figcaption>The info panel as cinefit draws it, over a film: low-latency Dolby Vision coming in, a 2.40:1 film cropped, no frames repeated. Picture: <em>Tears of Steel</em> &copy; Blender Foundation, <a href="https://mango.blender.org">mango.blender.org</a>, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>, with cinefit's display drawn over it.</figcaption></figure>
 
 - **In**: the picture type (Dolby Vision tunnel or low latency, HDR10, HLG, SDR), size, rate, format and the brightest level in the current picture. With a Denon receiver, the input's name first.
 - **Playing**: with an Apple TV, the title, app and position.
@@ -23,7 +23,7 @@ Besides the [menu](/using/#menu), cinefit draws three things over the picture or
 
 A **banner** appears for a few seconds when the picture type changes, saying what came in and what happens to it. When the change needs a resync it waits until the display shows a picture again. Turn banners off with [`osd.banners`](/settings/#osd-banners).
 
-<figure class="shot"><img src="/assets/images/osd-banner.png" alt="A banner in the top left corner of the picture: Dolby Vision, and under it 4K 23.976, mapped by the player, shown as is" width="2304" height="922" loading="lazy"><figcaption>A banner as low-latency Dolby Vision starts, in the top left of the picture, as cinefit draws it. Picture: <em>Tears of Steel</em> &copy; Blender Foundation, mango.blender.org, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-banner.png" alt="A banner in the top left corner of the picture: Dolby Vision, and under it 4K 23.976, mapped by the player, shown as is" width="2304" height="922" loading="lazy"><figcaption>A banner as low-latency Dolby Vision starts, in the top left of the picture, as cinefit draws it. Picture: <em>Tears of Steel</em> &copy; Blender Foundation, <a href="https://mango.blender.org">mango.blender.org</a>, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>, with cinefit's display drawn over it.</figcaption></figure>
 
 ## The waiting slate
 

@@ -158,7 +158,7 @@ b.append(f'<rect x="290" y="{ly - 11}" width="16" height="12" class="band"/>' + 
 b.append(f'<rect x="470" y="{ly - 11}" width="16" height="12" class="pic"/>' + text(494, ly, 'the picture'))
 figs['cih'] = figure(760, round(ly + 12), 'Constant image height: a 16:9 show, a 2.39 film and a 2.76 film on a 2.35 screen', ''.join(b),
     'Defaults: geometry.screen_ar = 2.35, geometry.fill_max_ar = 2.40. Content up to the fill limit fills the screen\'s height; wider content keeps its whole width. '
-    'Frames: <em>Charade</em> (1963), public domain in the US; <em>Tears of Steel</em> &copy; Blender Foundation, mango.blender.org, '
+    'Frames: <em>Charade</em> (1963), public domain in the US; <em>Tears of Steel</em> &copy; Blender Foundation, <a href="https://mango.blender.org">mango.blender.org</a>, '
     '<a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>, cut to 2.76 for the third.')
 
 # 4. The remote.
