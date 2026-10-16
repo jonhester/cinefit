@@ -1,6 +1,8 @@
-# cinefit as the system's service. tools/install.sh fills in @USER@, @GROUP@
-# and @HOME@ and prints the one-time steps that install it; after that,
-# upgrading, rolling back and switching builds need no root (see install.sh).
+# cinefit as the system's service, run from ~/cinefit-app. tools/install.sh
+# fills in @USER@, @GROUP@ and @HOME@ and prints the one-time steps that
+# install it; after that, upgrading, rolling back and switching builds need no
+# root (see install.sh). The .deb installs tools/deb/cinefit.service instead,
+# under the same name: install one or the other.
 [Unit]
 Description=cinefit: the capture card to the projector
 # The display and the capture card have one owner at a time: another service

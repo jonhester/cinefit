@@ -1,0 +1,43 @@
+# cinefit as the packaged system service: the unit tools/deb.sh puts in the
+# .deb. It runs /usr/bin/cinefit as the cinefit system user, and systemd makes
+# its directories (see crates/cinefit/src/places.rs): settings in
+# /etc/cinefit, recordings in /var/lib/cinefit, run logs in /var/log/cinefit.
+# tools/cinefit.service is the other way to run it, from ~/cinefit-app.
+[Unit]
+Description=cinefit: the capture card to the projector
+# Restart forever: with the display or the capture card missing, cinefit exits
+# and tries again every RestartSec, and comes back by itself once they are there.
+StartLimitIntervalSec=0
+After=network.target
+
+[Service]
+Type=simple
+User=cinefit
+Group=cinefit
+# The display (video), the GPU's render node (render), the remote (input).
+SupplementaryGroups=video render input
+
+ConfigurationDirectory=cinefit
+StateDirectory=cinefit
+LogsDirectory=cinefit
+WorkingDirectory=/var/lib/cinefit
+ExecStart=/usr/bin/cinefit play
+
+# The capture card's module loads through udev, which can lose a race with
+# early boot. Wait for its node, but start anyway if it never appears: cinefit
+# then exits and Restart= keeps trying.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/blackmagic/io0 ] && exit 0; sleep 1; done; echo "DeckLink not present after 30s; starting without it" >&2'
+
+Restart=always
+RestartSec=5
+
+# cinefit holds DRM master and handles SIGTERM: it writes its summary and lets
+# go of the display. Give it time to.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

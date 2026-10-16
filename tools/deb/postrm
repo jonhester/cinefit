@@ -1,0 +1,9 @@
+#!/bin/sh
+# Purging removes what cinefit kept: its settings and Apple TV pairing, its
+# recordings and its logs. A plain remove keeps them for a reinstall.
+set -e
+systemctl daemon-reload >/dev/null 2>&1 || true
+if [ "$1" = purge ]; then
+    rm -rf /etc/cinefit /var/lib/cinefit /var/log/cinefit
+fi
+exit 0

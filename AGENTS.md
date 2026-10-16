@@ -66,6 +66,13 @@ published build), copies it there and repoints `current`;
 watching. The one-time root setup, and keeping Ubuntu's automatic updates from
 restarting it mid-film, are in `docs/service.md`.
 
+Each release also publishes a `.deb` (`tools/deb.sh`, unit and maintainer
+scripts in `tools/deb/`): `/usr/bin/cinefit`, run by a `cinefit` system user
+with its settings in `/etc/cinefit`, recordings in `/var/lib/cinefit` and logs
+in `/var/log/cinefit`, the directories systemd hands over
+(`crates/cinefit/src/places.rs`). An upgrade never restarts the service. The
+package is for other people's machines; this rig keeps `~/cinefit-app`.
+
 Releases are SemVer from 0.1.0, the version in `Cargo.toml`:
 `tools/release.sh patch|minor|major` bumps it, commits, tags and pushes, as
 `npm version` does, and `.github/workflows/release.yml` publishes one x86-64-v3

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Makes the user and starts the service on a first install. An upgrade never
+# restarts it: a restart is a resync on the display, so the running service
+# keeps its build until its next start (a boot, or `systemctl restart
+# cinefit`), as tools/install.sh does.
+set -e
+if [ "$1" = configure ]; then
+    systemd-sysusers cinefit.conf
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ -z "$2" ]; then
+        systemctl enable cinefit.service >/dev/null 2>&1 || true
+        systemctl start cinefit.service || true
+    elif systemctl is-active -q cinefit.service; then
+        echo "cinefit: the running service keeps its build until its next start;"
+        echo "         'sudo systemctl restart cinefit' to switch now (the display will resync)"
+    fi
+fi
+exit 0

@@ -51,7 +51,12 @@ jobs:
           # The binary says the version it was built as.
           target/release/cinefit --version | grep -F "cinefit $VERSION ("
           tools/package.sh target/release/cinefit "$VERSION" dist
-          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          tools/deb.sh target/release/cinefit "$VERSION" dist
+          # The package again under a name without the version, so the guide
+          # can give one link that is always the latest:
+          # releases/latest/download/cinefit_amd64.deb.
+          cp "dist/cinefit_${VERSION}_amd64.deb" dist/cinefit_amd64.deb
+          (cd dist && sha256sum -- *.tar.gz *.deb > SHA256SUMS && cat SHA256SUMS)
       - env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
