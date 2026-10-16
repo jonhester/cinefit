@@ -1,15 +1,15 @@
 ---
 title: "The signal chain"
-description: "How to connect sources, an AV receiver, an HDCP-stripping HDMI splitter and the DeckLink capture card for cinefit, and which EDID choices decide HDR10, Dolby Vision tunnel or LLDV."
+description: "How sources, an AV receiver, an HDMI splitter and the DeckLink capture card connect for cinefit, what signal the card accepts, and which EDID choices decide HDR10, Dolby Vision tunnel or LLDV."
 ---
 
 # The signal chain
 
 ```mermaid
 flowchart LR
-    source([Player or streamer]) --> avr["AV receiver<br/>(optional)"] --> splitter["HDMI splitter<br/>(strips HDCP)"]
-    splitter -- protected output --> tv([Another display, optional])
-    splitter -- HDCP removed --> card
+    source([Player or streamer]) --> avr["AV receiver<br/>(optional)"] --> splitter["HDMI splitter<br/>(EDID choice)"]
+    splitter --> tv([Another display, optional])
+    splitter --> card
     subgraph pc [The cinefit PC]
         card[DeckLink input] --> gpu[GPU output]
     end
@@ -18,9 +18,13 @@ flowchart LR
 
 The receiver is optional; it is there for audio, and cinefit can read its input names ([Receiver and Apple TV](/integrations/)).
 
+## What the capture card accepts {#accepts}
+
+**The capture card accepts only signals without HDCP.** Most commercial players protect their output, and a protected signal gives no picture: the slate says **No signal**. cinefit does not remove or bypass copy protection; what reaches the card is up to the equipment upstream.
+
 ## Why a splitter
 
-Players protect most video with HDCP, and capture cards refuse HDCP signals: you get no picture at all. An HDMI splitter that removes HDCP on one of its outputs, placed just before the card, solves it. Developed with an EZCOO EZ-SP12H2.
+A splitter between the receiver and the card decides which EDID the player sees, and so which kind of signal it sends, independently of the projector and the receiver. Its second output can feed another display.
 
 ## The EDID decides what the player sends
 

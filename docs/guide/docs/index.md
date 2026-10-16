@@ -85,7 +85,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css">'
     <li><strong>A PC</strong> with Ubuntu 26.04 and a free PCIe slot</li>
     <li><strong>An AMD graphics card</strong>, tested on the Radeon RX 6400</li>
     <li><strong>A Blackmagic DeckLink</strong> capture card with HDMI in</li>
-    <li><strong>An HDMI splitter</strong> that removes HDCP</li>
+    <li><strong>A source</strong> whose signal the capture card accepts</li>
   </ol>
   <a class="button primary" href="/requirements/">See the full list</a>
 </section>

@@ -13,7 +13,7 @@ Work from the input to the screen. The first three checks are read-only and safe
 cinefit probe
 ```
 
-You should see your DeckLink, its `persistent ID`, and the format arriving on its input (for example `3840x2160 23.976`, YCbCr, HDR metadata if any). No signal here means the problem is upstream: the splitter, the EDID or HDCP. See [The signal chain](/signal-chain/).
+You should see your DeckLink, its `persistent ID`, and the format arriving on its input (for example `3840x2160 23.976`, YCbCr, HDR metadata if any). No signal here means the problem is upstream: the cables, the EDID, or a signal the card does not accept. See [The signal chain](/signal-chain/).
 
 ## 2. Does the display offer the right modes?
 

@@ -9,9 +9,9 @@ Start with the log: `journalctl -u cinefit -n 100`, or the newest file in `/var/
 
 ## The slate says "No signal"
 
-- **Cause**: nothing reaches the capture card, or it is HDCP protected.
+- **Cause**: nothing reaches the capture card, or the signal is one it does not accept, such as an HDCP-protected one.
 - **Check**: `cinefit probe` shows no format on the input. Try another source, or connect the source straight to the splitter.
-- **Fix**: make sure the splitter output feeding the card strips HDCP, and that the cables are rated for 18 Gbps.
+- **Fix**: check the cables (rated for 18 Gbps) and the source, and see [What the capture card accepts](/signal-chain/#accepts).
 
 ## "Can't show this format · set the player to YCbCr"
 

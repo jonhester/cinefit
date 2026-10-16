@@ -21,8 +21,8 @@ cinefit is built and tested with an **AMD Radeon RX 6400**, a small, quiet, low-
 A **Blackmagic DeckLink** card with an HDMI input, such as the **DeckLink Mini Recorder 4K**. This is how the picture gets into the PC.
 ::: /step
 
-::: step "An HDMI splitter that removes HDCP"
-Players copy-protect their output, and capture cards refuse protected signals. A splitter such as the **EZCOO EZ-SP12H2**, placed just before the capture card, takes care of that. [The signal chain](/signal-chain/) explains how to set it up.
+::: step "A source the capture card accepts"
+The capture card takes only signals without HDCP copy protection, which most commercial players apply; cinefit does not remove or bypass it. An HDMI splitter in front of the card also decides which kind of HDR the player sends. [The signal chain](/signal-chain/) explains both.
 ::: /step
 
 ::: step "Your projector or TV"

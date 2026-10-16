@@ -39,7 +39,7 @@ figs = {}
 i = 'path'
 b = [marker(i)]
 b.append(text(20, 18, 'Every frame takes the same path, from the player to the screen', 't b', size=15))
-top = [(20, ['Player or streamer']), (230, ['Receiver', 'optional']), (440, ['HDMI splitter', 'removes HDCP'])]
+top = [(20, ['Player or streamer']), (230, ['Receiver', 'optional']), (440, ['HDMI splitter', 'chooses the EDID'])]
 for x, l in top:
     b.append(box(x, 36, 170, 48, [(l[0], True)] + [(s, False) for s in l[1:]]))
 b.append(arrow(i, [(190, 60), (228, 60)]))
