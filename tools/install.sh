@@ -3,7 +3,8 @@
 # switches the service to another build. No root: the service runs
 # ~/cinefit-app/current, a symlink this script repoints.
 #
-#   tools/install.sh                     build this tree and make it current
+#   tools/install.sh                     build this tree and make it current;
+#                                        outside a source tree, --release
 #   tools/install.sh --release [VERSION] a published release (default: the
 #                                        latest)
 #   tools/install.sh --rollback          swap current and previous
@@ -22,10 +23,27 @@
 # with libplacebo linked in. Published builds come from GitHub's releases
 # (CINEFIT_REPO, default jonhester/cinefit), built for x86-64-v3, checked
 # against SHA256SUMS.
+#
+# Each release also publishes this script, so a release installs without a
+# clone or a build:
+#   curl -fsSL https://github.com/jonhester/cinefit/releases/latest/download/install.sh | sh
+# Run outside a source tree, it installs releases only, and keeps itself and
+# the service's templates, from the installed release's tag, in
+# ~/cinefit-app/tools/: that copy is the one to run for the next update.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 app="${CINEFIT_APP:-$HOME/cinefit-app}"
+
+# A source tree builds and has the templates beside this script; anywhere
+# else (piped from curl, or the copy in $app/tools) only releases install,
+# and the templates are the ones fetched with the last release.
+if [ -f "$root/Cargo.toml" ] && [ -f "$root/tools/cinefit.service" ]; then
+    tools="$root/tools"
+else
+    tools="$app/tools"
+    root=""
+fi
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
@@ -56,7 +74,7 @@ switch_to() {
 # Fill in the templates for this user, for the steps only root can take.
 render() {
     sed -e "s|@USER@|$(id -un)|g" -e "s|@GROUP@|$(id -gn)|g" -e "s|@HOME@|$HOME|g" \
-        "$root/tools/$1" > "$app/$1"
+        "$tools/$1" > "$app/$1"
 }
 
 # Until the unit runs `current`, a switch here changes nothing the service
@@ -67,6 +85,7 @@ unit_ready() {
 
 check_unit() {
     unit_ready && return 0
+    [ -f "$tools/cinefit.service" ] || die "no service templates in $tools: install a release first"
     render cinefit.service
     echo
     echo "The service does not run $app/current yet. Once, as the owner:"
@@ -128,6 +147,7 @@ $(echo "$links" | grep "not found")"
 }
 
 install_build() {
+    [ -n "$root" ] || die "not in a source tree: --release installs a published build"
     cd "$root"
     # A version that names a commit, so `current` says what is running.
     version=$(git rev-parse --short=12 HEAD)
@@ -177,7 +197,23 @@ install_release() {
     (cd "$work" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c --quiet -) ||
         die "$name.tar.gz does not match its SHA256SUMS"
     tar -C "$work" -xzf "$work/$name.tar.gz"
+    # Outside a source tree, this script and the service's templates come
+    # from the release's own tag, so they match the binary they install.
+    if [ -z "$root" ]; then
+        raw="https://raw.githubusercontent.com/$repo/v$version/tools"
+        mkdir -p "$work/tools"
+        for f in install.sh cinefit.service 50-cinefit.rules; do
+            curl -fsSL -o "$work/tools/$f" "$raw/$f" || die "no tools/$f at v$version"
+        done
+    fi
     place "$work/$name/cinefit" "rust-$version" "$version"
+    if [ -z "$root" ]; then
+        mkdir -p "$tools"
+        chmod +x "$work/tools/install.sh"
+        for f in install.sh cinefit.service 50-cinefit.rules; do
+            mv -f "$work/tools/$f" "$tools/$f"
+        done
+    fi
 }
 
 # The newest release's version.
@@ -204,11 +240,14 @@ EOF
 
 mkdir -p "$app"
 case "${1:-}" in
-    "") install_build ;;
-    --release)
-        v=${2:-$(latest_release)}
-        [ -n "$v" ] || die "no release found"
-        install_release "${v#v}" ;;
+    "" | --release)
+        if [ -z "${1:-}" ] && [ -n "$root" ]; then
+            install_build
+        else
+            v=${2:-$(latest_release)}
+            [ -n "$v" ] || die "no release found"
+            install_release "${v#v}"
+        fi ;;
     --rollback)
         prev=$(readlink "$app/previous" 2>/dev/null) || die "nothing to roll back to"
         switch_to "$prev" ;;

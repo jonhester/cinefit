@@ -52,6 +52,9 @@ jobs:
           target/release/cinefit --version | grep -F "cinefit $VERSION ("
           tools/package.sh target/release/cinefit "$VERSION" dist
           (cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          # The installer beside the archive: releases/latest/download/install.sh
+          # is how a release installs without a clone (docs/guide, Installing).
+          cp tools/install.sh dist/
       - env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
