@@ -5,8 +5,8 @@
   "out": "site",
   "engine": "js",
   "logo": {
-    "light": "/assets/images/cinefit-dark-accent.svg",
-    "dark": "/assets/images/cinefit-light-accent.svg",
+    "light": "/assets/images/cinefit-wordmark-light.svg",
+    "dark": "/assets/images/cinefit-wordmark-dark.svg",
     "alt": "cinefit"
   },
   "markdown": {
