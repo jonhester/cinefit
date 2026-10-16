@@ -33,6 +33,8 @@ It lists each press for 30 seconds. While it runs it takes the keys from the ser
 
 **Menu** opens it.
 
+<figure class="shot"><img src="/assets/images/osd-menu.png" alt="The menu, on its Picture page: Crop black bars On, Fill the screen up to 2.40:1, Banners On; at the foot, Applies now, no resync" width="898" height="484" loading="lazy"><figcaption>The menu as cinefit draws it, on its Picture page. The foot says what the selected change costs.</figcaption></figure>
+
 1. **Up / Down** pick a page: Picture, Output, Screen, Input.
 2. **Right** or **Select** enters the page; **Up / Down** pick a row.
 3. **Left / Right** change the value. A change applies at once and is saved to the settings file.
@@ -64,6 +66,8 @@ Settings not in the menu are on the web page and in the [settings file](/setting
 ## Banners and the slate
 
 A **banner** appears for a few seconds when the picture type changes, saying what came in and what happens to it. When the change needs a resync it waits until the display shows a picture again. Turn banners off with [`osd.banners`](/settings/#osd-banners).
+
+<figure class="shot"><img src="/assets/images/osd-banner.png" alt="A banner in the top left corner of the picture: Dolby Vision, and under it 4K 23.976, mapped by the player, shown as is" width="1200" height="480" loading="lazy"><figcaption>A banner as low-latency Dolby Vision starts, in the top left of the picture, as cinefit draws it.</figcaption></figure>
 
 <figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: The Screening Room, and under it No signal, small, in the lower left corner" width="1600" height="680" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name and the state, small, in one corner.</figcaption></figure>
 
