@@ -33,7 +33,7 @@ It lists each press for 30 seconds. While it runs it takes the keys from the ser
 
 **Menu** opens it.
 
-<figure class="shot"><img src="/assets/images/osd-menu.png" alt="The menu, on its Picture page: Crop black bars On, Fill the screen up to 2.40:1, Banners On; at the foot, Applies now, no resync" width="1974" height="1146" loading="lazy"><figcaption>The menu as cinefit draws it, on its Picture page. The foot says what the selected change costs. Picture: <em>Tears of Steel</em> &copy; Blender Foundation, <a href="https://mango.blender.org">mango.blender.org</a>, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>, with cinefit's display drawn over it.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-menu.png" alt="The menu, on its Picture page: Crop black bars On, Fill the screen up to 2.40:1, Banners On; at the foot, Applies now, no resync" width="2884" height="1146" loading="lazy"><figcaption>The menu as cinefit draws it, on its Picture page. The foot says what the selected change costs. Picture: <em>Charade</em> (1963), public domain in the US, with cinefit's display drawn over it.</figcaption></figure>
 
 1. **Up / Down** pick a page: Picture, Output, Screen, Input.
 2. **Right** or **Select** enters the page; **Up / Down** pick a row.

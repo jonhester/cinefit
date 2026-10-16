@@ -7,7 +7,7 @@ From the repository root:
     uv run --with pillow --with numpy docs/guide/figs/osd.py /tmp/osd
 
 The test writes each overlay as raw BGRA, premultiplied, at 4096 x 2160; this
-lays each one over black (the slate) or over a frame of Tears of Steel
+lays each one over black (the slate) or over a film frame from figs/frames
 (the rest) and crops it for the page.
 """
 import sys
@@ -24,14 +24,18 @@ def overlay(dir, name):
     return a[..., [2, 1, 0]], a[..., 3:4] / 255.0
 
 
-def stand_in():
-    """A real picture behind the overlay: a frame of Tears of Steel (CC BY
-    3.0, Blender Foundation), 2.40:1, scaled to the panel's width and
-    placed in the screen's band, black above and below as on a scope screen."""
-    frame = Image.open(f"{OUT}/frames/tos-street.jpg").convert("RGB")
-    h = round(W * frame.height / frame.width)
+def picture(name):
+    """A film frame filling the screen's band, scaled to cover it and cut to
+    fit, so no black shows above, below or beside it. figs/frames holds the
+    frames: Charade (1963, public domain in the US) where the shape of the
+    picture does not matter, Tears of Steel (CC BY 3.0, Blender Foundation)
+    where the overlay says 2.40 : 1."""
+    frame = Image.open(f"docs/guide/figs/frames/{name}.jpg").convert("RGB")
+    s = max(W / frame.width, BAND[1] / frame.height)
+    big = frame.resize((round(frame.width * s), round(frame.height * s)), Image.LANCZOS)
+    x0, y0 = (big.width - W) // 2, (big.height - BAND[1]) // 2
     canvas = Image.new("RGB", (W, H))
-    canvas.paste(frame.resize((W, h), Image.LANCZOS), (0, BAND[0] + (BAND[1] - h) // 2))
+    canvas.paste(big.crop((x0, y0, x0 + W, y0 + BAND[1])), (0, BAND[0]))
     return np.asarray(canvas, np.float32)
 
 
@@ -39,11 +43,13 @@ def over(rgb, alpha, bg):
     return np.clip(rgb + bg * (1 - alpha), 0, 255).astype(np.uint8)
 
 
-def around(alpha, margin):
-    """The overlay's drawn part, with a margin of picture round it."""
+def around(alpha, margin, right=None):
+    """The overlay's drawn part, with a margin of picture round it (`right`
+    on that side, to take in more of the picture), kept inside the screen's
+    band: the rows outside it are black."""
     ys, xs = np.where(alpha[..., 0] > 0)
-    return (max(xs.min() - margin, 0), max(ys.min() - margin, 0),
-            min(xs.max() + margin, W), min(ys.max() + margin, H))
+    return (max(xs.min() - margin, 0), max(ys.min() - margin, BAND[0]),
+            min(xs.max() + (margin if right is None else right), W), min(ys.max() + margin, BAND[0] + BAND[1]))
 
 
 def save(img, box, width, name):
@@ -60,17 +66,18 @@ def save(img, box, width, name):
 
 
 def main(dir):
-    picture = stand_in()
     # The slate: over black, the whole screen band, as it looks in the room.
     rgb, a = overlay(dir, "slate-0")
-    save(over(rgb, a, np.zeros_like(picture)), (0, BAND[0], W, BAND[0] + BAND[1]), 2400, "osd-slate")
-    # The banner: the top left of the picture, where it appears.
+    save(over(rgb, a, np.zeros((H, W, 3), np.float32)), (0, BAND[0], W, BAND[0] + BAND[1]), 2400, "osd-slate")
+    # The banner, top left, over an SDR film, as its text says.
     rgb, a = overlay(dir, "banner")
-    save(over(rgb, a, picture), (0, BAND[0], 2304, BAND[0] + 922), 2304, "osd-banner")
-    # The info panel and the menu: each with a margin of picture.
-    for name, width in (("info", 4096), ("menu", 4096)):
+    save(over(rgb, a, picture("charade-megeve")), (0, BAND[0], 2304, BAND[0] + 922), 2304, "osd-banner")
+    # The menu over Charade; the info panel, which reads 2.40 : 1, over a
+    # 2.40 film.
+    # The menu takes in Hepburn beside it.
+    for name, frame, right in (("menu", "charade-salon", 1000), ("info", "tos-closeup", None)):
         rgb, a = overlay(dir, name)
-        save(over(rgb, a, picture), around(a, 90), width, f"osd-{name}")
+        save(over(rgb, a, picture(frame)), around(a, 90, right), 4096, f"osd-{name}")
 
 
 main(sys.argv[1])

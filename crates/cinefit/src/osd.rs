@@ -1097,9 +1097,10 @@ mod preview {
         }
         let mut px = vec![0u8; w * 4 * h];
         let mut c = Canvas::new(&mut px, w * 4, w, h, Encoding::Sdr);
+        // The user guide's banner, over a frame of an SDR film.
         let text = BannerText {
-            title: "Dolby Vision".into(),
-            detail: "4K 23.976 \u{b7} mapped by the player, shown as is".into(),
+            title: "SDR".into(),
+            detail: "1080p 23.976 \u{b7} scaled to 4K".into(),
         };
         banner(
             &mut c,
