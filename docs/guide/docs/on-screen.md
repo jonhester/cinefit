@@ -27,6 +27,10 @@ A **banner** appears for a few seconds when the picture type changes, saying wha
 
 ## The waiting slate
 
-The **slate** is shown whenever there is no picture: **No signal**, **Signal lost** (and how long ago), **Receiver off**, **Identifying the signal...**, or **Can't show this format**. It moves to another corner every five minutes. Set [`slate.venue`](/settings/#slate-venue) to put your theater's name above it.
+The **slate** is shown whenever there is no picture: **No signal**, **Signal lost** (and how long ago), **Receiver off**, **Identifying the signal...**, or **Can't show this format**. It sits small in one corner and moves to another every five minutes, so nothing stays on the screen in one place.
 
-<figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: The Screening Room, and under it No signal, small, in the lower left corner" width="2400" height="1021" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name and the state, small, in one corner.</figcaption></figure>
+### Your theater's name
+
+Above the state, the slate shows your theater's name: **The Screening Room** in the picture below stands in for yours. Set it on the [web page](/web-page/) (**Screen**, then **Theater name**) or as [`slate.venue`](/settings/#slate-venue) in the settings file, up to 40 characters. It changes at once, with no restart. Left empty, the slate shows only the state.
+
+<figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: The Screening Room, and under it No signal, small, in the lower left corner" width="2400" height="1021" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name you set, and the state under it, small, in one corner.</figcaption></figure>
