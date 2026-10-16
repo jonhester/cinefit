@@ -836,16 +836,22 @@ fn render_markdown() -> String {
          CINEFIT_UPDATE_GUIDE=1 cargo test -p cinefit config -->\n\n\
          # Settings\n\n\
          Every setting, grouped as on the [web page](/web-page/), where all of them can be \
-         changed. Those marked **in the menu** are on the remote's [menu](/using/#menu) too. \
+         changed. Those tagged **In the menu** are on the remote's [menu](/using/#menu) too. \
          Both save to the settings file, `/etc/cinefit/cinefit.toml`, which holds only what you \
          have changed; `cinefit settings` lists every setting with its current value.\n\n\
-         A change costs one of three things:\n\n\
-         - **applies now**: the next frame uses it.\n\
-         - **resyncs the display**: the display blanks for a few seconds while it locks on.\n\
-         - **applies at the next start**: restart the service (`sudo systemctl restart \
-         cinefit`).\n",
+         Each setting's tag says what a change costs:\n\n\
+         - **Applies now**: the next frame uses it.\n\
+         - **Resyncs the display**: the display blanks for a few seconds while it locks on.\n\
+         - **At the next start**: restart the service (`sudo systemctl restart cinefit`).\n",
     );
-    let quote = |v: &str| format!("`{v}`");
+    // HTML for each setting's card, inside a Markdown page: the heading
+    // stays Markdown so the page's contents and anchors work.
+    let esc = |t: &str| {
+        t.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let code = |v: &str| format!("<code>{}</code>", esc(v));
     for (group, intro) in GROUPS {
         let rows: Vec<&Setting> = SETTINGS
             .iter()
@@ -869,43 +875,78 @@ fn render_markdown() -> String {
                 Kind::Int { min, max } => format!("{min} to {max}"),
                 Kind::Float { min, max } => format!("{min} to {max}"),
                 Kind::Choice(names) => match names.split_last() {
-                    Some((last, [])) => quote(last),
+                    Some((last, [])) => code(last),
                     Some((last, rest)) => format!(
                         "{} or {}",
-                        rest.iter().map(|n| quote(n)).collect::<Vec<_>>().join(", "),
-                        quote(last)
+                        rest.iter().map(|n| code(n)).collect::<Vec<_>>().join(", "),
+                        code(last)
                     ),
                     None => String::new(),
                 },
                 Kind::Text { max } => format!("text, up to {max} characters"),
                 Kind::Ratio { min, max, off } => format!(
                     "{min} to {max}, as a number or W:H{}",
-                    if off { ", or 0 for off" } else { "" }
+                    if off { "; 0 is off" } else { "" }
                 ),
             };
             let default = match s.get(&d) {
                 Value::Name(n) if n.is_empty() => "empty".to_string(),
-                v => quote(&v.to_string()),
+                v => code(&v.to_string()),
             };
-            let applies = match s.apply {
-                Apply::Live => "applies now",
-                Apply::Modeset => "resyncs the display",
-                Apply::Start => "applies at the next start",
+            let (cost, tag) = match s.apply {
+                Apply::Live => ("now", "Applies now"),
+                Apply::Modeset => ("resync", "Resyncs the display"),
+                Apply::Start => ("start", "At the next start"),
             };
             let menu = if crate::menu::offers(s.key) {
-                " \u{b7} **in the menu**"
+                "<span class=\"tag tag-menu\">In the menu</span>"
             } else {
                 ""
             };
-            // `<` opens a tag in Markdown: help text may say `<this machine>`.
-            let help = s.help.replace('<', "&lt;");
+            // Help for a choice that reads "on: this. off: that." becomes a
+            // list, one line per choice, which is easier to read than a
+            // sentence that runs them together.
+            let help = match s.kind {
+                Kind::Choice(names) => {
+                    let mut at: Vec<(usize, &str)> = names
+                        .iter()
+                        .flat_map(|n| {
+                            let mark = format!("{n}: ");
+                            s.help
+                                .match_indices(&mark)
+                                .filter(|(i, _)| *i == 0 || s.help[..*i].ends_with(' '))
+                                .map(|(i, _)| (i, *n))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    at.sort();
+                    if at.len() >= 2 && at[0].0 == 0 {
+                        let items: String = at
+                            .iter()
+                            .enumerate()
+                            .map(|(k, (i, n))| {
+                                let end = at.get(k + 1).map_or(s.help.len(), |x| x.0);
+                                let text = s.help[i + n.len() + 2..end].trim();
+                                format!("<li>{}: {}</li>", code(n), esc(text))
+                            })
+                            .collect();
+                        format!("<ul>{items}</ul>")
+                    } else {
+                        format!("<p>{}</p>", esc(s.help))
+                    }
+                }
+                _ => format!("<p>{}</p>", esc(s.help)),
+            };
             // The key is the anchor, `#output-width`, so links survive a
             // label or a group changing.
             out.push_str(&format!(
-                "\n### {label} {{#{}}}\n\n{help}\n\n\
-                 `{}` \u{b7} {values} \u{b7} default {default} \u{b7} {applies}{menu}\n",
+                "\n### {label} {{#{}}}\n\n\
+                 <div class=\"setting\"><div class=\"tags\"><span class=\"tag tag-{cost}\">{tag}\
+                 </span>{menu}</div>{help}<dl><div><dt>Values</dt><dd>{values}</dd></div>\
+                 <div><dt>Default</dt><dd>{default}</dd></div><div><dt>Key</dt><dd>{}</dd></div>\
+                 </dl></div>\n",
                 s.key.replace(['.', '_'], "-"),
-                s.key,
+                code(s.key),
             ));
         }
     }
