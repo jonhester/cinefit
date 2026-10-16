@@ -1,0 +1,33 @@
+/* Figures in the guide: inline SVG drawn in the style of the on-screen UI,
+   with amber marking the part that does the work. Colors follow docmd's
+   light and dark themes. */
+:root {
+  --fig-bg: #f7f7f9; --fig-line: #d9d9e0; --fig-card: #ffffff; --fig-card-line: #c9c9d3;
+  --fig-text: #1f1f24; --fig-dim: #6a6a76; --fig-hot: #fff3dc; --fig-hot-line: #d08a1f;
+  --fig-hot-text: #8a5300; --fig-velvet: #e6e6ec; --fig-pic: #f1c983;
+}
+[data-theme="dark"] {
+  --fig-bg: #15151a; --fig-line: #2a2a33; --fig-card: #1c1c23; --fig-card-line: #3b3b47;
+  --fig-text: #ececf0; --fig-dim: #9d9daa; --fig-hot: #3a2e1a; --fig-hot-line: #f2b84b;
+  --fig-hot-text: #f2b84b; --fig-velvet: #26262f; --fig-pic: #5e4a28;
+}
+figure.fig { margin: 1.5rem 0; padding: 20px; background: var(--fig-bg); border: 1px solid var(--fig-line); border-radius: 14px; }
+figure.fig svg { display: block; width: 100%; height: auto; font-family: inherit; }
+/* On a phone the figure scrolls inside its frame rather than shrinking its
+   text past reading. */
+figure.fig .scroll { overflow-x: auto; }
+@media (max-width: 640px) { figure.fig svg { min-width: 560px; } }
+figure.fig figcaption { margin-top: 12px; color: var(--fig-dim); font-size: 0.9em; }
+.fig .t { fill: var(--fig-text); }
+.fig .d { fill: var(--fig-dim); }
+.fig .b { font-weight: 600; }
+.fig .card { fill: var(--fig-card); stroke: var(--fig-card-line); stroke-width: 1.2; }
+.fig .hot { fill: var(--fig-hot); stroke: var(--fig-hot-line); stroke-width: 1.8; }
+.fig .ht { fill: var(--fig-hot-text); }
+.fig .ln { fill: none; stroke: var(--fig-dim); stroke-width: 1.2; }
+.fig .box { fill: none; stroke: var(--fig-card-line); stroke-width: 1.2; }
+.fig .ah { fill: var(--fig-dim); }
+.fig .velvet { fill: var(--fig-velvet); stroke: var(--fig-card-line); stroke-width: 1; }
+.fig .band { fill: none; stroke: var(--fig-dim); stroke-width: 1; stroke-dasharray: 4 3; }
+.fig .pic { fill: var(--fig-pic); stroke: var(--fig-hot-line); stroke-width: 1.4; }
+.fig .old { fill: var(--fig-velvet); stroke: var(--fig-card-line); }

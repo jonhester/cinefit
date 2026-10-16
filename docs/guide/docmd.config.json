@@ -43,7 +43,10 @@
   "theme": {
     "name": "default",
     "appearance": "system",
-    "codeHighlight": true
+    "codeHighlight": true,
+    "customCss": [
+      "/assets/css/guide.css"
+    ]
   },
   "minify": true,
   "autoTitleFromH1": true,
