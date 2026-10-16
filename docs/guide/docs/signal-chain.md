@@ -26,7 +26,7 @@ A player chooses its output from the **EDID** it sees: the description of the di
 | What the splitter presents | What a player sends | What cinefit does |
 |---|---|---|
 | A copy of the capture card's EDID | HDR10 and SDR, YCbCr 4:2:2 | Passes HDR10 through, or tone maps it ([`output.mode`](/settings/#output-mode)) |
-| A Dolby Vision display (TV-led) | Dolby Vision tunneled in 10-bit RGB | Decodes it and maps it to SDR BT.2020 |
+| A Dolby Vision display (TV-led) | Dolby Vision tunneled in 10-bit RGB | Not yet: tunneled Dolby Vision is in progress |
 | A low-latency Dolby Vision display (LLDV) | Dolby Vision already mapped by the player | Shows it as is; set [`output.white_nits`](/settings/#output-white-nits) to the EDID's declared peak (often 96) |
 
 ::: callout warning "Watch for RGB and 4:4:4"

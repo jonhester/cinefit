@@ -9,7 +9,7 @@ description: "Common questions about cinefit: what it costs, Dolby Vision and HD
 
 ### What is cinefit?
 
-A video processor for a home theater that runs on a Linux PC you build: it captures what your player sends, crops away the black bars so every film is as tall as your screen, handles HDR10 and Dolby Vision, and drives the projector directly. [What cinefit is](/overview/) has the whole picture.
+A video processor for a home theater that runs on a Linux PC you build: it captures what your player sends, crops away the black bars so every film is as tall as your screen, handles HDR10 and low-latency Dolby Vision, and drives the projector directly. [What cinefit is](/overview/) has the whole picture.
 
 ### Is it really free?
 
@@ -25,7 +25,7 @@ It is used every day in one theater, and developed and tested on one set of hard
 
 ### Does it support Dolby Vision?
 
-Yes, in two forms. **Tunneled** Dolby Vision is decoded by cinefit from the pixels and mapped to SDR in a BT.2020 container, scene by scene. **Low-latency** Dolby Vision is mapped by the player and shown as it arrives. Which form you get depends on the EDID the player sees ([The signal chain](/signal-chain/)). cinefit never sends Dolby Vision to the display. Details are in [Picture types](/picture/).
+**Low-latency** Dolby Vision, yes: the player maps it, and cinefit shows it as it arrives, in SDR BT.2020. **Tunneled** Dolby Vision, which cinefit would decode and map itself, is in progress and not ready yet. Which form a player sends depends on the EDID it sees ([The signal chain](/signal-chain/)). cinefit never sends Dolby Vision to the display. Details are in [Picture types](/picture/).
 
 ### What about HDR10?
 

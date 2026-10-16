@@ -1,6 +1,6 @@
 ---
 title: "cinefit"
-description: "cinefit is an open-source video processor for home theaters: it captures HDMI on a Linux PC, crops away black bars for constant image height, handles HDR10 and Dolby Vision, and drives your projector directly."
+description: "cinefit is an open-source video processor for home theaters: it captures HDMI on a Linux PC, crops away black bars for constant image height, handles HDR10 and low-latency Dolby Vision, and drives your projector directly."
 noStyle: true
 titleAppend: false
 components:
@@ -25,7 +25,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
 </header>
 <section class="hero">
   <h1>A video processor for your home theater, on a PC you build.</h1>
-  <p class="lede">cinefit captures what your player sends, crops away the black bars, scales the picture to fill your screen, and drives your projector directly, with HDR10 and Dolby Vision handled the way you choose. Open source, no desktop, no subscription.</p>
+  <p class="lede">cinefit captures what your player sends, crops away the black bars, scales the picture to fill your screen, and drives your projector directly, with HDR10 handled the way you choose and low-latency Dolby Vision shown as the player maps it. Open source, no desktop, no subscription.</p>
   <div class="cta">
     <a class="button primary" href="/requirements/">Get started</a>
     <a class="button" href="/overview/">Read the guide</a>
@@ -49,8 +49,8 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
 </section>
 <section class="features">
   <article>
-    <h3>Dolby Vision, decoded</h3>
-    <p>A tunneled Dolby Vision signal is decoded from the pixels and mapped by cinefit itself. A player's low-latency Dolby Vision passes through untouched.</p>
+    <h3>Low-latency Dolby Vision</h3>
+    <p>A player's low-latency Dolby Vision is shown as it was mapped, untouched. Decoding tunneled Dolby Vision in cinefit itself is in progress.</p>
   </article>
   <article>
     <h3>HDR10 your way</h3>

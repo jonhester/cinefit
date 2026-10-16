@@ -57,10 +57,10 @@ for x, (l, hot) in zip(xs, steps):
     b.append(box(x, 158, 124, 64, [(l[0], True)] + [(s, False) for s in l[1:]], hot))
 for a, c in zip(xs, xs[1:]):
     b.append(arrow(i, [(a + 124, 190), (c - 2, 190)]))
-b.append(box(36, 266, 124, 56, [('Dolby Vision', True), ('metadata read', False), ('from the pixels', False)]))
+b.append(box(36, 266, 124, 56, [('Dolby Vision', True), ('tunnel decoding', False), ('in progress', False)]))
 b.append(arrow(i, [(98, 222), (98, 264)]))
 b.append(arrow(i, [(160, 294), (527, 294), (527, 224)]))
-b.append(text(190, 286, 'tunneled Dolby Vision only'))
+b.append(text(190, 286, 'tunneled Dolby Vision, when it is ready'))
 b.append(arrow(i, [(670, 222), (670, 372)]))
 b.append(text(660, 364, 'HDMI', anchor='end'))
 b.append(box(590, 374, 150, 40, [('Projector or TV', True)]))
@@ -104,7 +104,7 @@ rows = [
     ('SDR', 'nothing to map', [('passes it on', 0), ('BT.2020 container', 0), ('shows it', 0)]),
     ('HDR10, passthrough', 'the default', [('passes it on', 0), ('passes it on', 0), ('maps it|its own mapping', 1)]),
     ('HDR10, sdr2020', 'output.mode = sdr2020', [('passes it on', 0), ('maps it|to SDR BT.2020', 1), ('shows it', 0)]),
-    ('Dolby Vision, tunneled', 'Dolby Vision EDID', [('sends it', 0), ('maps it|from the pixels', 1), ('shows it', 0)]),
+    ('Dolby Vision, tunneled', 'in progress, not ready yet', [('sends it', 0), ('will map it|from the pixels', 1), ('shows it', 0)]),
     ('Dolby Vision, low latency', 'LLDV EDID', [('maps it|to the EDID\'s peak', 1), ('passes it on', 0), ('shows it', 0)]),
 ]
 for r, (name, sub, cells) in enumerate(rows):
