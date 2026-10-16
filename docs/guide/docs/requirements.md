@@ -1,39 +1,52 @@
 ---
 title: "What you need"
-description: "Hardware and software requirements for cinefit: an x86-64 Linux PC with Ubuntu 26.04, a Blackmagic DeckLink capture card, a Vulkan GPU (AMD tested) and a KMS display output."
+description: "The parts for a cinefit system, in plain terms: a small Linux PC with an AMD graphics card, a Blackmagic DeckLink capture card, an HDMI splitter, and your projector."
 ---
 
 # What you need
 
-## The PC
+A cinefit system is a small PC that sits in your rack between your sources and your projector. Here is the shopping list.
 
-- **CPU**: x86-64. Published releases need x86-64-v3 (AVX2, roughly any Intel or AMD CPU from 2015 on). An older CPU can still run cinefit built from source.
-- **Operating system**: Ubuntu 26.04, server install (no desktop). Releases are built on 26.04; other distributions are untested.
-- **No desktop or display manager on the output GPU.** cinefit drives the display directly through the kernel (KMS) and must be the only program doing so.
+::: steps
 
-## The GPU
+::: step "A PC to run it on"
+Almost any desktop PC from the last ten years will do. It needs a free PCIe slot for the capture card, and it will run **Ubuntu 26.04** with no desktop: cinefit starts by itself when the PC powers on, and you never need a monitor or keyboard on it after setup.
+::: /step
 
-- **Tested**: AMD Radeon RX 6400 with Mesa's Vulkan driver (RADV).
-- **Needed**: Vulkan, KMS with an output plane that takes 10-bit RGB, and an overlay plane for the on-screen menu and banners. Without an overlay plane cinefit plays but shows no menu, slate or banners.
-- **Other vendors**: untested. cinefit links `libdrm_amdgpu`, so that library must be installed even on another GPU, and it holds the GPU's clocks steady only on AMD (elsewhere it logs `gpu clocks: not held` and carries on).
+::: step "A graphics card"
+cinefit is built and tested with an **AMD Radeon RX 6400**, a small, quiet, low-power card that has plenty of headroom. Other recent AMD cards should work the same way. NVIDIA and Intel graphics have not been tried yet.
+::: /step
 
-## The capture card
+::: step "A capture card"
+A **Blackmagic DeckLink** card with an HDMI input, such as the **DeckLink Mini Recorder 4K**. This is how the picture gets into the PC.
+::: /step
 
-- **A Blackmagic DeckLink with an HDMI input.** Developed with the DeckLink Mini Recorder 4K.
-- **Blackmagic Desktop Video 16.0 or newer**, the card's Linux driver, from Blackmagic's support site.
-- **Mind the card's limits.** The Mini Recorder 4K captures 2160p only up to 30 frames per second (60 at 1080p and below). Films at 23.976 or 24 are fine; a 2160p60 source is not. Check your card's specifications.
+::: step "An HDMI splitter that removes HDCP"
+Players copy-protect their output, and capture cards refuse protected signals. A splitter such as the **EZCOO EZ-SP12H2**, placed just before the capture card, takes care of that. [The signal chain](/signal-chain/) explains how to set it up.
+::: /step
 
-## The display
+::: step "Your projector or TV"
+Anything with an HDMI input. cinefit starts out set up for a 4096x2160 projector on a 2.35:1 scope screen, and two settings adapt it to yours.
+::: /step
 
-- Any display connected to the GPU's HDMI output. cinefit's defaults are for a **4096x2160** projector on a **2.35:1** screen; for a 3840x2160 display, set [`output.width`](/settings/#output-width) to 3840.
-- The display must offer its native size at the source's rates (23.976, 24, 59.94...). cinefit refuses to start a mode the display does not list.
-- For constant image height on a scope screen, set the lens so the picture's **width** fills the screen; cinefit then uses the band of the panel that lands on the screen.
+::: step "A remote (optional)"
+Any remote that can send keyboard keys through a small USB receiver, such as a **flirc**. A plain USB keyboard works too, and there is a web page for phones.
+::: /step
 
-## Between the source and the card
+:::
 
-- **An HDMI splitter that strips HDCP**, because the capture card refuses protected signals. See [The signal chain](/signal-chain/).
+::: callout info "Good to know before you buy"
+- **4K at 60 frames per second**: the Mini Recorder 4K captures 4K only up to 30 frames per second. Films (24 fps) are fine. Set your player to match the content's frame rate.
+- **Your projector's resolution**: check that it accepts its native resolution at 24 Hz. Nearly every 4K projector does.
+- **The PC's CPU**: ready-made releases need a CPU from about 2015 or later (Intel Haswell, AMD Excavator or Zen). Older ones can [build from source](/build-from-source/).
+:::
 
-## Optional
+## The finer print
 
-- **An IR remote and a USB receiver** that types keyboard keys (developed with a Logitech Harmony and a flirc). Any USB keyboard works too. See [Remote and menu](/using/).
-- **A Denon receiver** and an **Apple TV** on the network, for input names and now-playing information. See [Receiver and Apple TV](/integrations/).
+For anyone matching parts or troubleshooting:
+
+- **GPU**: needs Vulkan (Mesa's RADV driver on AMD), a display output the Linux kernel drives directly, and an overlay plane for the on-screen menu. cinefit holds the GPU's clocks steady on AMD only; elsewhere it logs `gpu clocks: not held` and carries on.
+- **Capture driver**: Blackmagic Desktop Video 16.0 or newer.
+- **CPU**: published builds target x86-64-v3 (AVX2).
+- **Nothing else on the display**: no desktop environment on the GPU's output. cinefit drives the display itself.
+- **Optional extras**: a Denon receiver and an Apple TV on your network add input names and what's playing to the on-screen info. See [Receiver and Apple TV](/integrations/).

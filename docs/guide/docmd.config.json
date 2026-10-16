@@ -125,6 +125,11 @@
           "icon": "terminal"
         },
         {
+          "title": "Building from source",
+          "path": "/build-from-source/",
+          "icon": "hammer"
+        },
+        {
           "title": "Troubleshooting",
           "path": "/troubleshooting/",
           "icon": "life-buoy"

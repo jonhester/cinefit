@@ -1,6 +1,6 @@
 ---
 title: "Installing"
-description: "Install cinefit on Ubuntu 26.04: the DeckLink driver, user groups, a release or a source build with tools/install.sh, and the one-time systemd service setup."
+description: "Install cinefit on Ubuntu 26.04: the DeckLink driver, user groups, the latest release with one command, and the one-time systemd service setup."
 ---
 
 # Installing
@@ -28,23 +28,21 @@ The groups let cinefit open the display (`video`), the GPU's render node (`rende
 
 ## 3. cinefit itself
 
-Clone the repository and install the latest published release:
-
 ```sh
-git clone https://github.com/jonhester/cinefit.git
-cd cinefit
-tools/install.sh --release
+curl -fsSL https://github.com/jonhester/cinefit/releases/latest/download/install.sh | sh
 ```
 
-`install.sh` checks your CPU, downloads the release, verifies its checksum and puts it in `~/cinefit-app/`, with `~/cinefit-app/current` pointing at it. It runs `cinefit settings` on the new build before switching, so a broken download never becomes current.
+This downloads the latest release, checks it against its published checksum, and puts it in `~/cinefit-app/`, with `~/cinefit-app/current` pointing at it. Before switching to a new build it makes sure the build starts and can read your settings, so a bad download never becomes the one that runs. It also keeps a copy of itself in `~/cinefit-app/tools/`, which is what you run for [updates](/updating/).
 
-::: callout info "Building from source instead"
-On a CPU without x86-64-v3, or to run unreleased code, install Rust, build libplacebo once with `scripts/build-libplacebo.sh`, then run `tools/install.sh` with no arguments. It builds the tree and installs that build the same way.
+To install a particular version instead of the latest, add it at the end: `| sh -s -- --release 0.2.0`.
+
+::: callout info "Building from source"
+To run unreleased code, or on a CPU too old for the published builds, see [Building from source](/build-from-source/).
 :::
 
 ## 4. The service (root, once)
 
-The first time, `install.sh` prints the steps that need root, with your user filled in:
+The first time, the installer prints the steps that need root, with your user filled in:
 
 ```sh
 sudo cp ~/cinefit-app/cinefit.service /etc/systemd/system/
