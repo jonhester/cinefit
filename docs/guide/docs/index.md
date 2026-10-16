@@ -79,7 +79,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
 <section class="parts">
   <h2>What it takes</h2>
   <ol>
-    <li><strong>A PC</strong> with Ubuntu 26.04 LTS and a free PCIe slot</li>
+    <li><strong>A Linux PC</strong> with Ubuntu 26.04 LTS and two free PCIe slots</li>
     <li><strong>An AMD graphics card</strong>, tested on the Radeon RX 6400</li>
     <li><strong>A Blackmagic DeckLink</strong> capture card with HDMI in</li>
     <li><strong>A source</strong> whose signal the capture card accepts</li>
