@@ -5,16 +5,9 @@ description: "How sources, an AV receiver, an HDMI splitter and the DeckLink cap
 
 # The signal chain
 
-```mermaid
-flowchart LR
-    source([Player or streamer]) --> avr["AV receiver<br/>(optional)"] --> splitter["HDMI splitter<br/>(EDID choice)"]
-    splitter --> tv([Another display, optional])
-    splitter --> card
-    subgraph pc [The cinefit PC]
-        card[DeckLink input] --> gpu[GPU output]
-    end
-    gpu --> display([Projector])
-```
+<!-- fig:chain -->
+<figure class="fig"><div class="scroll"><svg viewBox="0 0 760 326" role="img" aria-label="The signal chain: player, optional receiver, HDMI splitter, then the capture card and graphics card in the cinefit PC, then the projector; the splitter presents the EDID the player reads" font-size="13"><defs><marker id="ah-chain" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ah"/></marker></defs><text x="20" y="18" text-anchor="start" class="t b" font-size="15">The picture goes one way; the EDID goes the other</text><path d="M435 72 V46 H90 V70" class="ln" stroke-dasharray="4 3" marker-end="url(#ah-chain)"/><text x="262" y="40" text-anchor="middle" class="ht">the EDID: what the player may send</text><rect x="20" y="72" width="140" height="52" rx="8" class="card"/><text x="90.0" y="94.5" text-anchor="middle" class="t b">Player</text><text x="90.0" y="110.5" text-anchor="middle" class="d">or streamer</text><rect x="190" y="72" width="140" height="52" rx="8" class="card"/><text x="260.0" y="94.5" text-anchor="middle" class="t b">AV receiver</text><text x="260.0" y="110.5" text-anchor="middle" class="d">optional</text><rect x="360" y="72" width="150" height="52" rx="8" class="hot"/><text x="435.0" y="94.5" text-anchor="middle" class="ht b">HDMI splitter</text><text x="435.0" y="110.5" text-anchor="middle" class="ht">chooses the EDID</text><path d="M160 98 L188 98" class="ln" marker-end="url(#ah-chain)"/><path d="M330 98 L358 98" class="ln" marker-end="url(#ah-chain)"/><rect x="540" y="56" width="200" height="190" rx="10" class="box"/><text x="728" y="76" text-anchor="end" class="t b">The cinefit PC</text><rect x="556" y="86" width="168" height="48" rx="8" class="card"/><text x="640.0" y="106.5" text-anchor="middle" class="t b">Capture card</text><text x="640.0" y="122.5" text-anchor="middle" class="d">HDMI in</text><rect x="556" y="176" width="168" height="48" rx="8" class="card"/><text x="640.0" y="196.5" text-anchor="middle" class="t b">Graphics card</text><text x="640.0" y="212.5" text-anchor="middle" class="d">HDMI out</text><path d="M510 110 L554 110" class="ln" marker-end="url(#ah-chain)"/><path d="M640 134 L640 174" class="ln" marker-end="url(#ah-chain)"/><text x="652" y="158" text-anchor="start" class="d">cinefit</text><rect x="360" y="176" width="150" height="48" rx="8" class="card"/><text x="435.0" y="196.5" text-anchor="middle" class="t b">Another display</text><text x="435.0" y="212.5" text-anchor="middle" class="d">optional</text><path d="M435 124 L435 174" class="ln" marker-end="url(#ah-chain)"/><path d="M640 224 L640 270" class="ln" marker-end="url(#ah-chain)"/><rect x="560" y="272" width="160" height="44" rx="8" class="card"/><text x="640.0" y="298.5" text-anchor="middle" class="t b">Projector or TV</text></svg></div><figcaption>The player reads the EDID at the end of its cable, which with a splitter is the splitter's: that choice decides whether HDR10, tunneled Dolby Vision or low-latency Dolby Vision arrives.</figcaption></figure>
+<!-- /fig -->
 
 The receiver is optional; it is there for audio, and cinefit can read its input names ([Receiver and Apple TV](/integrations/)).
 

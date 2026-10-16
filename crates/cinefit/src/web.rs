@@ -343,6 +343,35 @@ pub fn settings_json(c: &Config) -> Json {
 mod tests {
     use super::*;
 
+    /// With `CINEFIT_OSD_PREVIEW` set, writes a sample `/api/state` there,
+    /// as `play` publishes it, with the settings from this table at their
+    /// defaults: what the user guide's screenshot of the page shows
+    /// (docs/guide/figs/web.mjs).
+    #[test]
+    fn web_state_preview() {
+        let Some(dir) = std::env::var_os("CINEFIT_OSD_PREVIEW") else {
+            return;
+        };
+        let row = |label: &str, line: &str, detail: &str| json!({"label": label, "line": line, "detail": detail});
+        let state = json!({
+            // The release number alone: a screenshot outlives the commit.
+            "version": env!("CARGO_PKG_VERSION"),
+            "pill": "Playing",
+            "now": [
+                row("IN", "Dolby Vision \u{b7} low latency",
+                    "3840 \u{d7} 2160 \u{b7} 23.976 \u{b7} YCbCr 4:2:2 10-bit"),
+                row("OUT", "SDR BT.2020 \u{b7} unchanged from the player",
+                    "4096 \u{d7} 2160 \u{b7} 23.976"),
+                row("CROP", "2.40 : 1 \u{b7} 280 / 279 rows", "zoom in (recent), 12 s ago"),
+                row("LAST 10 S", "240 shown \u{b7} 0 repeated",
+                    "frame work 7.9 ms of 41.7 (render 5.4, detect 1.2)"),
+            ],
+            "settings": settings_json(&Config::default()),
+        });
+        let path = std::path::Path::new(&dir).join("web-state.json");
+        std::fs::write(path, state.to_string()).expect("write");
+    }
+
     #[test]
     fn every_setting_has_a_place_on_the_page() {
         for s in config::settings() {

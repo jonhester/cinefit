@@ -67,6 +67,32 @@ b.append(box(590, 374, 150, 40, [('Projector or TV', True)]))
 figs['path'] = figure(760, 424, 'Every frame takes the same path, from the player to the screen', ''.join(b),
     'One frame\'s path through cinefit. Finding the bars is the clever part: everything after it follows from where the picture is.')
 
+# 1b. The signal chain, and the EDID going the other way.
+i = 'chain'
+b = [marker(i)]
+b.append(text(20, 18, 'The picture goes one way; the EDID goes the other', 't b', size=15))
+# The EDID: from the splitter back to the player, dashed, above the boxes.
+b.append(f'<path d="M435 72 V46 H90 V70" class="ln" stroke-dasharray="4 3" marker-end="url(#ah-{i})"/>')
+b.append(text(262, 40, 'the EDID: what the player may send', 'ht', 'middle'))
+b.append(box(20, 72, 140, 52, [('Player', True), ('or streamer', False)]))
+b.append(box(190, 72, 140, 52, [('AV receiver', True), ('optional', False)]))
+b.append(box(360, 72, 150, 52, [('HDMI splitter', True), ('chooses the EDID', False)], hot=True))
+b.append(arrow(i, [(160, 98), (188, 98)]))
+b.append(arrow(i, [(330, 98), (358, 98)]))
+b.append(f'<rect x="540" y="56" width="200" height="190" rx="10" class="box"/>')
+b.append(text(728, 76, 'The cinefit PC', 't b', 'end'))
+b.append(box(556, 86, 168, 48, [('Capture card', True), ('HDMI in', False)]))
+b.append(box(556, 176, 168, 48, [('Graphics card', True), ('HDMI out', False)]))
+b.append(arrow(i, [(510, 110), (554, 110)]))
+b.append(arrow(i, [(640, 134), (640, 174)]))
+b.append(text(652, 158, 'cinefit', 'd'))
+b.append(box(360, 176, 150, 48, [('Another display', True), ('optional', False)]))
+b.append(arrow(i, [(435, 124), (435, 174)]))
+b.append(arrow(i, [(640, 224), (640, 270)]))
+b.append(box(560, 272, 160, 44, [('Projector or TV', True)]))
+figs['chain'] = figure(760, 326, 'The signal chain: player, optional receiver, HDMI splitter, then the capture card and graphics card in the cinefit PC, then the projector; the splitter presents the EDID the player reads', ''.join(b),
+    'The player reads the EDID at the end of its cable, which with a splitter is the splitter\'s: that choice decides whether HDR10, tunneled Dolby Vision or low-latency Dolby Vision arrives.')
+
 # 2. Who does the tone mapping.
 i = 'tm'
 b = [marker(i)]
