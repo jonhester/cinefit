@@ -20,6 +20,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
     <a href="/overview/">Guide</a>
     <a href="/settings/">Settings</a>
     <a href="https://github.com/jonhester/cinefit">GitHub</a>
+    <a href="https://ko-fi.com/jonhester">Tip jar</a>
   </nav>
 </header>
 <section class="hero">
@@ -92,6 +93,6 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
 </section>
 <footer class="bottom">
   <p>cinefit is open source, under Apache-2.0 or MIT. Developed on an AMD RX 6400, a DeckLink Mini Recorder 4K and a JVC projector; other hardware is untested.</p>
-  <p><a href="/overview/">Guide</a> · <a href="/install/">Install</a> · <a href="/troubleshooting/">Troubleshooting</a> · <a href="https://github.com/jonhester/cinefit">GitHub</a></p>
+  <p><a href="/overview/">Guide</a> · <a href="/install/">Install</a> · <a href="/troubleshooting/">Troubleshooting</a> · <a href="https://github.com/jonhester/cinefit">GitHub</a> · <a href="https://ko-fi.com/jonhester">Tip jar</a></p>
 </footer>
 </div>

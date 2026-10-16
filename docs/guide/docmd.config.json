@@ -164,6 +164,12 @@
       "path": "https://github.com/jonhester/cinefit",
       "icon": "github",
       "external": true
+    },
+    {
+      "title": "Tip jar",
+      "path": "https://ko-fi.com/jonhester",
+      "icon": "coffee",
+      "external": true
     }
   ],
   "plugins": {

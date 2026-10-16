@@ -15,7 +15,7 @@ A video processor for a home theater that runs on a Linux PC you build: it captu
 
 Yes. cinefit is open source, under the Apache-2.0 or MIT license, your choice: no price, no subscription, no license key, no paid tier and no features held back. Everything else it needs is free too: Ubuntu, and Blackmagic's Desktop Video driver for the capture card.
 
-What costs money is the hardware ([What you need](/requirements/)). The only way the project earns anything is the guide's Amazon links, which pay a small commission on what you buy through them, at no cost to you, and say so where they appear. Buying elsewhere works just as well.
+What costs money is the hardware ([What you need](/requirements/)). The project earns in two ways, both optional: the guide's Amazon links pay a small commission on what you buy through them, at no cost to you, and say so where they appear; and if cinefit is useful to you, you can leave a tip in the [tip jar](https://ko-fi.com/jonhester). Buying elsewhere, and not tipping, works just as well.
 
 ### Is it a finished product?
 
