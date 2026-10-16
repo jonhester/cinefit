@@ -1138,6 +1138,21 @@ mod preview {
         let path = std::path::Path::new(&dir).join(format!("info-{w}x{h}.bgra"));
         std::fs::write(path, &px).expect("write");
 
+        // The menu as the remote opens it, on its first page's rows, with
+        // the defaults: what the user guide shows.
+        let mut m =
+            crate::menu::Menu::new(vec![23.976, 24.0, 59.94, 60.0], env!("CARGO_PKG_VERSION"));
+        let (config, now) = (crate::config::Config::default(), std::time::Instant::now());
+        for a in [cinefit_input::Action::Menu, cinefit_input::Action::Right] {
+            m.key(a, &config, now);
+        }
+        let view = m.view(&config, now).expect("the menu is open");
+        let mut px = vec![0u8; w * 4 * h];
+        let mut c = Canvas::new(&mut px, w * 4, w, h, Encoding::Sdr);
+        menu(&mut c, &fonts, menu_area((w, h), band.0), &view);
+        let path = std::path::Path::new(&dir).join(format!("menu-{w}x{h}.bgra"));
+        std::fs::write(path, &px).expect("write");
+
         let (w, h) = (2048, 1080);
         for enc in [Encoding::Sdr, Encoding::Pq] {
             let mut px = vec![0u8; w * 4 * h];

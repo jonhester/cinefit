@@ -73,10 +73,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css">'
   </article>
 </section>
 <section class="shot">
-  <picture>
-    <source srcset="/assets/images/osd-menu.webp" type="image/webp">
-    <img src="/assets/images/osd-menu.png" alt="cinefit's on-screen menu: the Picture page, with Crop black bars on, Fill the screen up to 2.40:1, and Banners on" width="898" height="484" loading="lazy">
-  </picture>
+  <img src="/assets/images/osd-menu.png" alt="cinefit's on-screen menu: the Picture page, with Crop black bars on, Fill the screen up to 2.40:1, and Banners on" width="1974" height="1146" loading="lazy">
   <p>The on-screen menu, as cinefit draws it. Every change says what it costs before you make it.</p>
 </section>
 <section class="parts">

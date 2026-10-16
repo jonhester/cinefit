@@ -66,7 +66,7 @@ h1, h2, h3 { font-weight: 600; line-height: 1.2; margin: 0 0 0.5em; letter-spaci
 .features p { color: var(--text-2); margin: 0; font-size: 16px; }
 
 .shot { text-align: center; }
-.shot img { display: block; width: 100%; max-width: 760px; height: auto; margin: 0 auto; border-radius: 16px; box-shadow: 0 24px 60px rgba(0,0,0,0.5); }
+.shot img { display: block; width: 100%; max-width: 760px; height: auto; margin: 0 auto; border-radius: 16px; }
 .shot p { color: var(--text-3); font-size: 15px; margin: 16px auto 0; max-width: 560px; }
 
 .parts ol { list-style: none; counter-reset: part; padding: 0; margin: 0 0 32px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 32px; }

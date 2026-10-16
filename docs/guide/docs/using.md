@@ -33,7 +33,7 @@ It lists each press for 30 seconds. While it runs it takes the keys from the ser
 
 **Menu** opens it.
 
-<figure class="shot"><img src="/assets/images/osd-menu.png" alt="The menu, on its Picture page: Crop black bars On, Fill the screen up to 2.40:1, Banners On; at the foot, Applies now, no resync" width="898" height="484" loading="lazy"><figcaption>The menu as cinefit draws it, on its Picture page. The foot says what the selected change costs.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-menu.png" alt="The menu, on its Picture page: Crop black bars On, Fill the screen up to 2.40:1, Banners On; at the foot, Applies now, no resync" width="1974" height="1146" loading="lazy"><figcaption>The menu as cinefit draws it, on its Picture page. The foot says what the selected change costs.</figcaption></figure>
 
 1. **Up / Down** pick a page: Picture, Output, Screen, Input.
 2. **Right** or **Select** enters the page; **Up / Down** pick a row.
@@ -55,7 +55,7 @@ Settings not in the menu are on the web page and in the [settings file](/setting
 
 **Info** shows what cinefit is doing, refreshed every second, and closes after 30 seconds or on **Back**:
 
-<figure class="shot"><img src="/assets/images/osd-info.png" alt="The info panel: IN Dolby Vision low latency, 3840 x 2160, 23.976, YCbCr 4:2:2 10-bit; OUT SDR BT.2020, unchanged from the player; CROP 2.40:1, 280 / 279 rows, zoom in 12 s ago; LAST 10 S 240 shown, 0 repeated, frame work 7.9 ms of 41.7" width="900" height="858" loading="lazy"><figcaption>The info panel as cinefit draws it, over a stand-in picture: low-latency Dolby Vision coming in, a 2.40:1 film cropped, no frames repeated.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-info.png" alt="The info panel: IN Dolby Vision low latency, 3840 x 2160, 23.976, YCbCr 4:2:2 10-bit; OUT SDR BT.2020, unchanged from the player; CROP 2.40:1, 280 / 279 rows, zoom in 12 s ago; LAST 10 S 240 shown, 0 repeated, frame work 7.9 ms of 41.7" width="1143" height="1090" loading="lazy"><figcaption>The info panel as cinefit draws it, over a stand-in picture: low-latency Dolby Vision coming in, a 2.40:1 film cropped, no frames repeated.</figcaption></figure>
 
 - **In**: the picture type (Dolby Vision tunnel or low latency, HDR10, HLG, SDR), size, rate, format and the brightest level in the current picture. With a Denon receiver, the input's name first.
 - **Playing**: with an Apple TV, the title, app and position.
@@ -67,9 +67,9 @@ Settings not in the menu are on the web page and in the [settings file](/setting
 
 A **banner** appears for a few seconds when the picture type changes, saying what came in and what happens to it. When the change needs a resync it waits until the display shows a picture again. Turn banners off with [`osd.banners`](/settings/#osd-banners).
 
-<figure class="shot"><img src="/assets/images/osd-banner.png" alt="A banner in the top left corner of the picture: Dolby Vision, and under it 4K 23.976, mapped by the player, shown as is" width="1200" height="480" loading="lazy"><figcaption>A banner as low-latency Dolby Vision starts, in the top left of the picture, as cinefit draws it.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-banner.png" alt="A banner in the top left corner of the picture: Dolby Vision, and under it 4K 23.976, mapped by the player, shown as is" width="2304" height="922" loading="lazy"><figcaption>A banner as low-latency Dolby Vision starts, in the top left of the picture, as cinefit draws it.</figcaption></figure>
 
-<figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: The Screening Room, and under it No signal, small, in the lower left corner" width="1600" height="680" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name and the state, small, in one corner.</figcaption></figure>
+<figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: The Screening Room, and under it No signal, small, in the lower left corner" width="2400" height="1021" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name and the state, small, in one corner.</figcaption></figure>
 
 The **slate** is shown whenever there is no picture: **No signal**, **Signal lost** (and how long ago), **Receiver off**, **Identifying the signal...**, or **Can't show this format**. It moves to another corner every five minutes. Set [`slate.venue`](/settings/#slate-venue) to put your theater's name above it.
 
