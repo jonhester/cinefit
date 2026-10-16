@@ -23,7 +23,7 @@ Set [`atv.host`](/settings/#atv-host) to the Apple TV's hostname or IP address, 
 1. Under **Receiver**, find **Apple TV pairing** and press **Pair**. The Apple TV shows a PIN.
 2. Type the PIN in **PIN on the TV** and press **Pair with this PIN**.
 
-cinefit keeps the pairing in `~/.config/cinefit-rs/atv-credentials` (readable only by your user; it holds a secret key). Pair again only if the Apple TV forgets cinefit.
+cinefit keeps the pairing in `/etc/cinefit/atv-credentials` (readable only by the `cinefit` user; it holds a secret key). Pair again only if the Apple TV forgets cinefit.
 
 Once paired, the info panel's **Playing** row shows the title, app and position. Some apps report nothing about what they play.
 

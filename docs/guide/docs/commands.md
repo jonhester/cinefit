@@ -5,7 +5,7 @@ description: "The cinefit command's subcommands for users: probe, display, gpu, 
 
 # Commands
 
-The installed build is `~/cinefit-app/current`. Every command takes `--help`, and `cinefit --version` prints the version.
+Every command takes `--help`, and `cinefit --version` prints the version. To run them as yourself, join the service's groups ([Installing, step 3](/install/)).
 
 ## Safe while the service runs
 
@@ -22,7 +22,7 @@ These only read.
 
 ## Need the service stopped
 
-These take the capture card, the display or the remote. Stop the service first (`systemctl stop cinefit`) and start it afterwards (`systemctl start cinefit`).
+These take the capture card, the display or the remote. Stop the service first (`sudo systemctl stop cinefit`) and start it afterwards (`sudo systemctl start cinefit`).
 
 | Command | What it does |
 |---|---|

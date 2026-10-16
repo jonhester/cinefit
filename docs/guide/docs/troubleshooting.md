@@ -5,7 +5,7 @@ description: "Symptoms, causes and fixes for cinefit: no signal, black picture, 
 
 # Troubleshooting
 
-Start with the log: `journalctl -u cinefit -n 100`, or the newest file in `~/cinefit-logs/` (also on the web page under **Recent runs and logs**). Each entry below is a symptom, its usual cause, how to tell, and the fix.
+Start with the log: `journalctl -u cinefit -n 100`, or the newest file in `/var/log/cinefit/` (also on the web page under **Recent runs and logs**). Each entry below is a symptom, its usual cause, how to tell, and the fix.
 
 ## The slate says "No signal"
 
@@ -58,7 +58,7 @@ Start with the log: `journalctl -u cinefit -n 100`, or the newest file in `~/cin
 ## The display blanks for a few seconds at odd times
 
 - **Cause**: a resync on a change of frame rate or HDR type is expected ([Picture types](/picture/#resyncs)). One in the middle of a film, with **Stopping cinefit.service** in the journal, is Ubuntu's automatic updates restarting it.
-- **Fix**: the two settings in [Installing, step 5](/install/#updates).
+- **Fix**: the two settings in [Installing, step 4](/install/#updates).
 
 ## The menu, banners and slate never appear
 
@@ -72,4 +72,4 @@ Start with the log: `journalctl -u cinefit -n 100`, or the newest file in `~/cin
 
 ## Disk filling up
 
-cinefit records what its bar detector measured, and some full frames, under `~/cinefit-clips/caught/` (about 150 MB a film plus up to [`detect.frames_gb`](/settings/#detect-frames-gb) of frames). This helps tune the detector. Turn it off with [`detect.record`](/settings/#detect-record), or keep only the small readings with `detect.frames_gb = 0`. Run logs in `~/cinefit-logs/` are not cleaned up automatically.
+cinefit records what its bar detector measured, and some full frames, under `/var/lib/cinefit/caught/` (about 150 MB a film plus up to [`detect.frames_gb`](/settings/#detect-frames-gb) of frames). This helps tune the detector. Turn it off with [`detect.record`](/settings/#detect-record), or keep only the small readings with `detect.frames_gb = 0`. Run logs in `/var/log/cinefit/` are not cleaned up automatically.

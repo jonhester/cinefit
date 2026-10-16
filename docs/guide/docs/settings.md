@@ -7,7 +7,7 @@ description: "Every cinefit setting: what it does, its values, its default and w
 
 # Settings reference
 
-Settings live in `~/.config/cinefit-rs/cinefit.toml`, one `[section]` per group below. A file that is not there means every setting is at its default, and the file only needs the settings you change. The on-screen menu and the web page change the same settings and save them to the same file. `cinefit settings` prints them all with their current values, and `cinefit settings --toml` prints a complete file to start from.
+Settings live in `/etc/cinefit/cinefit.toml` (in `~/.config/cinefit-rs/` when cinefit runs from your home directory), one `[section]` per group below. A file that is not there means every setting is at its default, and the file only needs the settings you change. The on-screen menu and the web page change the same settings and save them to the same file; to edit it by hand, `sudo -u cinefit editor /etc/cinefit/cinefit.toml`. `cinefit settings` prints them all with their current values, and `cinefit settings --toml` prints a complete file to start from.
 
 Each setting says what changing it costs while cinefit is running:
 

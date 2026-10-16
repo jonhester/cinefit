@@ -20,7 +20,7 @@ cinefit reads any USB keyboard-like device with arrow keys: a keyboard, or an IR
 Program your remote's buttons to send these keys (with a flirc, a media-center profile covers the arrows, Enter and Back; add `M` or `C` for Menu and `I` for Info). To see what each button sends:
 
 ```sh
-~/cinefit-app/current keys
+cinefit keys
 ```
 
 It lists each press for 30 seconds. While it runs it takes the keys from the service.

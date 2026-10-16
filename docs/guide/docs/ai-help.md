@@ -17,10 +17,10 @@ This guide is also published in a form AI assistants read easily:
 3. Paste what cinefit says. The most useful are:
 
 ```sh
-~/cinefit-app/current --version
-~/cinefit-app/current probe
-~/cinefit-app/current display
-~/cinefit-app/current settings
+cinefit --version
+cinefit probe
+cinefit display
+cinefit settings
 journalctl -u cinefit -n 100 --no-pager
 ```
 

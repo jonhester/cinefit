@@ -61,7 +61,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css">'
   </article>
   <article>
     <h3>Runs like an appliance</h3>
-    <p>Power on and it plays. Updates never interrupt a film, and one command rolls back to the previous build.</p>
+    <p>Installs as an Ubuntu package and starts with the PC. Updates never interrupt a film, and an earlier release is one install away.</p>
   </article>
   <article>
     <h3>On your phone too</h3>

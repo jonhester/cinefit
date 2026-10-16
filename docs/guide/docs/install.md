@@ -1,15 +1,15 @@
 ---
 title: "Installing"
-description: "Install cinefit on Ubuntu 26.04: the DeckLink driver, user groups, the latest release with one command, and the one-time systemd service setup."
+description: "Install cinefit on Ubuntu 26.04: the DeckLink driver, then the cinefit package, which sets up the system service, its user and its folders."
 ---
 
 # Installing
 
-Every step here is done once. After it, cinefit starts at boot and updates need no root.
+Two packages: the capture card's driver, then cinefit. After that, cinefit starts whenever the PC does.
 
 ## 1. The capture card's driver
 
-Download **Desktop Video** (16.0 or newer) for Linux from Blackmagic's support site and install its `.deb` packages. Then check the card is seen:
+Download **Desktop Video** (16.0 or newer) for Linux from Blackmagic's support site and install it. Then check the card is seen:
 
 ```sh
 ls /dev/blackmagic/
@@ -17,50 +17,49 @@ ls /dev/blackmagic/
 
 You should see `io0`. If not, the driver is not loaded (a reboot after installing is the usual fix).
 
-## 2. Libraries and groups
+## 2. cinefit
 
 ```sh
-sudo apt install mesa-vulkan-drivers libvulkan1 liblcms2-2 libdrm2 libdrm-amdgpu1 libgbm1 curl python3
-sudo usermod -aG video,render,input "$USER"
+curl -fsSLO https://github.com/jonhester/cinefit/releases/latest/download/cinefit_amd64.deb
+sudo apt install ./cinefit_amd64.deb
 ```
 
-The groups let cinefit open the display (`video`), the GPU's render node (`render`) and the remote or keyboard (`input`) without root. Log out and back in for them to take effect.
+apt installs what cinefit needs alongside it (Vulkan and the graphics libraries), and the package then:
 
-## 3. cinefit itself
+- creates a `cinefit` system user, allowed to use the display, the GPU and the remote,
+- installs and starts the `cinefit` service, which starts again at every boot.
 
-```sh
-curl -fsSL https://github.com/jonhester/cinefit/releases/latest/download/install.sh | sh
-```
-
-This downloads the latest release, checks it against its published checksum, and puts it in `~/cinefit-app/`, with `~/cinefit-app/current` pointing at it. Before switching to a new build it makes sure the build starts and can read your settings, so a bad download never becomes the one that runs. It also keeps a copy of itself in `~/cinefit-app/tools/`, which is what you run for [updates](/updating/).
-
-To install a particular version instead of the latest, add it at the end: `| sh -s -- --release 0.2.0`.
-
-::: callout info "Building from source"
-To run unreleased code, or on a CPU too old for the published builds, see [Building from source](/build-from-source/).
-:::
-
-## 4. The service (root, once)
-
-The first time, the installer prints the steps that need root, with your user filled in:
-
-```sh
-sudo cp ~/cinefit-app/cinefit.service /etc/systemd/system/
-sudo cp ~/cinefit-app/50-cinefit.rules /etc/polkit-1/rules.d/
-sudo systemctl daemon-reload
-sudo systemctl enable --now cinefit
-```
-
-The service runs `~/cinefit-app/current play` as your user, waits up to 30 seconds at boot for the capture card, and restarts itself 5 seconds after any exit. The polkit rule lets your user start, stop and restart **this unit only** without a password, so updates and tests need no `sudo`.
-
-Check it is running and watch its log:
+Check it is running, and watch what it does:
 
 ```sh
 systemctl status cinefit
 journalctl -u cinefit -f
 ```
 
-## 5. Keep automatic updates out of the film {#updates}
+### Where things are
+
+| What | Where |
+|---|---|
+| The program | `/usr/bin/cinefit` |
+| Settings, and the Apple TV pairing | `/etc/cinefit/` |
+| Run logs | `/var/log/cinefit/`, and `journalctl -u cinefit` |
+| The bar detector's recordings | `/var/lib/cinefit/` |
+
+The web page and the on-screen menu change settings for you. To edit the settings file by hand, edit it as the `cinefit` user, so the service can still save to it:
+
+```sh
+sudo -u cinefit editor /etc/cinefit/cinefit.toml
+```
+
+## 3. Running cinefit's commands yourself (optional)
+
+The checks in [First picture](/first-picture/) are cinefit commands you type. To run them as yourself, join the same groups as the service, then log out and back in:
+
+```sh
+sudo usermod -aG video,render,input "$USER"
+```
+
+## 4. Keep automatic updates out of the film {#updates}
 
 Ubuntu installs security updates daily, and afterwards restarts services that use an updated library. The graphics libraries load into cinefit, so a Mesa or Vulkan update restarts it: the picture goes black for a few seconds and the display resyncs, in the middle of whatever is playing.
 
@@ -85,3 +84,7 @@ echo '$nrconf{override_rc}{qr(^cinefit\.service$)} = 0;' \
 ```
 
 Next: [The signal chain](/signal-chain/).
+
+::: callout info "Other ways to install"
+To run unreleased code, on a CPU too old for the published builds, or without root, see [Building from source](/build-from-source/).
+:::

@@ -10,7 +10,7 @@ Work from the input to the screen. The first three checks are read-only and safe
 ## 1. Is the card receiving a signal?
 
 ```sh
-~/cinefit-app/current probe
+cinefit probe
 ```
 
 You should see your DeckLink, its `persistent ID`, and the format arriving on its input (for example `3840x2160 23.976`, YCbCr, HDR metadata if any). No signal here means the problem is upstream: the splitter, the EDID or HDCP. See [The signal chain](/signal-chain/).
@@ -18,7 +18,7 @@ You should see your DeckLink, its `persistent ID`, and the format arriving on it
 ## 2. Does the display offer the right modes?
 
 ```sh
-~/cinefit-app/current display
+cinefit display
 ```
 
 This lists the connected display, the modes it offers, its HDR and colorimetry support and the GPU's planes. Check that your panel's native size (for example `4096x2160`) appears at 23.976 and 24.
@@ -26,14 +26,14 @@ This lists the connected display, the modes it offers, its HDR and colorimetry s
 ## 3. Does the GPU work?
 
 ```sh
-~/cinefit-app/current gpu
+cinefit gpu
 ```
 
 This checks Vulkan and libplacebo, and renders and reads back test frames. It touches no display.
 
 ## 4. Tell cinefit about your display and screen
 
-Create `~/.config/cinefit-rs/cinefit.toml` with what differs from the defaults (4096x2160 panel, 2.35:1 screen):
+Set what differs from the defaults (a 4096x2160 panel and a 2.35:1 screen). The screen ratio is in the on-screen menu and on the web page; the panel size is set on the web page or in the settings file (`sudo -u cinefit editor /etc/cinefit/cinefit.toml`):
 
 ```toml
 [output]
@@ -46,7 +46,7 @@ screen_ar = 2.39
 Every setting is in the [Settings reference](/settings/). Restart the service to pick up the panel size:
 
 ```sh
-systemctl restart cinefit
+sudo systemctl restart cinefit
 ```
 
 ## 5. Look at the screen
@@ -59,5 +59,5 @@ Play something with black bars. Within a few seconds of the signal arriving you 
 Press **Info** on the remote (or `I` on a keyboard) for the info panel: what is coming in, what is going out, the crop, and frames shown versus repeated in the last 10 seconds. Repeated frames during steady playback point at a performance problem; see [Troubleshooting](/troubleshooting/).
 
 ::: callout tip "Testing by hand"
-To run cinefit in a terminal instead of the service, stop the service first (`systemctl stop cinefit`), then `~/cinefit-app/current play -t 30`. Ctrl-C prints a summary. `play --dry-run` sets up capture and the first render but leaves the display alone. Start the service again afterwards.
+To run cinefit in a terminal instead of the service, stop the service first (`sudo systemctl stop cinefit`), then `cinefit play -t 30`. Ctrl-C prints a summary. `play --dry-run` sets up capture and the first render but leaves the display alone. Start the service again afterwards.
 :::
