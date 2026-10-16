@@ -7,6 +7,8 @@ description: "The parts for a cinefit system: a PC, an AMD graphics card (tested
 
 A cinefit system is a PC in your rack, between your sources and your projector. Here is each part, what it has to do, and the options to buy where there is a choice.
 
+<ol class="parts-toc"><li><a href="#pc"><span class="name">A PC</span><span class="pick">any recent desktop with two free PCIe slots</span></a></li><li><a href="#gpu"><span class="name">A graphics card</span><span class="pick">AMD Radeon RX 6400, tested; newer AMD cards should work</span></a></li><li><a href="#capture"><span class="name">A capture card</span><span class="pick">Blackmagic DeckLink Mini Recorder 4K, tested</span></a></li><li><a href="#source"><span class="name">A source the capture card accepts</span><span class="pick">a signal without HDCP, through an HDMI splitter</span></a></li><li><a href="#display"><span class="name">A projector or TV</span><span class="pick">any display with HDMI in</span></a></li><li><a href="#remote"><span class="name">A remote</span><span class="pick">optional: a flirc USB receiver, tested</span></a></li></ol>
+
 <p class="disclosure">The Buy on Amazon links support cinefit, at no cost to you: as an Amazon Associate, cinefit's author earns from qualifying purchases.</p>
 
 ## 1. A PC {#pc}
