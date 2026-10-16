@@ -118,8 +118,8 @@ unset.
   folder: `npm ci`, `npx docmd dev`, `npx docmd build`). A change users can
   see (a command, a message, a menu row) updates the guide in the same PR.
   `.github/workflows/guide.yml` publishes it to Cloudflare Pages
-  (cinefit.org) on a release tag only; main goes to next.cinefit.org, and
-  prerelease tags deploy nothing.
+  (cinefit.org) on a release tag (vX.Y.Z) only; a prerelease tag
+  (vX.Y.Z-beta.1) goes to next.cinefit.org, and main deploys nothing.
 
 - Every `unsafe` block has a `// SAFETY:` comment; clippy enforces it.
 - Structs shared with a C shim are declared on both sides; assert every field
