@@ -91,9 +91,19 @@
       "collapsible": false,
       "children": [
         {
-          "title": "On screen and remote",
+          "title": "Remote and menu",
           "path": "/using/",
           "icon": "gamepad-2"
+        },
+        {
+          "title": "On screen",
+          "path": "/on-screen/",
+          "icon": "monitor"
+        },
+        {
+          "title": "The web page",
+          "path": "/web-page/",
+          "icon": "smartphone"
         },
         {
           "title": "Picture types",

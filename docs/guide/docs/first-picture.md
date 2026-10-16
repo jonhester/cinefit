@@ -56,7 +56,7 @@ Play something with black bars. Within a few seconds of the signal arriving you 
 - A **banner** naming the picture type, such as `HDR10 / 4K 23.976 · to the projector`.
 - The picture **filling the screen's height**, the bars cropped away.
 
-Press **Info** on the remote (or `I` on a keyboard) for the info panel: what is coming in, what is going out, the crop, and frames shown versus repeated in the last 10 seconds. Repeated frames during steady playback point at a performance problem; see [Troubleshooting](/troubleshooting/).
+Press **Info** on the remote (or `I` on a keyboard) for the [info panel](/on-screen/): what is coming in, what is going out, the crop, and frames shown versus repeated in the last 10 seconds. Repeated frames during steady playback point at a performance problem; see [Troubleshooting](/troubleshooting/).
 
 ::: callout tip "Testing by hand"
 To run cinefit in a terminal instead of the service, stop the service first (`sudo systemctl stop cinefit`), then `cinefit play -t 30`. Ctrl-C prints a summary. `play --dry-run` sets up capture and the first render but leaves the display alone. Start the service again afterwards.
