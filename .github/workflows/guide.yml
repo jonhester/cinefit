@@ -7,7 +7,9 @@ name: Guide
 # never describes a setting or command that the latest release does not
 # have. A prerelease tag (v0.2.0-beta.1, v0.2.0-rc.1) goes to the `next`
 # preview alias (next.cinefit.org), the guide for what is about to be
-# released. main deploys nothing; a PR only builds, so broken links show. Only the guide's own files start it on a branch: Rust changes do
+# released. Only the newest of each counts (deploy-targets.py): a patch to
+# an older line leaves both alone. main deploys nothing; a PR only builds,
+# so broken links show. Only the guide's own files start it on a branch: Rust changes do
 # not need Node. The settings page is generated from the settings table
 # and checked by `cargo test` in CI.
 #
@@ -46,20 +48,19 @@ jobs:
       - run: npx docmd validate
       - run: npx docmd build
       # Production is the project's `main` branch in Cloudflare's terms;
-      # any other branch name is a preview, here aliased as next.
+      # any other branch name is a preview, here aliased as next. Which of
+      # them a tag goes to is by SemVer against every tag in the repository
+      # (deploy-targets.py), so an older line's patch never replaces the
+      # newest guide.
       - if: github.event_name == 'push'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          REF: ${{ github.ref }}
+          TAG: ${{ github.ref_name }}
         run: |
-          # vX.Y.Z is a release; vX.Y.Z-anything a prerelease.
-          if printf '%s' "$REF" | grep -Eq '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            branch=main
-          elif printf '%s' "$REF" | grep -Eq '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+-'; then
-            branch=next
-          else
-            echo "$REF is neither a release nor a prerelease tag: not deployed"
-            exit 0
-          fi
-          npx --yes wrangler@4 pages deploy site --project-name=cinefit --branch="$branch"
+          git fetch --quiet --tags --force origin
+          targets=$(python3 deploy-targets.py "$TAG" $(git tag --list 'v*'))
+          [ -n "$targets" ] || echo "$TAG is not the newest of its kind: the guide is not deployed"
+          for branch in $targets; do
+            npx --yes wrangler@4 pages deploy site --project-name=cinefit --branch="$branch"
+          done
