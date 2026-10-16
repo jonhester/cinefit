@@ -65,3 +65,7 @@ figure.shot.phones img { width: calc(50% - 8px); min-width: 220px; max-width: 32
 .tag-untried { background: var(--tag-untried); color: var(--tag-untried-t); }
 .setting.part .links { margin-top: 12px; font-size: 0.9em; }
 .disclosure { font-size: 0.88em; color: var(--fig-dim); border-left: 3px solid var(--fig-hot-line); padding: 4px 0 4px 12px; }
+.setting.part .options { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--fig-line); font-size: 0.92em; }
+.setting.part .options-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-weight: 600; }
+.setting.part .options ul { margin: 8px 0; }
+.setting.part .options p { margin: 6px 0 0; color: var(--fig-dim); }
