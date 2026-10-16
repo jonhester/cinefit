@@ -36,14 +36,14 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
     <h2>Same height, every film</h2>
     <p>On a scope screen, a 16:9 show and a 2.39:1 film should stand the same height. cinefit finds the bars in every frame and places the picture so it does: no lens memories, no remote juggling between titles.</p>
   </div>
-  <div class="cih-art" role="img" aria-label="Two scope screens: a 16:9 show with black at the sides, and a 2.39:1 film filling the screen, both the same height">
+  <div class="cih-art" role="img" aria-label="Two scope screens: a 16:9 frame from Charade with black at the sides, and a 2.39:1 frame from Tears of Steel filling the screen, both the same height">
     <figure>
-      <svg viewBox="0 0 240 104"><defs><linearGradient id="sky-a" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2b2350"/><stop offset="0.62" stop-color="#9a6b8f"/><stop offset="1" stop-color="#f0b27a"/></linearGradient><clipPath id="pic-a"><rect x="31" y="2" width="178" height="100"/></clipPath></defs><rect x="2" y="2" width="236" height="100" rx="2" class="screen"/><g clip-path="url(#pic-a)"><rect x="0" y="0" width="240" height="104" fill="url(#sky-a)"/><circle cx="150" cy="70" r="13" fill="#ffd9a0"/><path d="M0 78 L40 60 L78 74 L118 56 L160 76 L200 62 L240 72 V104 H0Z" fill="#3a2d4f"/><path d="M0 90 L52 76 L96 88 L140 74 L190 90 L240 80 V104 H0Z" fill="#1d1729"/></g><rect x="2" y="2" width="236" height="100" rx="2" class="frame"/></svg>
-      <figcaption>A 16:9 show</figcaption>
+      <svg viewBox="0 0 240 104"><rect x="2" y="2" width="236" height="100" rx="2" class="screen"/><clipPath id="pic-a"><rect x="31" y="2" width="178" height="100"/></clipPath><image href="/assets/images/frames/charade.jpg" x="31" y="2" width="178" height="100" preserveAspectRatio="xMidYMid slice" clip-path="url(#pic-a)"/><rect x="2" y="2" width="236" height="100" rx="2" class="frame"/></svg>
+      <figcaption>A 16:9 picture: <em>Charade</em> (1963)</figcaption>
     </figure>
     <figure>
-      <svg viewBox="0 0 240 104"><defs><linearGradient id="sky-b" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2b2350"/><stop offset="0.62" stop-color="#9a6b8f"/><stop offset="1" stop-color="#f0b27a"/></linearGradient><clipPath id="pic-b"><rect x="2" y="2" width="236" height="100"/></clipPath></defs><rect x="2" y="2" width="236" height="100" rx="2" class="screen"/><g clip-path="url(#pic-b)"><rect x="0" y="0" width="240" height="104" fill="url(#sky-b)"/><circle cx="150" cy="70" r="13" fill="#ffd9a0"/><path d="M0 78 L40 60 L78 74 L118 56 L160 76 L200 62 L240 72 V104 H0Z" fill="#3a2d4f"/><path d="M0 90 L52 76 L96 88 L140 74 L190 90 L240 80 V104 H0Z" fill="#1d1729"/></g><rect x="2" y="2" width="236" height="100" rx="2" class="frame"/></svg>
-      <figcaption>A 2.39:1 film</figcaption>
+      <svg viewBox="0 0 240 104"><rect x="2" y="2" width="236" height="100" rx="2" class="screen"/><clipPath id="pic-b"><rect x="2" y="2" width="236" height="100"/></clipPath><image href="/assets/images/frames/tos-canal.jpg" x="2" y="2" width="236" height="100" preserveAspectRatio="xMidYMid slice" clip-path="url(#pic-b)"/><rect x="2" y="2" width="236" height="100" rx="2" class="frame"/></svg>
+      <figcaption>A 2.39:1 film: <em>Tears of Steel</em> (2012)</figcaption>
     </figure>
   </div>
 </section>
@@ -92,6 +92,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
   <p>The whole guide is published as <a href="/llms-full.txt">one text file</a> that ChatGPT, Claude and other assistants can read. Hand it over with your parts and your logs, and ask. <a href="/ai-help/">How to ask well</a>.</p>
 </section>
 <footer class="bottom">
+  <p>Film frames: <em>Charade</em> (1963), public domain in the US; <em>Tears of Steel</em> &copy; Blender Foundation, mango.blender.org, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.</p>
   <p>cinefit is open source, under Apache-2.0 or MIT. Developed on an AMD RX 6400, a DeckLink Mini Recorder 4K and a JVC projector; other hardware is untested.</p>
   <p><a href="/overview/">Guide</a> · <a href="/install/">Install</a> · <a href="/troubleshooting/">Troubleshooting</a> · <a href="https://github.com/jonhester/cinefit">GitHub</a> · <a href="https://ko-fi.com/jonhester">Tip jar</a></p>
 </footer>

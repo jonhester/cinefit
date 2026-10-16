@@ -105,3 +105,4 @@ figure.shot.phones img { width: calc(50% - 8px); min-width: 220px; max-width: 32
 .parts-toc a::before { content: counter(part); grid-row: 1 / span 2; align-self: center; width: 1.7em; height: 1.7em; border-radius: 50%; display: grid; place-items: center; font-size: 0.85em; font-weight: 700; background: var(--tag-menu); color: var(--tag-menu-t); }
 .parts-toc .name { font-weight: 600; }
 .parts-toc .pick { font-size: 0.88em; color: var(--fig-dim); }
+.fig .pic-edge { fill: none; stroke: var(--fig-hot-line); stroke-width: 1.4; }

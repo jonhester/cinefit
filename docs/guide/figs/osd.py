@@ -7,8 +7,8 @@ From the repository root:
     uv run --with pillow --with numpy docs/guide/figs/osd.py /tmp/osd
 
 The test writes each overlay as raw BGRA, premultiplied, at 4096 x 2160; this
-lays each one over black (the slate) or over a stand-in picture (the rest)
-and crops it for the page. The stand-in is a drawn landscape, never footage.
+lays each one over black (the slate) or over a frame of Tears of Steel
+(the rest) and crops it for the page.
 """
 import sys
 import numpy as np
@@ -25,19 +25,14 @@ def overlay(dir, name):
 
 
 def stand_in():
-    """A dusk landscape, dimmed as a film's dark scene would be."""
-    bg = Image.new("RGB", (W, H))
-    d = ImageDraw.Draw(bg)
-    top, mid, low = np.array([43, 35, 80]), np.array([154, 107, 143]), np.array([240, 178, 122])
-    for y in range(H):
-        t = y / H
-        c = top + (mid - top) * min(t / 0.62, 1) if t < 0.62 else mid + (low - mid) * ((t - 0.62) / 0.38)
-        d.line([(0, y), (W, y)], fill=tuple(int(v * 0.55) for v in c))
-    d.polygon([(0, 1500), (700, 1150), (1350, 1420), (2050, 1080), (2800, 1460), (3500, 1190),
-               (4096, 1380), (4096, 2160), (0, 2160)], fill=(36, 28, 50))
-    d.polygon([(0, 1730), (900, 1460), (1650, 1690), (2400, 1420), (3250, 1730), (4096, 1540),
-               (4096, 2160), (0, 2160)], fill=(18, 14, 26))
-    return np.asarray(bg, np.float32)
+    """A real picture behind the overlay: a frame of Tears of Steel (CC BY
+    3.0, Blender Foundation), 2.40:1, scaled to the panel's width and
+    placed in the screen's band, black above and below as on a scope screen."""
+    frame = Image.open(f"{OUT}/frames/tos-street.jpg").convert("RGB")
+    h = round(W * frame.height / frame.width)
+    canvas = Image.new("RGB", (W, H))
+    canvas.paste(frame.resize((W, h), Image.LANCZOS), (0, BAND[0] + (BAND[1] - h) // 2))
+    return np.asarray(canvas, np.float32)
 
 
 def over(rgb, alpha, bg):
