@@ -53,6 +53,8 @@ Settings not in the menu are on the web page and in the [settings file](/setting
 
 **Info** shows what cinefit is doing, refreshed every second, and closes after 30 seconds or on **Back**:
 
+<figure class="shot"><img src="/assets/images/osd-info.png" alt="The info panel: IN Dolby Vision low latency, 3840 x 2160, 23.976, YCbCr 4:2:2 10-bit; OUT SDR BT.2020, unchanged from the player; CROP 2.40:1, 280 / 279 rows, zoom in 12 s ago; LAST 10 S 240 shown, 0 repeated, frame work 7.9 ms of 41.7" width="900" height="858" loading="lazy"><figcaption>The info panel as cinefit draws it, over a stand-in picture: low-latency Dolby Vision coming in, a 2.40:1 film cropped, no frames repeated.</figcaption></figure>
+
 - **In**: the picture type (Dolby Vision tunnel or low latency, HDR10, HLG, SDR), size, rate, format and the brightest level in the current picture. With a Denon receiver, the input's name first.
 - **Playing**: with an Apple TV, the title, app and position.
 - **Out**: what goes to the display and what was done to it (passed through, tone mapped, placed in BT.2020).
@@ -62,6 +64,8 @@ Settings not in the menu are on the web page and in the [settings file](/setting
 ## Banners and the slate
 
 A **banner** appears for a few seconds when the picture type changes, saying what came in and what happens to it. When the change needs a resync it waits until the display shows a picture again. Turn banners off with [`osd.banners`](/settings/#osd-banners).
+
+<figure class="shot"><img src="/assets/images/osd-slate.png" alt="The slate on a black screen: The Screening Room, and under it No signal, small, in the lower left corner" width="1600" height="680" loading="lazy"><figcaption>The slate while nothing is playing, across the whole screen: the theater's name and the state, small, in one corner.</figcaption></figure>
 
 The **slate** is shown whenever there is no picture: **No signal**, **Signal lost** (and how long ago), **Receiver off**, **Identifying the signal...**, or **Can't show this format**. It moves to another corner every five minutes. Set [`slate.venue`](/settings/#slate-venue) to put your theater's name above it.
 

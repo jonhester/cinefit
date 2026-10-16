@@ -31,3 +31,8 @@ figure.fig figcaption { margin-top: 12px; color: var(--fig-dim); font-size: 0.9e
 .fig .band { fill: none; stroke: var(--fig-dim); stroke-width: 1; stroke-dasharray: 4 3; }
 .fig .pic { fill: var(--fig-pic); stroke: var(--fig-hot-line); stroke-width: 1.4; }
 .fig .old { fill: var(--fig-velvet); stroke: var(--fig-card-line); }
+/* Screenshots of the on-screen display, rendered by cinefit's own drawing
+   code (osd.rs) rather than photographed. */
+figure.shot { margin: 1.5rem 0; }
+figure.shot img { display: block; max-width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--fig-line); }
+figure.shot figcaption { margin-top: 10px; color: var(--fig-dim); font-size: 0.9em; }
