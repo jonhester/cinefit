@@ -38,7 +38,7 @@ customHead: '<link rel="stylesheet" href="/assets/css/landing.css"><link rel="ap
   </div>
   <div class="cih-art" role="img" aria-label="Two scope screens: a 16:9 frame from Charade with black at the sides, and a 2.39:1 frame from Tears of Steel filling the screen, both the same height">
     <figure>
-      <svg viewBox="0 0 240 104"><rect x="2" y="2" width="236" height="100" rx="2" class="screen"/><clipPath id="pic-a"><rect x="31" y="2" width="178" height="100"/></clipPath><image href="/assets/images/frames/charade.jpg" x="31" y="2" width="178" height="100" preserveAspectRatio="xMidYMid slice" clip-path="url(#pic-a)"/><rect x="2" y="2" width="236" height="100" rx="2" class="frame"/></svg>
+      <svg viewBox="0 0 240 104"><rect x="2" y="2" width="236" height="100" rx="2" class="screen"/><clipPath id="pic-a"><rect x="31" y="2" width="178" height="100"/></clipPath><image href="/assets/images/frames/charade-doorway.jpg" x="31" y="2" width="178" height="100" preserveAspectRatio="xMidYMid slice" clip-path="url(#pic-a)"/><rect x="2" y="2" width="236" height="100" rx="2" class="frame"/></svg>
       <figcaption>A 16:9 picture: <em>Charade</em> (1963)</figcaption>
     </figure>
     <figure>

@@ -131,7 +131,7 @@ band = 4096 / 2.35 * s
 by = (ph - band) / 2
 # Real frames: Charade (1963) for the flat picture, Tears of Steel (2012)
 # for the scope ones; the 2.76 example is Tears of Steel cut to that shape.
-panels = [(20, '16:9 and 1.85', ['full height,', 'dark at the sides'], 16 / 9, 'charade'),
+panels = [(20, '16:9 and 1.85', ['full height,', 'dark at the sides'], 16 / 9, 'charade-face'),
           (277, '2.39 scope', ['fills the screen,', 'about 1% trimmed a side'], 2.39, 'tos-canal'),
           (535, '2.76, as Ben-Hur', ['fits the width,', 'thin bars above and below'], 2.76, 'tos-canal')]
 y0 = 58
