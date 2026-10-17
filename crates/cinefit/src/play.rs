@@ -1377,14 +1377,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     }
     // The slate and banners on the overlay plane: up with the modeset, so
     // a run without a source opens on the slate.
-    let mut ui = Ui::new(
-        &mut out,
-        index,
-        size,
-        (win.y, win.h),
-        &cfg.venue,
-        cfg.banners,
-    );
+    let mut ui = Ui::new(&mut out, index, size, win, &cfg.venue, cfg.banners);
     let mut enc = encoding_for(signal_of(hdr));
     // The remote and keyboards, read on their own thread.
     let keys = KeyReader::start(Path::new("/dev/input"), |line| info!("{line}"));
@@ -1546,8 +1539,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     run_started.elapsed().as_secs_f64(),
                     a.name()
                 );
-                // While the menu is open it takes every key but Info.
-                if a == Action::Menu || (menu.is_open() && a != Action::Info) {
+                // While the menu is open it takes every key but Info; with
+                // a pattern up, the keys that step and take it down.
+                if a != Action::Info && menu.takes(a) {
                     if let Some((key, value)) = menu.key(a, &cfg, Instant::now()) {
                         changes.push((key, value, "menu"));
                     }
@@ -1593,7 +1587,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     "detect.record" => finder.thumbs = cfg.record,
                     "geometry.screen_ar" => {
                         win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
-                        ui.set_band((win.y, win.h));
+                        ui.set_window(win);
                     }
                     "osd.banners" => ui.set_banners(cfg.banners),
                     "slate.venue" => ui.set_venue(&cfg.venue),
@@ -1603,7 +1597,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     _ => {}
                 }
             }
-            ui.set_menu(menu.view(&cfg, Instant::now()));
+            ui.set_menu(menu.view(&cfg, enc, Instant::now()));
+            ui.set_pattern(menu.pattern(Instant::now()));
             // Waiting, with the rate changed: ask for it on every pass, as
             // the policy wants a change held before it modesets.
             if wait_changed && dark {

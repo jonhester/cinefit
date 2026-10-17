@@ -23,6 +23,8 @@ mod menu;
 mod osd;
 mod pairs;
 #[cfg(target_os = "linux")]
+mod patterns;
+#[cfg(target_os = "linux")]
 mod play;
 mod record;
 mod replay;

@@ -9,18 +9,30 @@
 //! typed: ratios by their usual names, rates and the panel's size from the
 //! display's own modes. A setting with no list here (the tone curve, SDR
 //! white) is set in the file or on the web page.
+//!
+//! The last page is the test patterns, which are not settings: choosing one
+//! shows it at once under the menu, nothing is saved, and it stays up after
+//! the menu closes until Back takes it down (←→ step between patterns
+//! meanwhile). It goes by itself after [`PATTERN_IDLE`] without a key.
 
 use std::time::{Duration, Instant};
 
 use cinefit_input::Action;
 
 use crate::config::{self, Apply, Config, OutputMode, Ratio, Value};
+use crate::osd::Encoding;
+use crate::patterns::{self, KINDS, Kind, SIZES, Spec};
 
 /// Closes by itself after this long without a key, so it is never left over
 /// a film.
 pub const IDLE: Duration = Duration::from_secs(60);
 
-const PAGES: [&str; 4] = ["Picture", "Output", "Screen", "Input"];
+/// A test pattern goes by itself after this long without a key: long, as
+/// focusing is done with the projector's own remote, which cinefit does not
+/// see, but never left over a film.
+pub const PATTERN_IDLE: Duration = Duration::from_secs(30 * 60);
+
+const PAGES: [&str; 5] = ["Picture", "Output", "Screen", "Input", "Patterns"];
 
 /// The screen shapes offered: the usual names, 16:9 by its own.
 const SCREEN: [(f64, f64, &str); 8] = [
@@ -52,6 +64,16 @@ enum Row {
         what: fn(&Config) -> String,
         cost: &'static str,
     },
+    /// A test pattern's choice: shown at once, never saved.
+    Pattern { label: &'static str, what: Pick },
+}
+
+/// What a pattern row picks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    Kind,
+    Size,
+    Level,
 }
 
 fn rows(page: usize) -> &'static [Row] {
@@ -111,7 +133,21 @@ fn rows(page: usize) -> &'static [Row] {
             key: "input.lldv",
         },
     ];
-    [PICTURE, OUTPUT, SCREEN_ROWS, INPUT][page]
+    const PATTERNS: &[Row] = &[
+        Row::Pattern {
+            label: "Pattern",
+            what: Pick::Kind,
+        },
+        Row::Pattern {
+            label: "Window size",
+            what: Pick::Size,
+        },
+        Row::Pattern {
+            label: "Window level",
+            what: Pick::Level,
+        },
+    ];
+    [PICTURE, OUTPUT, SCREEN_ROWS, INPUT, PATTERNS][page]
 }
 
 /// A value a row can take, with what the menu calls it.
@@ -288,6 +324,13 @@ pub struct MenuText {
 
 /// The menu's state.
 pub struct Menu {
+    /// The test pattern up, if any, and its window's size and level.
+    pattern: Option<Kind>,
+    size: usize,
+    level: usize,
+    pattern_key: Instant,
+    /// The output's encoding as last drawn: it names the window's levels.
+    enc: Encoding,
     open: bool,
     page: usize,
     row: usize,
@@ -305,6 +348,13 @@ pub type Change = (&'static str, Value);
 impl Menu {
     pub fn new(rates: Vec<f64>, version: &str) -> Self {
         Self {
+            pattern: None,
+            // A quarter of the screen: big enough for a meter, small
+            // enough to keep the projector's light control out of it.
+            size: 1,
+            level: 0,
+            pattern_key: Instant::now(),
+            enc: Encoding::Sdr,
             open: false,
             page: 0,
             row: 0,
@@ -315,18 +365,88 @@ impl Menu {
         }
     }
 
+    #[cfg(test)]
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Whether the menu takes key `a`: every key while open, Menu to open
+    /// it, and Back and ←→ while a pattern is up.
+    pub fn takes(&self, a: Action) -> bool {
+        self.open
+            || a == Action::Menu
+            || (self.pattern.is_some() && matches!(a, Action::Back | Action::Left | Action::Right))
+    }
+
+    /// The test pattern to show now, if any; it goes after
+    /// [`PATTERN_IDLE`] without a key.
+    pub fn pattern(&mut self, now: Instant) -> Option<Spec> {
+        if self.pattern.is_some() && now.duration_since(self.pattern_key) >= PATTERN_IDLE {
+            self.pattern = None;
+        }
+        self.pattern.map(|kind| Spec {
+            kind,
+            size: self.size,
+            level: self.level.min(patterns::level_count(self.enc) - 1),
+        })
+    }
+
+    /// Steps a pattern row: off and the patterns, the sizes, or the levels
+    /// of the encoding up now. The ends stop.
+    fn step_pattern(&mut self, what: Pick, up: bool) {
+        let step = |i: usize, n: usize| {
+            if up {
+                (i + 1).min(n - 1)
+            } else {
+                i.saturating_sub(1)
+            }
+        };
+        match what {
+            Pick::Kind => {
+                // 0 is off, then the patterns in order.
+                let i = self
+                    .pattern
+                    .and_then(|k| KINDS.iter().position(|&x| x == k))
+                    .map_or(0, |i| i + 1);
+                let i = step(i, KINDS.len() + 1);
+                self.pattern = i.checked_sub(1).map(|i| KINDS[i]);
+            }
+            Pick::Size => self.size = step(self.size, SIZES.len()),
+            Pick::Level => {
+                let n = patterns::level_count(self.enc);
+                self.level = step(self.level.min(n - 1), n);
+            }
+        }
+    }
+
+    fn pattern_label(&self, what: Pick) -> String {
+        match what {
+            Pick::Kind => self.pattern.map_or("Off", Kind::label).into(),
+            Pick::Size => format!("{:.0}% of the screen", SIZES[self.size] * 100.0),
+            Pick::Level => patterns::level_label(self.level, self.enc),
+        }
     }
 
     /// One key. Returns a setting to change, if the key changed one. Keys
     /// the menu does not take while open (Info) are for the caller.
     pub fn key(&mut self, a: Action, c: &Config, now: Instant) -> Option<Change> {
         self.last_key = now;
+        self.pattern_key = now;
         if !self.open {
-            if a == Action::Menu {
-                self.open = true;
-                self.in_rows = false;
+            match a {
+                Action::Menu => {
+                    self.open = true;
+                    self.in_rows = false;
+                }
+                Action::Back => self.pattern = None,
+                // Between the patterns, never to off: that is Back.
+                Action::Left | Action::Right if self.pattern.is_some() => {
+                    self.step_pattern(Pick::Kind, a == Action::Right);
+                    if self.pattern.is_none() {
+                        self.pattern = Some(KINDS[0]);
+                    }
+                }
+                _ => {}
             }
             return None;
         }
@@ -342,18 +462,22 @@ impl Menu {
             }
             (Action::Up, true) => self.row = self.row.saturating_sub(1),
             (Action::Down, true) => self.row = (self.row + 1).min(n_rows - 1),
-            (Action::Left | Action::Right, true) => {
-                if let Row::Setting { key, .. } = rows(self.page)[self.row] {
+            (Action::Left | Action::Right, true) => match rows(self.page)[self.row] {
+                Row::Setting { key, .. } => {
                     return step(key, c, &self.rates, a == Action::Right).map(|v| (key, v));
                 }
-            }
+                Row::Pattern { what, .. } => self.step_pattern(what, a == Action::Right),
+                Row::Fixed { .. } => {}
+            },
             _ => {}
         }
         None
     }
 
-    /// What to draw, while open; closes after [`IDLE`] without a key.
-    pub fn view(&mut self, c: &Config, now: Instant) -> Option<MenuText> {
+    /// What to draw, while open, for an output in `enc`; closes after
+    /// [`IDLE`] without a key.
+    pub fn view(&mut self, c: &Config, enc: Encoding, now: Instant) -> Option<MenuText> {
+        self.enc = enc;
         if self.open && now.duration_since(self.last_key) >= IDLE {
             self.open = false;
         }
@@ -367,12 +491,20 @@ impl Menu {
                     (label.into(), value_label(key, c, &self.rates), true)
                 }
                 Row::Fixed { label, what, .. } => (label.into(), what(c), false),
+                Row::Pattern { label, what } => (label.into(), self.pattern_label(what), true),
             })
             .collect();
         let cost = if self.in_rows {
             match rows(self.page)[self.row] {
                 Row::Setting { key, .. } => cost(key).into(),
                 Row::Fixed { cost, .. } => cost.into(),
+                Row::Pattern {
+                    what: Pick::Level, ..
+                } => match self.enc {
+                    Encoding::Sdr => "SDR now: 100% white is the projector's peak".into(),
+                    Encoding::Pq => "HDR10 now: where the projector maps each level".into(),
+                },
+                Row::Pattern { .. } => "Shown now, never saved \u{b7} Back takes it down".into(),
             }
         } else {
             String::new()
@@ -414,18 +546,24 @@ mod tests {
     #[test]
     fn menu_opens_moves_between_pages_and_closes() {
         let (mut m, mut c) = (menu(), Config::default());
-        assert!(m.view(&c, Instant::now()).is_none());
+        assert!(m.view(&c, Encoding::Sdr, Instant::now()).is_none());
         press(&mut m, &mut c, &[Action::Menu]);
-        let v = m.view(&c, Instant::now()).unwrap();
+        let v = m.view(&c, Encoding::Sdr, Instant::now()).unwrap();
         assert_eq!((v.page, v.in_rows, v.cost.as_str()), (0, false, ""));
         press(
             &mut m,
             &mut c,
-            &[Action::Down, Action::Down, Action::Down, Action::Down],
+            &[
+                Action::Down,
+                Action::Down,
+                Action::Down,
+                Action::Down,
+                Action::Down,
+            ],
         );
         assert_eq!(
-            m.view(&c, Instant::now()).unwrap().page,
-            3,
+            m.view(&c, Encoding::Sdr, Instant::now()).unwrap().page,
+            4,
             "stops at the last page"
         );
         press(&mut m, &mut c, &[Action::Back]);
@@ -448,7 +586,7 @@ mod tests {
         // Down to the fill limit: 2.40 on a 2.35 screen, → to 2.55.
         let changed = press(&mut m, &mut c, &[Action::Down, Action::Right]);
         assert_eq!(changed, ["geometry.fill_max_ar=2.55"]);
-        let v = m.view(&c, Instant::now()).unwrap();
+        let v = m.view(&c, Encoding::Sdr, Instant::now()).unwrap();
         assert_eq!(v.rows[1].1, "2.55 : 1");
         assert_eq!(v.cost, "Applies now, no resync");
         // Back keeps it and goes to the pages; Back again closes.
@@ -524,7 +662,7 @@ mod tests {
             ],
         );
         assert!(changed.is_empty());
-        let v = m.view(&c, Instant::now()).unwrap();
+        let v = m.view(&c, Encoding::Sdr, Instant::now()).unwrap();
         assert_eq!(
             v.rows[1],
             ("Panel size".into(), "4096 \u{d7} 2160".into(), false)
@@ -533,13 +671,107 @@ mod tests {
         assert_eq!(v.rows[2].1, "\u{2014}", "no theater name");
     }
 
+    /// Opens the menu on the Patterns page, its rows in focus.
+    fn to_patterns(m: &mut Menu, c: &mut Config) {
+        let mut keys = vec![Action::Menu];
+        keys.extend([Action::Down; 4]);
+        keys.push(Action::Right);
+        assert!(press(m, c, &keys).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_shows_at_once_stays_after_the_menu_and_is_never_saved() {
+        let (mut m, mut c) = (menu(), Config::default());
+        let now = Instant::now();
+        to_patterns(&mut m, &mut c);
+        assert_eq!(m.pattern(now), None);
+        // → on Pattern: alignment, at once, and no setting changed.
+        assert!(press(&mut m, &mut c, &[Action::Right]).is_empty());
+        let v = m.view(&c, Encoding::Sdr, now).unwrap();
+        assert_eq!(v.pages[4], "Patterns");
+        assert_eq!(v.rows[0].1, "Alignment");
+        assert_eq!(v.cost, "Shown now, never saved \u{b7} Back takes it down");
+        assert_eq!(m.pattern(now).map(|p| p.kind), Some(Kind::Alignment));
+        // Menu closes the menu; the pattern stays.
+        press(&mut m, &mut c, &[Action::Menu]);
+        assert!(!m.is_open());
+        assert_eq!(m.pattern(now).map(|p| p.kind), Some(Kind::Alignment));
+        // ←→ step between the patterns with the menu closed, never to off.
+        assert!(m.takes(Action::Right) && !m.takes(Action::Up));
+        press(&mut m, &mut c, &[Action::Right, Action::Right]);
+        assert_eq!(m.pattern(now).map(|p| p.kind), Some(Kind::FocusGreen));
+        press(&mut m, &mut c, &[Action::Left, Action::Left, Action::Left]);
+        assert_eq!(m.pattern(now).map(|p| p.kind), Some(Kind::Alignment));
+        // Back takes it down, and then the menu takes no more keys.
+        press(&mut m, &mut c, &[Action::Back]);
+        assert_eq!(m.pattern(now), None);
+        assert!(!m.takes(Action::Back) && !m.takes(Action::Right));
+        assert_eq!(c, Config::default(), "nothing set");
+    }
+
+    #[test]
+    fn the_window_steps_its_size_and_its_level_in_the_output_encoding() {
+        let (mut m, mut c) = (menu(), Config::default());
+        let now = Instant::now();
+        to_patterns(&mut m, &mut c);
+        // Pattern: → four times to the window, the last; a fifth stops.
+        press(&mut m, &mut c, &[Action::Right; 5]);
+        assert_eq!(m.pattern(now).map(|p| p.kind), Some(Kind::Window));
+        // Size: a quarter to start, → to half.
+        press(&mut m, &mut c, &[Action::Down, Action::Right]);
+        let v = m.view(&c, Encoding::Pq, now).unwrap();
+        assert_eq!(v.rows[1].1, "50% of the screen");
+        // Level, in nits under HDR10, down from 10,000 to 1,000.
+        assert_eq!(v.rows[2].1, "10000 nits");
+        press(
+            &mut m,
+            &mut c,
+            &[Action::Down, Action::Right, Action::Right],
+        );
+        let v = m.view(&c, Encoding::Pq, now).unwrap();
+        assert_eq!(v.rows[2].1, "1000 nits");
+        assert!(v.cost.starts_with("HDR10 now"));
+        assert_eq!(m.pattern(now).unwrap().level, 2);
+        // Under SDR, as a share of white; the index held past its end is
+        // the list's last until stepped.
+        press(&mut m, &mut c, &[Action::Right; 3]);
+        assert_eq!(m.pattern(now).unwrap().level, 5);
+        let v = m.view(&c, Encoding::Sdr, now).unwrap();
+        assert_eq!(v.rows[2].1, "10% white");
+        assert_eq!(m.pattern(now).unwrap().level, 4);
+        press(&mut m, &mut c, &[Action::Left]);
+        assert_eq!(m.pattern(now).unwrap().level, 3);
+    }
+
+    #[test]
+    fn a_pattern_goes_by_itself_after_a_long_while() {
+        let (mut m, mut c) = (menu(), Config::default());
+        let t0 = Instant::now();
+        m.key(Action::Menu, &c, t0);
+        for _ in 0..4 {
+            m.key(Action::Down, &c, t0);
+        }
+        m.key(Action::Right, &c, t0);
+        m.key(Action::Right, &c, t0);
+        m.key(Action::Menu, &c, t0);
+        assert!(
+            m.pattern(t0 + PATTERN_IDLE - Duration::from_secs(1))
+                .is_some()
+        );
+        assert!(m.pattern(t0 + PATTERN_IDLE).is_none());
+        let _ = &mut c;
+    }
+
     #[test]
     fn it_closes_itself_when_left_alone() {
         let (mut m, mut c) = (menu(), Config::default());
         let t0 = Instant::now();
         m.key(Action::Menu, &c, t0);
-        assert!(m.view(&c, t0 + IDLE - Duration::from_millis(1)).is_some());
-        assert!(m.view(&c, t0 + IDLE).is_none());
+        assert!(
+            m.view(&c, Encoding::Sdr, t0 + IDLE - Duration::from_millis(1))
+                .is_some()
+        );
+        assert!(m.view(&c, Encoding::Sdr, t0 + IDLE).is_none());
         let _ = &mut c;
     }
 }

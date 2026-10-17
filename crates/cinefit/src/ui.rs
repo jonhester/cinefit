@@ -1,6 +1,8 @@
-//! What the overlay shows during `play`: the info panel (#72) while it is
-//! open, the waiting slate (#76) while there is no picture, and a banner
-//! (#77) when the picture type changes. One at a time, in that order.
+//! What the overlay shows during `play`: a test pattern while one is up,
+//! with the menu over it while that is open; else the menu, the info panel
+//! (#72) while it is open, the waiting slate (#76) while there is no
+//! picture, and a banner (#77) when the picture type changes. One at a time,
+//! in that order.
 //!
 //! `play` says what is happening ([`Ui::set_slate`], [`Ui::picture`],
 //! [`Ui::resynced`], [`Ui::toggle_info`]) and calls [`Ui::update`] before
@@ -16,6 +18,7 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use cinefit_geometry::Rect;
 use cinefit_kms::Output;
 use log::{info, warn};
 
@@ -23,6 +26,7 @@ use crate::menu::MenuText;
 use crate::osd::{
     self, Area, BannerText, Canvas, Corner, Encoding, Fonts, InfoText, SlateText, Tone,
 };
+use crate::patterns::{self, Spec};
 
 /// How long the slate stays in one corner, so nothing sits in one place on
 /// the screen for hours.
@@ -120,21 +124,23 @@ enum Content {
     Banner(BannerText),
     Info(InfoText),
     Menu(MenuText),
+    /// The whole raster, opaque, the menu over it while it is open.
+    Pattern(Spec, Option<MenuText>),
 }
 
 /// A picture asked of the drawing thread.
 struct Job {
     content: Content,
     enc: Encoding,
-    /// The screen's band as it is now: the screen ratio can change mid-run.
-    band: (usize, usize),
+    /// The screen as it is now: the screen ratio can change mid-run.
+    win: Rect,
 }
 
 /// A picture the drawing thread made: `px` covers `area` of the raster.
 struct Painted {
     content: Content,
     enc: Encoding,
-    band: (usize, usize),
+    win: Rect,
     area: Area,
     px: Vec<u8>,
     ms: f64,
@@ -172,12 +178,19 @@ impl Painter {
 /// Draws one picture, off the overlay's memory.
 fn paint(fonts: &Fonts, raster: (usize, usize), job: Job) -> Painted {
     let started = Instant::now();
-    let band = job.band;
+    let win = job.win;
+    let band = (win.y as usize, win.h as usize);
     let area = match &job.content {
         Content::Slate(_, corner) => osd::slate_area(raster, band, *corner),
         Content::Banner(text) => osd::banner_area(raster, band.0, fonts, text),
         Content::Info(text) => osd::info_area(raster, band, text),
         Content::Menu(_) => osd::menu_area(raster, band.0),
+        Content::Pattern(..) => Area {
+            x: 0,
+            y: 0,
+            w: raster.0,
+            h: raster.1,
+        },
     };
     let mut px = vec![0u8; area.w * 4 * area.h];
     let mut c = Canvas::window(&mut px, area.w * 4, area, raster, job.enc);
@@ -186,11 +199,18 @@ fn paint(fonts: &Fonts, raster: (usize, usize), job: Job) -> Painted {
         Content::Banner(text) => osd::banner(&mut c, fonts, area, text),
         Content::Info(text) => osd::info(&mut c, fonts, area, text),
         Content::Menu(m) => osd::menu(&mut c, fonts, area, m),
+        Content::Pattern(spec, menu) => {
+            patterns::draw(&mut px, raster, win, job.enc, fonts, *spec);
+            if let Some(m) = menu {
+                let mut c = Canvas::new(&mut px, raster.0 * 4, raster.0, raster.1, job.enc);
+                osd::menu(&mut c, fonts, osd::menu_area(raster, band.0), m);
+            }
+        }
     }
     Painted {
         content: job.content,
         enc: job.enc,
-        band,
+        win,
         area,
         px,
         ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -198,8 +218,8 @@ fn paint(fonts: &Fonts, raster: (usize, usize), job: Job) -> Painted {
 }
 
 /// What a picture was drawn for besides its content: the output's encoding
-/// and the screen's band. A change to either redraws it.
-type Look = (Encoding, (usize, usize));
+/// and the screen. A change to either redraws it.
+type Look = (Encoding, Rect);
 
 pub struct Ui {
     painter: Option<Painter>,
@@ -210,14 +230,16 @@ pub struct Ui {
     buffers: Option<[usize; 2]>,
     /// Where each buffer has been drawn, to clear before drawing again.
     drawn: [Option<Area>; 2],
-    /// The buffer on screen, what it holds, and in which encoding and band.
+    /// The buffer on screen, what it holds, and in which encoding and screen.
     shown: Option<(usize, Content, Look)>,
     /// The picture last asked of the drawing thread.
     asked: Option<(Content, Look)>,
-    /// The screen's band of the raster: top row and height.
-    band: (usize, usize),
+    /// Where the screen is on the raster.
+    win: Rect,
     /// The menu, while open: what it shows.
     menu: Option<MenuText>,
+    /// The test pattern up, if any.
+    pattern: Option<Spec>,
     /// The info panel: opened when, and what it says.
     info: Option<(Instant, Option<InfoText>)>,
     fades: bool,
@@ -241,7 +263,7 @@ impl Ui {
         out: &mut Output,
         index: usize,
         raster: (u32, u32),
-        band: (u32, u32),
+        win: Rect,
         venue: &str,
         banners: bool,
     ) -> Self {
@@ -262,7 +284,6 @@ impl Ui {
             info!("osd: the overlay plane has no opacity property: banners appear without fades");
         }
         let raster = (raster.0 as usize, raster.1 as usize);
-        let band = (band.0 as usize, band.1 as usize);
         let painter = buffers.and_then(|_| Painter::start(raster));
         Self {
             painter,
@@ -272,8 +293,9 @@ impl Ui {
             drawn: [None; 2],
             shown: None,
             asked: None,
-            band,
+            win,
             menu: None,
+            pattern: None,
             info: None,
             fades,
             started: Instant::now(),
@@ -325,10 +347,16 @@ impl Ui {
         self.menu = menu;
     }
 
-    /// The screen's band, after a change of screen ratio: whatever is shown
-    /// is redrawn in it.
-    pub fn set_band(&mut self, band: (u32, u32)) {
-        self.band = (band.0 as usize, band.1 as usize);
+    /// The test pattern to show, or `None`: it comes before everything,
+    /// the menu drawn over it.
+    pub fn set_pattern(&mut self, pattern: Option<Spec>) {
+        self.pattern = pattern;
+    }
+
+    /// The screen, after a change of screen ratio: whatever is shown is
+    /// redrawn in it.
+    pub fn set_window(&mut self, win: Rect) {
+        self.win = win;
     }
 
     /// The theater's name, after a change on the web page.
@@ -405,7 +433,7 @@ impl Ui {
             self.asked = None;
             return;
         };
-        let look = (enc, self.band);
+        let look = (enc, self.win);
         let up_to_date = self
             .shown
             .as_ref()
@@ -417,7 +445,7 @@ impl Ui {
                 let job = Job {
                     content: wanted.0.clone(),
                     enc,
-                    band: self.band,
+                    win: self.win,
                 };
                 if painter.jobs.send(job).is_err() {
                     warn!("osd: the drawing thread is gone, so no overlay from now");
@@ -436,7 +464,7 @@ impl Ui {
                 && self
                     .asked
                     .as_ref()
-                    .is_some_and(|(c, l)| *c == p.content && *l == (p.enc, p.band))
+                    .is_some_and(|(c, l)| *c == p.content && *l == (p.enc, p.win))
             {
                 // The buffer not on screen: the last commit has completed,
                 // so nothing scans it out.
@@ -451,7 +479,7 @@ impl Ui {
                     return;
                 }
                 out.set_overlay(Some(buffers[i]));
-                self.shown = Some((buffers[i], p.content, (p.enc, p.band)));
+                self.shown = Some((buffers[i], p.content, (p.enc, p.win)));
             }
         }
         out.set_overlay_alpha((alpha * 65535.0).round() as u16);
@@ -459,6 +487,9 @@ impl Ui {
 
     /// What should show now, and at what opacity.
     fn want(&mut self, now: Instant) -> (Option<Content>, f32) {
+        if let Some(spec) = self.pattern {
+            return (Some(Content::Pattern(spec, self.menu.clone())), 1.0);
+        }
         if let Some(m) = &self.menu {
             return (Some(Content::Menu(m.clone())), 1.0);
         }
@@ -548,6 +579,15 @@ impl Ui {
             Content::Banner(t) => format!("banner \"{} / {}\"", t.title, t.detail),
             Content::Info(_) => "info".to_string(),
             Content::Menu(_) => "menu".to_string(),
+            Content::Pattern(spec, menu) => format!(
+                "pattern {}{}",
+                spec.kind.label(),
+                if menu.is_some() {
+                    " under the menu"
+                } else {
+                    ""
+                }
+            ),
         };
         if what != self.logged {
             info!(
@@ -575,8 +615,14 @@ mod tests {
             drawn: [None; 2],
             shown: None,
             asked: None,
-            band: (209, 1742),
+            win: Rect {
+                x: 0,
+                y: 209,
+                w: 4096,
+                h: 1742,
+            },
             menu: None,
+            pattern: None,
             info: None,
             fades: true,
             started: Instant::now(),

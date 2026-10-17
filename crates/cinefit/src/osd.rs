@@ -101,7 +101,7 @@ pub mod palette {
 }
 
 /// SMPTE ST 2084's inverse EOTF: nits to a signal value in 0..1.
-fn pq(nits: f32) -> f32 {
+pub(crate) fn pq(nits: f32) -> f32 {
     let (m1, m2) = (0.159_301_76_f32, 78.843_75_f32);
     let (c1, c2, c3) = (0.835_937_5_f32, 18.851_563_f32, 18.6875_f32);
     let y = (nits / 10_000.0).clamp(0.0, 1.0).powf(m1);
