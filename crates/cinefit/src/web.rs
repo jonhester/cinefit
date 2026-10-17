@@ -287,15 +287,17 @@ fn place(key: &str) -> (&'static str, &'static str) {
         ),
         "output.mode" => ("Output", "HDR10"),
         "output.wait_hz" => ("Output", "Rate while waiting"),
-        "output.white_nits" => ("Output", "SDR white and low-latency Dolby Vision, nits"),
         "tonemap.curve" => ("Output", "Tone curve"),
         "tonemap.source_peak" => ("Output", "HDR10 source peak, nits (0: from the disc)"),
+        "tonemap.peak_nits" => ("Output", "Screen peak, nits"),
+        "tonemap.target_nits" => ("Output", "Map HDR into, nits (0: the screen peak)"),
         "geometry.screen_ar" => ("Screen", "Screen ratio"),
         "output.width" => ("Screen", "Panel width"),
         "output.height" => ("Screen", "Panel height"),
         "slate.venue" => ("Screen", "Theater name"),
         "input.rgb_range" => ("Input", "RGB range"),
         "input.lldv" => ("Input", "Dolby Vision low latency"),
+        "input.lldv_nits" => ("Input", "Low-latency Dolby Vision peak, nits"),
         "input.device" => ("Input", "Capture device (persistent ID)"),
         "web.port" => ("Web page", "Port"),
         "avr.denon" => ("Receiver", "Denon AVR (hostname or IP)"),
@@ -401,7 +403,10 @@ mod tests {
             set(&s, r#"{"key":"geometry.screen_ar","value":"16:9"}"#).0,
             200
         );
-        assert_eq!(set(&s, r#"{"key":"output.white_nits","value":96}"#).0, 200);
+        assert_eq!(
+            set(&s, r#"{"key":"tonemap.target_nits","value":150}"#).0,
+            200
+        );
         let (code, e) = set(&s, r#"{"key":"detect.crop","value":"maybe"}"#);
         assert_eq!(code, 400);
         assert!(e["error"].as_str().unwrap().contains("on | off"), "{e}");
@@ -416,7 +421,7 @@ mod tests {
             [
                 "detect.crop=off",
                 "geometry.screen_ar=16:9",
-                "output.white_nits=96"
+                "tonemap.target_nits=150"
             ]
         );
     }
