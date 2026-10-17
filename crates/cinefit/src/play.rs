@@ -355,9 +355,11 @@ struct Target<'a, 'p> {
     color: RgbColor,
     /// What plain RGB input's codes mean (the `input.rgb_range` setting).
     rgb_range: Levels,
-    /// HDR into SDR: what SDR white stands for, which is also the peak
-    /// low-latency Dolby Vision is mapped to, and the curve (the settings).
-    white_nits: f32,
+    /// What SDR white stands for: low-latency Dolby Vision's own peak, which
+    /// passes one to one, and what HDR10 and the tunnel are mapped into
+    /// (the settings), with the curve.
+    lldv_nits: f32,
+    mapped_nits: f32,
     curve: Curve,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
@@ -405,7 +407,8 @@ fn target<'a, 'p>(
         tex: &targets[b],
         color,
         rgb_range: c.rgb_range,
-        white_nits: f32::from(c.white_nits),
+        lldv_nits: f32::from(c.lldv_nits),
+        mapped_nits: f32::from(c.mapped_nits()),
         curve: c.curve,
         source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
         view,
@@ -1025,13 +1028,14 @@ fn draw<'p>(
         | Content::Lldv(color) => {
             // Low-latency Dolby Vision is PQ under its SDR label, already
             // mapped by the player to its peak.
-            let (color, peak) = match content {
+            let (color, peak, white) = match content {
                 Content::Lldv(_) => (
                     YcbcrColor {
                         transfer: Transfer::Pq,
                         ..color
                     },
-                    Some(dst.white_nits),
+                    Some(dst.lldv_nits),
+                    dst.lldv_nits,
                 ),
                 _ => {
                     if color.transfer == Transfer::Pq
@@ -1046,7 +1050,7 @@ fn draw<'p>(
                             sources.pq_peak = Some(p as f32);
                         }
                     }
-                    (color, dst.source_peak.or(sources.pq_peak))
+                    (color, dst.source_peak.or(sources.pq_peak), dst.mapped_nits)
                 }
             };
             let p = sources.planes.as_mut().expect("uploaded");
@@ -1057,7 +1061,7 @@ fn draw<'p>(
                         // An HDR10 disc without MaxCLL or mastering: 1000 nits,
                         // the common grade.
                         src_peak: peak.unwrap_or(1000.0),
-                        dst_peak: dst.white_nits,
+                        dst_peak: white,
                         curve: dst.curve,
                     }
                 });
@@ -1070,7 +1074,7 @@ fn draw<'p>(
             // curve: the scene-by-scene metadata is not used yet.
             let map = (out.transfer == Transfer::Bt1886).then(|| Mapping {
                 src_peak: cinefit_dovi::pq_to_nits(tunnel.source_max_pq) as f32,
-                dst_peak: dst.white_nits,
+                dst_peak: dst.mapped_nits,
                 curve: dst.curve,
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
@@ -1089,6 +1093,16 @@ fn draw<'p>(
     }
     stages.render.push(ms(t));
     Ok(())
+}
+
+/// What the SDR output's white stands for with this content: low-latency
+/// Dolby Vision's own peak, which passes one to one, else what HDR is mapped
+/// into. A readout of the output in nits uses it.
+fn white_for(content: Content, c: &Config) -> u16 {
+    match content {
+        Content::Lldv(_) => c.lldv_nits,
+        _ => c.mapped_nits(),
+    }
 }
 
 fn ms(since: Instant) -> f64 {
@@ -1284,12 +1298,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 None => ", no source".to_string(),
                 Some(Content::Lldv(_)) => format!(
                     ": low-latency Dolby Vision, passed through at {} nits",
-                    cfg.white_nits
+                    cfg.lldv_nits
                 ),
                 Some(Content::Tunnel | Content::Hdr10(_)) => format!(
-                    ": HDR tone-mapped ({}) to white at {} nits",
+                    ": HDR tone-mapped ({}) to white at {} nits (screen peak {})",
                     cfg.curve.name(),
-                    cfg.white_nits
+                    cfg.mapped_nits(),
+                    cfg.peak_nits
                 ),
                 _ => String::new(),
             }
@@ -1664,10 +1679,16 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             peak_words(
                                 Content::of(k.kind, cfg.lldv),
                                 b,
-                                cfg.lldv.then_some(cfg.white_nits)
+                                cfg.lldv.then_some(cfg.lldv_nits)
                             ),
                             shown
-                                .and_then(|v| out_nits(v, signal, cfg.white_nits))
+                                .and_then(|v| {
+                                    out_nits(
+                                        v,
+                                        signal,
+                                        white_for(Content::of(k.kind, cfg.lldv), &cfg),
+                                    )
+                                })
                                 .map_or_else(|| "-".into(), |n| format!("brightest {n:.0} nits"))
                         ),
                         _ => String::new(),
@@ -1803,7 +1824,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         input_section(
                             picture.map(|(c, k)| (c, k.width, k.height)),
                             last_format,
-                            cfg.lldv.then_some(cfg.white_nits),
+                            cfg.lldv.then_some(cfg.lldv_nits),
                             brightest,
                         ),
                         output_section(
@@ -1811,7 +1832,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             policy.committed().signal,
                             cur_mode,
                             shown,
-                            cfg.white_nits,
+                            picture.map_or(cfg.mapped_nits(), |(c, _)| white_for(c, &cfg)),
                         ),
                         status::crop_section(
                             last_key.filter(|_| !dark).map(|k| (k.width, k.height)),
