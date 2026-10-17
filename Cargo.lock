@@ -275,6 +275,14 @@ name = "cinefit-geometry"
 version = "0.1.0"
 
 [[package]]
+name = "cinefit-harmony"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde_json",
+]
+
+[[package]]
 name = "cinefit-input"
 version = "0.1.0"
 dependencies = [
