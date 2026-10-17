@@ -7,14 +7,14 @@
 //! gate: a false cut delays a zoom-in by a few frames, a missed one lets old
 //! evidence count a little longer, and neither can crop picture. So this is
 //! deliberately cheap: no confirmation frame, no cooldown, no near-black
-//! events, all of which the reference detector needs because its cuts drive
-//! decisions.
+//! events. A detector whose cuts drove decisions would need them.
 //!
-//! The thresholds are the reference description's, in 10-bit codes, plus one
-//! of the C++ version's own, `spike`, set against 352 labelled detections from
-//! recorded clips: fast motion through texture passes every threshold on
-//! every frame, and what tells a cut from it is that a cut is a spike after a
-//! calm frame.
+//! A cut needs a large change in the cells, over most of them, and in the
+//! picture's make-up (all in 10-bit codes, [`Params`]), and it must be a
+//! spike against the previous frame's change. The spike rule was set against
+//! 352 detections from recorded clips, labelled by eye: fast motion through
+//! texture passes every other threshold on every frame, and what tells a cut
+//! from it is that a cut is a spike after a calm frame.
 
 use crate::{RowScratch, Samples};
 
@@ -203,9 +203,7 @@ impl Cuts {
             }
             // Histogram distance: half the L1 distance between the two bin
             // counts, as a share of samples: the fraction that would have to
-            // change bin to turn one histogram into the other. The reference
-            // description gives the threshold (55 per mille) but not the
-            // measure; this is the C++ version's reading.
+            // change bin to turn one histogram into the other.
             let l1: u64 = hist
                 .iter()
                 .zip(&prev.hist)
