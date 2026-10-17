@@ -12,7 +12,7 @@ It is developed and tested with a JVC RS3000 (a 4096x2160 panel).
 
 | Crate | What it is | Must not know about |
 |---|---|---|
-| `cinefit` | the one binary: `probe`, `capture`, `gpu`, `pattern` | — (it wires the others together) |
+| `cinefit` | the one binary: `probe`, `capture`, `gpu`, `pattern` | nothing (it wires the others together) |
 | `cinefit-decklink` | capture, through a C++ shim over the vendored DeckLink SDK headers | KMS, Vulkan, libplacebo |
 | `cinefit-dovi` | tunneled Dolby Vision metadata from pixel parity (ETSI GS CCM 001 §6) | anything but bytes |
 | `cinefit-detect` | the bar detector: rows of luma and chroma in, rows of bar out | capture, GPU, display |
@@ -118,6 +118,8 @@ unset.
 - "Not reported" is never "no" or zero: unreported values are `None`.
 - Comments explain *why*, especially where code looks wrong but is right.
   Match the density of the file you are editing.
+- **No em dashes (U+2014), anywhere**: code, comments, docs, commit messages,
+  PRs and issues. Use a colon, a comma, parentheses or a new sentence.
 
 ## Workflow
 

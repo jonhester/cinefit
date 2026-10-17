@@ -1,7 +1,7 @@
 # cinefit-atv
 
-What an Apple TV is playing — the app, the title, where in it, and whether it
-is playing — read over the remote-control channel that AirPlay 2 tunnels
+What an Apple TV is playing (the app, the title, where in it, and whether it
+is playing), read over the remote-control channel that AirPlay 2 tunnels
 (#115). It only reads: nothing it sends changes what the Apple TV does.
 
 ## Based on pyatv
