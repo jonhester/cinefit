@@ -35,6 +35,7 @@ mod status;
 mod times;
 #[cfg(target_os = "linux")]
 mod tunnel_check;
+mod ub820;
 #[cfg(target_os = "linux")]
 mod ui;
 #[cfg(target_os = "linux")]
@@ -290,6 +291,15 @@ enum Command {
         #[arg(short = 't', long, default_value_t = 30.0)]
         seconds: f64,
     },
+    /// Read a Panasonic UB820's play state and position over the network
+    /// (needs Voice Control on in the player). Reads only; presses nothing.
+    Ub820 {
+        /// The player's IP address or hostname.
+        host: String,
+        /// Keep reading, once a second, until interrupted.
+        #[arg(long)]
+        watch: bool,
+    },
     /// List every setting: its value, range, what a change costs, and help.
     Settings {
         /// The settings file; by default ~/.config/cinefit-rs/cinefit.toml.
@@ -309,6 +319,7 @@ fn main() -> ExitCode {
             sessions.iter().try_for_each(|s| hindsight::run(s, worst))
         }
         Command::Gpu => gpu(),
+        Command::Ub820 { host, watch } => ub820::run(&host, watch),
         Command::Dovi { session } => dovi_meta::run(&session),
         Command::Pairs {
             a,

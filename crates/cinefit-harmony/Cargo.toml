@@ -1,0 +1,16 @@
+[package]
+name = "cinefit-harmony"
+description = "Send IR commands through a Logitech Harmony Hub over its local network API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+log = "0.4"
+serde_json = "1"
+
+[lints]
+workspace = true
