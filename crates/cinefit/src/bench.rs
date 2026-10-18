@@ -120,6 +120,7 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
     let mut linear: Option<Vec<u32>> = None;
     let mut tiled_frame = None;
     let mut bad = 0;
+    let mut unread = 0;
     for &m in &modifiers {
         let name = cinefit_kms::modifier_name(m);
         let frame = match out.create_scanout_as(index, m) {
@@ -160,7 +161,7 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
         let words = match read_words(&out, frame, w, h) {
             Ok(words) => words,
             Err(e) => {
-                bad += 1;
+                unread += 1;
                 println!(
                     "{name:<20} {:>6.2}ms {:>6.2}ms {:>6.2}ms {:>8}  not read back: {e}",
                     at(0.5),
@@ -264,6 +265,9 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
     drop(clocks);
     if bad > 0 {
         return Err(format!("{bad} layouts render differently from LINEAR").into());
+    }
+    if unread > 0 {
+        return Err(format!("{unread} layouts could not be read back, so are unchecked").into());
     }
     Ok(())
 }
