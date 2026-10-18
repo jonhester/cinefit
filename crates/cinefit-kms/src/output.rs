@@ -566,14 +566,26 @@ impl Output {
         }
         let format = self.scanout_format()?;
         let gbm = self.gbm.as_ref().expect("created above");
-        let bo = gbm
-            .create_buffer_object_with_modifiers2::<()>(
+        let alloc = |flags| {
+            gbm.create_buffer_object_with_modifiers2::<()>(
                 w.into(),
                 h.into(),
                 format,
                 modifiers.iter().map(|&m| gbm::Modifier::from(m)),
-                gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
+                flags,
             )
+        };
+        // NVIDIA's GBM refuses LINEAR with RENDERING (EINVAL, every format)
+        // but allocates it for SCANOUT alone. RENDERING is only a hint here:
+        // the renderer writes through Vulkan's dma-buf import, not GBM.
+        let bo = alloc(gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING)
+            .or_else(|e| {
+                if modifiers == [0] {
+                    alloc(gbm::BufferObjectFlags::SCANOUT)
+                } else {
+                    Err(e)
+                }
+            })
             .map_err(io("allocating a GBM scanout buffer"))?;
         if bo.plane_count() != 1 {
             return Err(Error::Planes(bo.modifier().into(), bo.plane_count()));

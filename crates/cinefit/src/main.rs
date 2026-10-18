@@ -740,12 +740,25 @@ fn pattern(run: PatternRun) -> Result<(), Box<dyn std::error::Error>> {
         };
         let fonts = osd::Fonts::load();
         let t = Instant::now();
+        // Drawn in memory and copied in, as play's OSD is: drawing blends, so
+        // it reads, and a mapped buffer can be uncached video memory (drawn
+        // in place on NVIDIA, the card took 9.5 s).
+        let mut card = vec![0u8; w * h * 4];
+        osd::test_card(
+            &mut osd::Canvas::new(&mut card, w * 4, w, h, enc),
+            &fonts,
+            enc,
+        );
+        let drawn = t.elapsed();
         out.draw_overlay(i, |px, pitch| {
-            osd::test_card(&mut osd::Canvas::new(px, pitch, w, h, enc), &fonts, enc);
+            for (row, src) in px.chunks_mut(pitch).zip(card.chunks(w * 4)) {
+                row[..w * 4].copy_from_slice(src);
+            }
         })?;
         println!(
-            "overlay: test card drawn in {:.0} ms, encoded for {enc:?}",
-            t.elapsed().as_secs_f64() * 1000.0
+            "overlay: test card drawn in {:.0} ms, copied in {:.0} ms, encoded for {enc:?}",
+            drawn.as_secs_f64() * 1000.0,
+            (t.elapsed() - drawn).as_secs_f64() * 1000.0
         );
         out.set_overlay(Some(i));
         Some(i)
