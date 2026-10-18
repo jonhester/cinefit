@@ -155,7 +155,22 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
         }
         times.sort_by(f64::total_cmp);
         let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
-        let words = read_words(&out, frame, w, h)?;
+        // A layout GBM will not map for reading (NVIDIA's block-linear, it
+        // seems: EINVAL on a 3060) still has its timing: report it and go on.
+        let words = match read_words(&out, frame, w, h) {
+            Ok(words) => words,
+            Err(e) => {
+                bad += 1;
+                println!(
+                    "{name:<20} {:>6.2}ms {:>6.2}ms {:>6.2}ms {:>8}  not read back: {e}",
+                    at(0.5),
+                    at(0.95),
+                    times[times.len() - 1],
+                    buf.stride
+                );
+                continue;
+            }
+        };
         // play's start-up check on this layout (it renders over the frame,
         // so after the frame is read).
         let check = match crate::play::renders_right(&out, &pl, frame, &target) {
