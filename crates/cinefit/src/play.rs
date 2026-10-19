@@ -23,6 +23,7 @@ use crate::dataset;
 use crate::follow;
 use crate::menu::Menu;
 use crate::osd::InfoText;
+use crate::pairfollow;
 use crate::runlog;
 use crate::status::{self, Window};
 use crate::times::Times;
@@ -484,7 +485,21 @@ struct Dataset {
     playing: Option<String>,
     /// Which frames to keep in full (#91), from the first frame recorded.
     picker: Option<dataset::Picker>,
+    /// While pairing (#138): the session's recent frames with their
+    /// thumbnails, and every frame it kept, so a later pass can follow an
+    /// earlier one from memory; the files on disk are written through
+    /// buffers and lag.
+    history: std::collections::VecDeque<(u64, Option<[u8; dataset::THUMB]>)>,
+    kept: std::collections::BTreeSet<u64>,
+    /// The `detect.pair_follow` in force and its follower; `None` inside
+    /// when there is nothing to follow (another session, frames not held).
+    follow: Option<(String, Option<pairfollow::Follower>)>,
 }
+
+/// Frames of history held while pairing: 45 minutes at 24p, about 38 MB.
+/// A runner that plays every chapter's tunnel pass first and the low-latency
+/// ones after needs the whole run's.
+const HISTORY: usize = 1 << 16;
 
 /// The signal gone this long ends a viewing: the dataset's session closes,
 /// and the next frame opens a new one. Short drops (a player changing HDR or
@@ -584,27 +599,131 @@ impl Dataset {
         if !cfg.record || cfg.frames_gb == 0 || self.next == 0 {
             return;
         }
-        let Some(r) = self.recorder.as_mut() else {
+        if self.recorder.is_none() {
             return;
-        };
-        let picker = self.picker.get_or_insert_with(|| {
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(1, |d| d.as_nanos() as u64);
-            dataset::Picker::new(seed, t)
-        });
-        let why = if cfg.pair_every > 0 {
-            picker.pick_pairs(found.cut, cfg.pair_every)
+        }
+        let index = self.next - 1;
+        let pairing = cfg.pair_every > 0 || !cfg.pair_follow.is_empty();
+        if pairing && self.history.back().is_none_or(|h| h.0 < index) {
+            self.history.push_back((index, found.thumb));
+            if self.history.len() > HISTORY {
+                self.history.pop_front();
+            }
+        }
+        let why = if cfg.pair_follow.is_empty() {
+            self.follow = None;
+            let picker = self.picker.get_or_insert_with(|| {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| d.as_nanos() as u64);
+                dataset::Picker::new(seed, t)
+            });
+            if cfg.pair_every > 0 {
+                picker.pick_pairs(found.cut, cfg.pair_every)
+            } else {
+                picker.pick(t, found.change.is_some(), found.candidate)
+            }
         } else {
-            picker.pick(t, found.change.is_some(), found.candidate)
+            self.follow_step(&cfg.pair_follow, index, found.thumb.as_ref())
         };
         let Some(why) = why else {
             return;
         };
-        if let Some(px) = frame.pixels() {
+        if let (Some(r), Some(px)) = (self.recorder.as_mut(), frame.pixels()) {
             let budget = u64::from(cfg.frames_gb) << 30;
-            r.keep(self.next - 1, t, frame.info(), px.bytes(), why, budget);
+            r.keep(index, t, frame.info(), px.bytes(), why, budget);
+            if pairing {
+                self.kept.insert(index);
+            }
         }
+    }
+
+    /// `detect.pair_follow` (#138) on this frame: the follower for `spec`,
+    /// made when it changes, told the frame.
+    fn follow_step(
+        &mut self,
+        spec: &str,
+        index: u64,
+        thumb: Option<&[u8; dataset::THUMB]>,
+    ) -> Option<&'static str> {
+        if self.follow.as_ref().is_none_or(|(s, _)| s != spec) {
+            let f = self.follower(spec);
+            self.follow = Some((spec.to_string(), f));
+        }
+        let fl = self.follow.as_mut()?.1.as_mut()?;
+        let s = fl.step(index, thumb);
+        match s.event {
+            Some(pairfollow::Event::Locked(d)) => {
+                info!(
+                    "pair follow: locked at frame {index}: this pass's frames are the tunnel pass's + {d}"
+                );
+            }
+            Some(pairfollow::Event::Moved(e)) => {
+                info!("pair follow: offset moved by {e} at frame {index}")
+            }
+            Some(pairfollow::Event::Lost) => {
+                warn!("pair follow: lost at frame {index}: the pictures no longer match")
+            }
+            None => {}
+        }
+        s.keep.then_some("follow")
+    }
+
+    /// The follower `spec` asks for, from the history: `None`, said why,
+    /// when it names another session or frames no longer held.
+    fn follower(&self, spec: &str) -> Option<pairfollow::Follower> {
+        let open = self
+            .recorder
+            .as_ref()
+            .and_then(|r| r.dir().file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let range = spec.rsplit_once(':').and_then(|(session, range)| {
+            let (lo, hi) = range.split_once('-')?;
+            Some((
+                session,
+                lo.trim().parse::<u64>().ok()?,
+                hi.trim().parse::<u64>().ok()?,
+            ))
+        });
+        let Some((session, lo, hi)) = range.filter(|r| r.1 <= r.2) else {
+            warn!("pair follow: {spec:?} is not SESSION:FIRST-LAST: keeping nothing");
+            return None;
+        };
+        if hi - lo >= pairfollow::MAX_PASS as u64 {
+            warn!(
+                "pair follow: {spec}: {} frames, more than a pass ({} at most): keeping nothing",
+                hi - lo + 1,
+                pairfollow::MAX_PASS
+            );
+            return None;
+        }
+        if open.as_deref() != Some(session) {
+            warn!(
+                "pair follow: {spec} is not this session ({}): keeping nothing",
+                open.as_deref().unwrap_or("none open")
+            );
+            return None;
+        }
+        let held = |i: u64| {
+            self.history
+                .binary_search_by_key(&i, |h| h.0)
+                .ok()
+                .and_then(|k| self.history[k].1)
+        };
+        let thumbs: Vec<_> = (lo..=hi).map(held).collect();
+        let have = thumbs.iter().filter(|t| t.is_some()).count();
+        if have == 0 {
+            warn!("pair follow: no thumbnails held for frames {lo}-{hi}: keeping nothing");
+            return None;
+        }
+        let kept = self.kept.range(lo..=hi).copied().collect();
+        let fl = pairfollow::Follower::new(lo, &thumbs, kept);
+        info!(
+            "pair follow: following frames {lo}-{hi}: {have} thumbnails of {}, {} kept",
+            thumbs.len(),
+            fl.size().1
+        );
+        Some(fl)
     }
 
     /// The receiver's input changed: noted in the open session, and in
@@ -671,6 +790,10 @@ impl Dataset {
         }
         self.next = 0;
         self.picker = None;
+        // Frame numbers start again in the next session.
+        self.history.clear();
+        self.kept.clear();
+        self.follow = None;
         if let Some(r) = self.recorder.take() {
             match r.finish() {
                 Ok(s) => info!(

@@ -285,6 +285,10 @@ fn place(key: &str) -> (&'static str, &'static str) {
             "Picture",
             "Pairing passes: keep every Nth frame of each shot (0: off)",
         ),
+        "detect.pair_follow" => (
+            "Picture",
+            "Pairing passes: follow the tunnel pass (SESSION:FIRST-LAST)",
+        ),
         "output.mode" => ("Output", "HDR10"),
         "output.wait_hz" => ("Output", "Rate while waiting"),
         "output.white_nits" => ("Output", "SDR white and low-latency Dolby Vision, nits"),

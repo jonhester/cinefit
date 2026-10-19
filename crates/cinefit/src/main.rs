@@ -21,6 +21,8 @@ mod hindsight;
 mod menu;
 #[cfg(target_os = "linux")]
 mod osd;
+#[cfg(target_os = "linux")]
+mod pairfollow;
 mod pairs;
 #[cfg(target_os = "linux")]
 mod play;
