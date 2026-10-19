@@ -1830,16 +1830,18 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 );
             }
             if let Some(frame) = taken {
+                let came_back = dark;
                 if dark {
                     returns += 1;
                     info!("{:.1} s: signal back", run_started.elapsed().as_secs_f64());
                     dark = false;
                     wait_changed = false;
                 }
-                if holds_clocks && clocks.is_none() {
+                if came_back && holds_clocks && clocks.is_none() {
                     // A failure here (another process took the pstate while
                     // it was free) is logged and the run goes on at the
-                    // default policy; the next return tries again.
+                    // default policy; the next return tries again, not the
+                    // next frame, which would retry and log 24 times a second.
                     match cinefit_render::power::StablePstate::acquire() {
                         Ok(p) => {
                             info!(
