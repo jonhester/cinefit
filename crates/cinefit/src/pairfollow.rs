@@ -27,8 +27,9 @@
 //!   paused, one frame sent over and over, and the two passes pause at
 //!   different film frames; their repeats matched each other at the wrong
 //!   offsets and pulled the lock 13 frames off on the hardware. Nor is a
-//!   repeat ever kept: once this pass's player stops, the frame it repeats is
-//!   not the one the offset predicts.
+//!   repeat ever kept or followed: once either player stops, the frame it
+//!   repeats is not the partner the offset predicts (the hardware kept one
+//!   for a tunnel frame recorded two seconds into its pause).
 //! - **What is kept:** the frame whose partner the tunnel pass kept. Nothing
 //!   before the lock, and the lock needs a window of the tunnel's own frames
 //!   and [`FAR`] more, so a frame the tunnel kept in its first three seconds
@@ -124,11 +125,14 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 impl Follower {
     /// From the tunnel pass: its frames from `lo` on, in order, each with its
     /// thumbnail where it has one, and the frames it kept.
-    pub fn new(lo: u64, thumbs: &[Option<[u8; THUMB]>], kept: BTreeSet<u64>) -> Self {
+    pub fn new(lo: u64, thumbs: &[Option<[u8; THUMB]>], mut kept: BTreeSet<u64>) -> Self {
         let mut refs = vec![0f32; thumbs.len() * THUMB];
         let mut valid = vec![false; thumbs.len()];
         for (k, t) in thumbs.iter().enumerate() {
             if k > 0 && t.is_some() && thumbs[k - 1] == *t {
+                // A repeat: the tunnel's player had stopped. A frame it kept
+                // here has no partner in a pass still playing.
+                kept.remove(&(lo + k as u64));
                 continue;
             }
             if let Some(n) = t.as_ref().and_then(norm) {
@@ -494,6 +498,27 @@ mod tests {
         }
         assert_eq!(events, vec![Event::Locked(240)]);
         assert!(got.iter().all(|g| kept_films.contains(g)), "{got:?}");
+    }
+
+    #[test]
+    fn a_kept_tunnel_frame_in_its_paused_tail_is_not_followed() {
+        // The tunnel pass's player paused at film 1079 and recording went on
+        // for 40 frames of it, one of them kept (seen on the hardware: kept
+        // in the frozen tail). This pass plays on: its frame at that offset
+        // is a different picture, and must not be kept as the partner.
+        let f = film(1400, 11, (0, 0));
+        let tunnel_films: Vec<usize> = (300..1080).chain([1079; 40]).collect();
+        let thumbs: Vec<_> = tunnel_films.iter().map(|&x| Some(f[x])).collect();
+        let kept: BTreeSet<u64> = [730, 778, 800].into_iter().collect();
+        let mut fl = Follower::new(0, &thumbs, kept);
+        let mut got = Vec::new();
+        for (j, x) in (60..1200).enumerate() {
+            if fl.step(j as u64, Some(&mapped(&f[x]))).keep {
+                got.push(x);
+            }
+        }
+        // 730 and 778 are film 1030 and 1078; 800 is a repeat of 1079.
+        assert_eq!(got, vec![1030, 1078]);
     }
 
     #[test]
