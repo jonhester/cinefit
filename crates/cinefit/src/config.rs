@@ -76,6 +76,9 @@ pub struct Config {
     /// Pairing passes (#109): keep each shot's first frame and every this
     /// many after it, and nothing else; 0 for the usual choice.
     pub pair_every: u32,
+    /// Pairing passes (#138): `SESSION:FIRST-LAST`, the tunnel pass this one
+    /// follows, as frames of the open dataset session; empty for none.
+    pub pair_follow: String,
     /// The screen's aspect: the band of the raster that lands on it.
     pub screen_ar: Ratio,
     /// Content wider than this is trimmed at the sides to fill the screen's
@@ -171,6 +174,7 @@ impl Default for Config {
             record: true,
             frames_gb: 20,
             pair_every: 0,
+            pair_follow: String::new(),
             screen_ar: Ratio::of(2.35),
             fill_max_ar: Ratio::of(2.40),
             venue: String::new(),
@@ -451,6 +455,17 @@ static SETTINGS: &[Setting] = &[
                kept, so mind detect.frames_gb. 0: off, frames kept as usual.",
         get: |c| Value::Int(c.pair_every.into()),
         set: Set::Int(|c, v| c.pair_every = v as u32),
+    },
+    Setting {
+        key: "detect.pair_follow",
+        kind: Kind::Text { max: 40 },
+        apply: Apply::Live,
+        help: "For pairing two passes of a title: SESSION:FIRST-LAST names the tunnel pass of this chapter, as \
+               frames of the open dataset session. The pass now playing then keeps the frames whose pictures match \
+               the ones that pass kept, found by thumbnail, in place of detect.pair_every's own cuts. Ignored in any \
+               other session. Set by the pass runner for each low-latency pass. Empty: off.",
+        get: |c| Value::Name(c.pair_follow.clone()),
+        set: Set::Name(|c, v| c.pair_follow = v.trim().to_string()),
     },
     Setting {
         key: "geometry.screen_ar",
