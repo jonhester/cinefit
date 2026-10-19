@@ -209,7 +209,8 @@ fn amdgpu_render_node() -> Option<String> {
     })
 }
 
-fn level_of(node: &str) -> String {
+/// A render node's clock level as sysfs reports it, e.g. `auto`.
+pub fn level_of(node: &str) -> String {
     std::fs::read_to_string(format!(
         "/sys/class/drm/{node}/device/power_dpm_force_performance_level"
     ))

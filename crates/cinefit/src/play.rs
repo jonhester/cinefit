@@ -491,6 +491,13 @@ struct Dataset {
 /// rate at a title's start, 1-3 s) stay within one.
 const VIEWING_GAP: Duration = Duration::from_secs(10);
 
+/// The signal gone this long gives the GPU's clocks back to the driver's
+/// default policy, which idles them: the slate and the menu are light work,
+/// and the stable pstate otherwise holds the clocks up all night in standby.
+/// Long past a player's HDR or rate change, so a viewing keeps its clocks;
+/// the first frame back takes them again before it is rendered.
+const CLOCKS_IDLE: Duration = Duration::from_secs(60);
+
 /// About half an hour at 24p: a film with no break in its signal is judged
 /// in pieces, each ending at a cut, so memory stays bounded.
 const JUDGE_EVERY: usize = 24 * 60 * 30;
@@ -1154,10 +1161,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     }
     let size = (u32::from(mode.width), u32::from(mode.height));
 
-    let _clocks = if opts.pstate {
+    let mut clocks = if opts.pstate {
         match cinefit_render::power::StablePstate::acquire() {
             Ok(p) => {
-                info!("gpu clocks: {} (stable pstate, held until exit)", p.level());
+                info!(
+                    "gpu clocks: {} (stable pstate, held while there is a signal)",
+                    p.level()
+                );
                 Some(p)
             }
             Err(e) => {
@@ -1169,6 +1179,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         info!("gpu clocks: default policy (--no-pstate)");
         None
     };
+    // Only a hold taken at startup is given back and taken again: one refused
+    // then (another holder, --no-pstate) stays refused for the run.
+    let holds_clocks = clocks.is_some();
 
     let pl = Placebo::new()?;
     // The scanout buffers in the layout GBM picks from the plane's list
@@ -1805,12 +1818,44 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 );
                 dataset.end_session();
             }
+            if taken.is_none() && dark && clocks.is_some() && last_frame_at.elapsed() >= CLOCKS_IDLE
+            {
+                let node = clocks.take().map(|p| p.node().to_owned());
+                info!(
+                    "{:.1} s: no signal for {} s: gpu clocks released ({})",
+                    run_started.elapsed().as_secs_f64(),
+                    CLOCKS_IDLE.as_secs(),
+                    node.map(|n| cinefit_render::power::level_of(&n))
+                        .unwrap_or_default()
+                );
+            }
             if let Some(frame) = taken {
+                let came_back = dark;
                 if dark {
                     returns += 1;
                     info!("{:.1} s: signal back", run_started.elapsed().as_secs_f64());
                     dark = false;
                     wait_changed = false;
+                }
+                if came_back && holds_clocks && clocks.is_none() {
+                    // A failure here (another process took the pstate while
+                    // it was free) is logged and the run goes on at the
+                    // default policy; the next return tries again, not the
+                    // next frame, which would retry and log 24 times a second.
+                    match cinefit_render::power::StablePstate::acquire() {
+                        Ok(p) => {
+                            info!(
+                                "{:.1} s: gpu clocks: {} again",
+                                run_started.elapsed().as_secs_f64(),
+                                p.level()
+                            );
+                            clocks = Some(p);
+                        }
+                        Err(e) => info!(
+                            "{:.1} s: gpu clocks: not held again: {e}",
+                            run_started.elapsed().as_secs_f64()
+                        ),
+                    }
                 }
                 last_frame_at = Instant::now();
                 let k = classify(&frame, &mut last_tunnel);

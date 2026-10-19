@@ -269,7 +269,8 @@ enum Command {
         #[arg(long = "set", value_name = "KEY=VALUE")]
         sets: Vec<String>,
         /// Leave the GPU's clocks to the driver's default policy instead of
-        /// holding the standard stable power state.
+        /// holding the standard stable power state (held while there is a
+        /// signal, and given back after a minute without one).
         #[arg(long)]
         no_pstate: bool,
         /// Stop before the modeset: pre-roll, mode, signalling and the first
