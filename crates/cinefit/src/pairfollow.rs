@@ -14,23 +14,28 @@
 //!   least [`LOCK_MIN`] and better by [`UNIQUE`] than any offset [`FAR`] or
 //!   more frames away. A still shot agrees with every offset inside it, so it
 //!   does not stand out and does not lock; nor does a window half outside the
-//!   tunnel pass, where a still could match an edge perfectly.
+//!   tunnel pass, where a still could match an edge perfectly; nor an offset
+//!   within [`FAR`] of the end of those the window can be scored at yet, where
+//!   the right one may be just past it.
 //! - **Following:** the offset may move by [`DRIFT`] (the capture dropping
 //!   or repeating a frame), judged over the last [`TRACK_WINDOW`] frames; a
 //!   move must beat staying by [`TIE`], so slow or dark pictures, where the
 //!   neighbouring offsets score within noise of each other, keep theirs.
 //!   Below [`LOST`] the lock is let go, the window emptied, and found again.
 //! - **What is kept:** the frame whose partner the tunnel pass kept. Nothing
-//!   before the lock, and the lock needs a window of the tunnel's own frames,
-//!   so a frame the tunnel kept in its first two seconds cannot be followed
-//!   however early this pass starts.
+//!   before the lock, and the lock needs a window of the tunnel's own frames
+//!   and [`FAR`] more, so a frame the tunnel kept in its first three seconds
+//!   cannot be followed however early this pass starts.
 //!
 //! The windows and margins were chosen on the 26 recorded passes of one
-//! title's 13 chapters (2026-10-19): every pass locked, two seconds in
-//! (median; six and a half at most), and of 424 frames that would have been
-//! kept, 2 were off their chapter's offset. A first version judged the lock on
-//! frames that differ from the one before, and real film at 32x18 hardly
-//! does: it locked on 19 of 26.
+//! title's 13 chapters (2026-10-19): every pass locked, 2.2 s in (median; 7.3 s
+//! at most), and 432 of the tunnel's 530 kept frames would have had their
+//! partner kept; 4 were off their chapter's median offset, all in the chapter
+//! whose passes were recorded twice, where they correlate as well as the
+//! median would. A first version judged the lock on frames that differ from
+//! the one before, and real film at 32x18 hardly does: it locked on 19 of 26.
+//! On the hardware, a lock at the first window wholly inside the tunnel pass
+//! went 42 frames off, hence the margin from the ends.
 //!
 //! Pure: tested without a card, a GPU or a disk.
 
@@ -163,20 +168,26 @@ impl Follower {
     }
 
     /// The lock from scratch: the best offset over [`LOCK_WINDOW`], if it is
-    /// good enough and stands out.
+    /// good enough and stands out, and not within [`FAR`] of either end of
+    /// the offsets the window can be scored at yet. At an end the offsets just
+    /// past it, the right one among them, cannot be scored, so standing out
+    /// there proves nothing: a shot at the tunnel pass's start that repeats
+    /// one this pass showed earlier locked 42 frames off on the hardware.
     fn search(&self) -> Option<i64> {
         let (j, n) = (self.rows.back()?.0 as i64, self.valid.len() as i64);
         let first = j - (self.lo as i64 + n - 1);
         let scores: Vec<(i64, f32)> = (first..first + n)
             .filter_map(|d| self.score(d, LOCK_WINDOW, true).map(|s| (d, s)))
             .collect();
+        let (lowest, highest) = (scores.first()?.0, scores.last()?.0);
         let &(best, s) = scores.iter().max_by(|x, y| x.1.total_cmp(&y.1))?;
         let rival = scores
             .iter()
             .filter(|x| (x.0 - best).abs() >= FAR)
             .map(|x| x.1)
             .fold(-1f32, f32::max);
-        (s >= LOCK_MIN && s - rival >= UNIQUE).then_some(best)
+        let inside = best - lowest >= FAR && highest - best >= FAR;
+        (s >= LOCK_MIN && s - rival >= UNIQUE && inside).then_some(best)
     }
 
     /// Follows the offset held by a frame or a few, or lets it go.
@@ -302,12 +313,12 @@ mod tests {
 
     /// The film frames the tunnel kept that can be followed: tunnel session
     /// frame `lo + k` is film frame `from + k`, and the lock needs a whole
-    /// window of the tunnel's frames first.
+    /// window of the tunnel's frames, and [`FAR`] more, first.
     fn followable(fl: &Follower, from: usize, lo: u64) -> Vec<usize> {
         fl.kept
             .iter()
             .map(|&a| from + (a - lo) as usize)
-            .filter(|&f| f + 1 >= from + LOCK_WINDOW)
+            .filter(|&f| f + 1 >= from + LOCK_WINDOW + FAR as usize)
             .collect()
     }
 
@@ -325,7 +336,7 @@ mod tests {
             followable(&fl, 300, 937),
             "the same film frames, all of them"
         );
-        assert_eq!(got.len(), 18, "of the tunnel's {}", fl.size().1);
+        assert_eq!(got.len(), 17, "of the tunnel's {}", fl.size().1);
     }
 
     #[test]
@@ -437,6 +448,25 @@ mod tests {
             events.iter().any(|e| matches!(e.1, Event::Locked(_))),
             "never locked"
         );
+    }
+
+    #[test]
+    fn a_repeated_shot_at_the_tunnel_start_does_not_lock_early() {
+        // The tunnel pass opens on a shot that repeats one this pass, started
+        // earlier, has just shown: film 300-359 is 240-299 again. The first
+        // window wholly inside the tunnel pass can only be scored at the edge
+        // offset, and there the repeat matches perfectly and stands out (seen
+        // on the hardware, 2026-10-19: locked 42 frames off, then walked).
+        let mut f = film(1400, 9, (0, 0));
+        for k in 0..60 {
+            f[300 + k] = f[240 + k];
+        }
+        let mut fl = tunnel(&f, 300, 1200, 0);
+        let (kept, events) = follow(&mut fl, &f, 60, 1300, 0, &[]);
+        assert_eq!(events, vec![Event::Locked(240)]);
+        let want = followable(&fl, 300, 0);
+        let got: Vec<usize> = kept.iter().map(|&(_, film)| film).collect();
+        assert!(got.iter().all(|g| want.contains(g)), "{got:?}");
     }
 
     #[test]

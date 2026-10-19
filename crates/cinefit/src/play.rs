@@ -638,6 +638,19 @@ impl Dataset {
         }
     }
 
+    /// For the web page's state (#138): the open session and the index the
+    /// next frame recorded gets, which does not move while recording is off.
+    /// A pass runner reads its passes' frames here; the session's files are
+    /// written through buffers and lag by seconds.
+    fn state(&self) -> serde_json::Value {
+        let session = self
+            .recorder
+            .as_ref()
+            .and_then(|r| r.dir().file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        serde_json::json!({ "session": session, "next": self.next })
+    }
+
     /// `detect.pair_follow` (#138) on this frame: the follower for `spec`,
     /// made when it changes, told the frame.
     fn follow_step(
@@ -1846,6 +1859,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             "pill": pill,
                             "now": now_rows,
                             "settings": crate::web::settings_json(&cfg),
+                            "dataset": dataset.state(),
                         }),
                         &cfg,
                     );
