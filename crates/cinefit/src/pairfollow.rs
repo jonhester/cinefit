@@ -22,6 +22,13 @@
 //!   move must beat staying by [`TIE`], so slow or dark pictures, where the
 //!   neighbouring offsets score within noise of each other, keep theirs.
 //!   Below [`LOST`] the lock is let go, the window emptied, and found again.
+//! - **Repeats count for nothing:** a frame the same as the one before it, on
+//!   either side, is left out of every score. A clip ends with the player
+//!   paused, one frame sent over and over, and the two passes pause at
+//!   different film frames; their repeats matched each other at the wrong
+//!   offsets and pulled the lock 13 frames off on the hardware. Nor is a
+//!   repeat ever kept: once this pass's player stops, the frame it repeats is
+//!   not the one the offset predicts.
 //! - **What is kept:** the frame whose partner the tunnel pass kept. Nothing
 //!   before the lock, and the lock needs a window of the tunnel's own frames
 //!   and [`FAR`] more, so a frame the tunnel kept in its first three seconds
@@ -93,6 +100,8 @@ pub struct Follower {
     /// Each recent frame of this pass with its correlation against every
     /// reference (`None` for a flat or missing thumbnail).
     rows: VecDeque<(u64, Option<Vec<f32>>)>,
+    /// The last thumbnail seen, as sent, to tell a repeat.
+    last: Option<[u8; THUMB]>,
     offset: Option<i64>,
 }
 
@@ -119,6 +128,9 @@ impl Follower {
         let mut refs = vec![0f32; thumbs.len() * THUMB];
         let mut valid = vec![false; thumbs.len()];
         for (k, t) in thumbs.iter().enumerate() {
+            if k > 0 && t.is_some() && thumbs[k - 1] == *t {
+                continue;
+            }
             if let Some(n) = t.as_ref().and_then(norm) {
                 refs[k * THUMB..(k + 1) * THUMB].copy_from_slice(&n);
                 valid[k] = true;
@@ -130,6 +142,7 @@ impl Follower {
             valid,
             kept,
             rows: VecDeque::with_capacity(LOCK_WINDOW.max(TRACK_WINDOW) + 1),
+            last: None,
             offset: None,
         }
     }
@@ -218,7 +231,9 @@ impl Follower {
 
     /// This pass's frame `index` and its thumbnail: whether to keep it.
     pub fn step(&mut self, index: u64, thumb: Option<&[u8; THUMB]>) -> Step {
-        let corr = thumb.and_then(norm).map(|b| {
+        let repeat = thumb.is_some() && thumb == self.last.as_ref();
+        self.last = thumb.copied();
+        let corr = thumb.filter(|_| !repeat).and_then(norm).map(|b| {
             self.refs
                 .as_chunks::<THUMB>()
                 .0
@@ -237,10 +252,13 @@ impl Follower {
             self.offset = Some(d);
             event = Some(Event::Locked(d));
         }
-        let keep = self.offset.is_some_and(|d| {
-            let a = index as i64 - d;
-            a >= 0 && self.kept.contains(&(a as u64))
-        });
+        // A repeat is not the film frame the offset predicts: the player has
+        // stopped and the tunnel pass may not have.
+        let keep = !repeat
+            && self.offset.is_some_and(|d| {
+                let a = index as i64 - d;
+                a >= 0 && self.kept.contains(&(a as u64))
+            });
         Step { keep, event }
     }
 }
@@ -448,6 +466,34 @@ mod tests {
             events.iter().any(|e| matches!(e.1, Event::Locked(_))),
             "never locked"
         );
+    }
+
+    #[test]
+    fn a_paused_end_does_not_pull_the_offset() {
+        // Each clip ends with the player paused, one frame repeated, and the
+        // two passes pause at different film frames: here the tunnel plays on
+        // to film 1079 and this pass stops at 1064. Its repeats match the
+        // tunnel's one 1064 at ever larger offsets (seen on the hardware,
+        // 2026-10-19: walked 13 frames and kept the wrong partner).
+        let f = film(1400, 10, (0, 0));
+        let tunnel_films: Vec<usize> = (300..1080).chain([1079; 40]).collect();
+        let thumbs: Vec<_> = tunnel_films.iter().map(|&x| Some(f[x])).collect();
+        let kept: BTreeSet<u64> = (0..tunnel_films.len() as u64)
+            .filter(|k| k % 48 == 10)
+            .collect();
+        let kept_films: Vec<usize> = kept.iter().map(|&k| tunnel_films[k as usize]).collect();
+        let mut fl = Follower::new(0, &thumbs, kept);
+        let pass_films: Vec<usize> = (60..1065).chain([1064; 60]).collect();
+        let (mut events, mut got) = (Vec::new(), Vec::new());
+        for (j, &x) in pass_films.iter().enumerate() {
+            let s = fl.step(j as u64, Some(&mapped(&f[x])));
+            events.extend(s.event);
+            if s.keep {
+                got.push(x);
+            }
+        }
+        assert_eq!(events, vec![Event::Locked(240)]);
+        assert!(got.iter().all(|g| kept_films.contains(g)), "{got:?}");
     }
 
     #[test]
