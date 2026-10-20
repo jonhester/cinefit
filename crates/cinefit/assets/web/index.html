@@ -68,8 +68,11 @@
   footer { color: var(--hint); font-size: 13px; text-align: center; padding: 8px 0 4px; }
   @media (min-width: 900px) {
     main { grid-template-columns: minmax(0, 1fr) minmax(320px, 420px); grid-template-areas:
-           "head head" "status settings" "foot foot"; padding: 28px 32px; gap: 28px 32px; align-items: start; }
+           "head head" "status settings" "runs settings" "foot foot"; padding: 28px 32px; gap: 28px 32px; align-items: start; }
+    /* On a phone the settings come straight after the status, the logs last; here the logs sit under
+       the status and the settings keep the side column. */
     header { grid-area: head; } #status { grid-area: status; } #settings { grid-area: settings; }
+    #runs { grid-area: runs; }
     footer { grid-area: foot; }
     #settings { position: sticky; top: 28px; max-height: calc(100vh - 56px); overflow-y: auto; }
     /* Status as tiles: each reads label, value, detail, top to bottom. Two or four across, never three, so
@@ -90,12 +93,14 @@
   <header><div class="wordmark">cine<span>fit</span></div><div id="pill" class="pill">…</div></header>
   <section id="status">
     <div class="card now" id="now"></div>
-    <h2 style="margin-top:24px">Recent runs and logs</h2>
-    <div class="card logs" id="logs"></div>
   </section>
   <section id="settings">
     <h2>Settings</h2>
     <div id="pages"></div>
+  </section>
+  <section id="runs">
+    <h2>Recent runs and logs</h2>
+    <div class="card logs" id="logs"></div>
   </section>
   <footer id="version"></footer>
 </main>
