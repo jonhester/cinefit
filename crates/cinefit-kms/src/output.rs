@@ -432,6 +432,31 @@ impl Output {
         self.modes.iter().map(timing).collect()
     }
 
+    /// Asks the driver to probe the connector again (its EDID, so a display
+    /// that came on behind a receiver is seen) and takes the modes it now
+    /// offers, which later mode indices refer to. Whether it is still
+    /// connected, and the modes. Only before the first modeset: indices
+    /// already handed out would point into the old list.
+    ///
+    /// The probe, not the cached list: a hotplug pulse updates the
+    /// connector's state, but the mode list is refreshed only when someone
+    /// probes, which a desktop does on the uevent and cinefit does here.
+    ///
+    /// # Errors
+    ///
+    /// If the connector cannot be read at all.
+    pub fn probe_modes(&mut self) -> Result<(bool, Vec<ModeTiming>), Error> {
+        let conn = self
+            .card
+            .get_connector(self.connector, true)
+            .map_err(io("probing the connector"))?;
+        let connected = conn.state() == connector::State::Connected;
+        if !self.modeset {
+            self.modes = conn.modes().to_vec();
+        }
+        Ok((connected, self.modes()))
+    }
+
     /// A buffer the size of mode `index`, in XRGB8888, for the CPU to draw.
     ///
     /// # Errors
