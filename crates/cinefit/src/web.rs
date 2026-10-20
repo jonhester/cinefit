@@ -294,6 +294,8 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "tonemap.curve" => ("Output", "Tone curve"),
         "tonemap.peak_detect" => ("Output", "Tone curve follows each scene"),
         "tonemap.contrast_recovery" => ("Output", "Contrast recovery (0: off)"),
+        "tonemap.peak_percentile" => ("Output", "Peak detection percentile (100: brightest pixel)"),
+        "tonemap.knee_offset" => ("Output", "BT.2390 knee offset (0: libplacebo's)"),
         "tonemap.source_peak" => ("Output", "HDR10 source peak, nits (0: from the disc)"),
         "tonemap.peak_nits" => ("Output", "Screen peak, nits"),
         "tonemap.target_nits" => ("Output", "Map HDR into, nits (0: the screen peak)"),

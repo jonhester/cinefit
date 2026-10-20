@@ -361,9 +361,12 @@ struct Target<'a, 'p> {
     lldv_nits: f32,
     mapped_nits: f32,
     curve: Curve,
-    /// The `tonemap.peak_detect` and `tonemap.contrast_recovery` settings.
+    /// The `tonemap.peak_detect`, `tonemap.contrast_recovery`,
+    /// `tonemap.peak_percentile` and `tonemap.knee_offset` settings.
     peak_detect: bool,
     contrast_recovery: f32,
+    peak_percentile: f32,
+    knee_offset: f32,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
     /// Which part of the frame is drawn and where it lands.
@@ -415,6 +418,8 @@ fn target<'a, 'p>(
         curve: c.curve,
         peak_detect: c.peak_detect,
         contrast_recovery: c.contrast_recovery as f32,
+        peak_percentile: c.peak_percentile as f32,
+        knee_offset: c.knee_offset as f32,
         source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
         view,
     }
@@ -1078,6 +1083,12 @@ fn draw<'p>(
                         } else {
                             dst.contrast_recovery
                         },
+                        peak_percentile: dst.peak_percentile,
+                        knee_offset: if matches!(content, Content::Lldv(_)) {
+                            0.0
+                        } else {
+                            dst.knee_offset
+                        },
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
@@ -1093,6 +1104,8 @@ fn draw<'p>(
                 curve: dst.curve,
                 peak_detect: dst.peak_detect,
                 contrast_recovery: dst.contrast_recovery,
+                peak_percentile: dst.peak_percentile,
+                knee_offset: dst.knee_offset,
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
         }

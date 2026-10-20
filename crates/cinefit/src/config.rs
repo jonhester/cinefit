@@ -72,6 +72,11 @@ pub struct Config {
     pub peak_detect: bool,
     /// libplacebo's contrast recovery for that curve, 0 (off) to 1.
     pub contrast_recovery: f64,
+    /// Where peak detection reads each frame's peak, as a percentile of its
+    /// brightness; 0 or 100 is the brightest pixel (libplacebo's default).
+    pub peak_percentile: f64,
+    /// BT.2390's knee offset; 0 leaves libplacebo's default (1.0).
+    pub knee_offset: f64,
     /// The HDR10 source's peak for the curve, in nits, in place of its
     /// MaxCLL; 0 uses the metadata. A disc can declare far more than it
     /// holds: the test disc's 10,000-nit title says 10,000, its scenes peak
@@ -193,6 +198,8 @@ impl Default for Config {
             // renditions do not; whether it helps at a projector's peak is a
             // judgement at the screen.
             contrast_recovery: 0.0,
+            peak_percentile: PEAK_PERCENTILE_DEFAULT,
+            knee_offset: KNEE_OFFSET_DEFAULT,
             source_peak: 0,
             crop: true,
             record: true,
@@ -449,6 +456,31 @@ static SETTINGS: &[Setting] = &[
         set: Set::Float(|c, v| c.contrast_recovery = v),
     },
     Setting {
+        key: "tonemap.peak_percentile",
+        kind: Kind::Float {
+            min: 0.0,
+            max: 100.0,
+        },
+        apply: Apply::Live,
+        help: "Where peak detection reads each frame's peak, as a percentile of its brightness: 100 (or 0) is \
+               the brightest pixel, libplacebo's own default. A few stray bright pixels then set the peak, and \
+               the curve darkens the whole scene to make room for them; a little below 100 (99.9) follows the \
+               scene's real highlights. 99.9 suits spline; bt2390, already brighter than Dolby, is better at 100. \
+               Only with tonemap.peak_detect on.",
+        get: |c| Value::Float(c.peak_percentile),
+        set: Set::Float(|c, v| c.peak_percentile = v),
+    },
+    Setting {
+        key: "tonemap.knee_offset",
+        kind: Kind::Float { min: 0.0, max: 2.0 },
+        apply: Apply::Live,
+        help: "BT.2390's knee offset: where its roll-off starts, relative to the spec's own placement (0.5); \
+               higher keeps more of the picture below the knee untouched. 0 leaves libplacebo's default (1.0). \
+               Only for tonemap.curve bt2390; the other curves ignore it.",
+        get: |c| Value::Float(c.knee_offset),
+        set: Set::Float(|c, v| c.knee_offset = v),
+    },
+    Setting {
         key: "tonemap.source_peak",
         kind: Kind::Int { min: 0, max: 10000 },
         apply: Apply::Live,
@@ -618,6 +650,15 @@ static SETTINGS: &[Setting] = &[
         set: Set::Int(|c, v| c.web_port = v as u16),
     },
 ];
+
+// Chosen against Dolby's low-latency renditions on the development titles
+// (cinefit-research docs/log.md, 2026-10-20). Spline with the peak read at
+// 99.9 % and BT.2390 with knee offset 2 scored the same there (12.6 dE,
+// libplacebo's defaults 14.9 and 15.1), so the curve stays spline. 99.9 is
+// spline's: BT.2390 is better at 100, as it is already brighter than Dolby.
+// Knee offset 2 only touches BT.2390.
+const PEAK_PERCENTILE_DEFAULT: f64 = 99.9;
+const KNEE_OFFSET_DEFAULT: f64 = 2.0;
 
 const CURVES: &[&str] = &[
     "spline",

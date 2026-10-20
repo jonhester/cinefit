@@ -932,6 +932,8 @@ impl Mapping {
             },
             peak_detect: self.peak_detect.into(),
             contrast_recovery: self.contrast_recovery,
+            peak_percentile: self.peak_percentile,
+            knee_offset: self.knee_offset,
         }
     }
 }

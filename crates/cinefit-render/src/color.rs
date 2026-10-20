@@ -289,4 +289,10 @@ pub struct Mapping {
     /// libplacebo's contrast recovery, 0 (off) to 1: detail the curve
     /// flattened in compressed highlights, added back by sharpening.
     pub contrast_recovery: f32,
+    /// Where peak detection reads the scene's peak, as a percentile of its
+    /// brightness; 0 (or 100) the brightest pixel, libplacebo's default.
+    pub peak_percentile: f32,
+    /// BT.2390's knee offset; 0 leaves libplacebo's default. Other curves
+    /// ignore it.
+    pub knee_offset: f32,
 }

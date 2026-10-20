@@ -17,10 +17,12 @@
 _Static_assert(PL_API_VER == 375, "shim written for libplacebo API 375 (scripts/build-libplacebo.sh)");
 
 /* cf_pl_map as src/ffi.rs declares it. */
-_Static_assert(sizeof(cf_pl_map) == 20, "cf_pl_map size");
+_Static_assert(sizeof(cf_pl_map) == 28, "cf_pl_map size");
 _Static_assert(offsetof(cf_pl_map, curve) == 8, "cf_pl_map.curve");
 _Static_assert(offsetof(cf_pl_map, peak_detect) == 12, "cf_pl_map.peak_detect");
 _Static_assert(offsetof(cf_pl_map, contrast_recovery) == 16, "cf_pl_map.contrast_recovery");
+_Static_assert(offsetof(cf_pl_map, peak_percentile) == 20, "cf_pl_map.peak_percentile");
+_Static_assert(offsetof(cf_pl_map, knee_offset) == 24, "cf_pl_map.knee_offset");
 
 struct cf_pl {
     pl_log log;
@@ -465,10 +467,11 @@ static const struct pl_tone_map_function *curve(int c) {
  * libplacebo's HDR black, not SDR's default 1000:1: BT.1886 would otherwise
  * lift the shadows to emulate a display far greyer than a projector in a dark
  * room. Contrast recovery is the caller's (libplacebo's default is 0.3): it
- * sharpens, which Dolby's own renditions do not, so 0 is the default there. */
+ * sharpens, which Dolby's own renditions do not, so 0 is the default there.
+ * cmp and pdp are the caller's, so they outlive the render that reads them. */
 static void apply_map(struct pl_frame *image, struct pl_frame *target,
                       struct pl_render_params *params, struct pl_color_map_params *cmp,
-                      const cf_pl_map *map) {
+                      struct pl_peak_detect_params *pdp, const cf_pl_map *map) {
     if (!map) return;
     if (map->src_peak > 0) image->color.hdr.max_luma = map->src_peak;
     if (map->dst_peak > 0) target->color.hdr.max_luma = map->dst_peak;
@@ -476,10 +479,17 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
     *cmp = pl_color_map_default_params;
     cmp->tone_mapping_function = curve(map->curve);
     cmp->contrast_recovery = map->contrast_recovery;
+    if (map->knee_offset > 0) cmp->tone_constants.knee_offset = map->knee_offset;
     params->color_map_params = cmp;
     // Only here, where there is a mapping to make: the callers turn it off for
     // renders between identical spaces, where it would invent one.
-    if (map->peak_detect) params->peak_detect_params = &pl_peak_detect_default_params;
+    if (map->peak_detect) {
+        *pdp = pl_peak_detect_default_params;
+        // The brightest pixel is often a few stray ones: measured against
+        // Dolby, reading the peak a little below it maps the scene less darkly.
+        if (map->peak_percentile > 0) pdp->percentile = map->peak_percentile;
+        params->peak_detect_params = pdp;
+    }
 }
 
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
@@ -530,7 +540,8 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
     // tone mapping. Passthrough wants none.
     params.peak_detect_params = NULL;
     struct pl_color_map_params cmp;
-    apply_map(&image, &target, &params, &cmp, map);
+    struct pl_peak_detect_params pdp;
+    apply_map(&image, &target, &params, &cmp, &pdp, map);
     if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
@@ -889,7 +900,8 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     // As in cf_pl_render_ycbcr: no tone mapping between identical spaces.
     params.peak_detect_params = NULL;
     struct pl_color_map_params cmp;
-    apply_map(&image, &target, &params, &cmp, map);
+    struct pl_peak_detect_params pdp;
+    apply_map(&image, &target, &params, &cmp, &pdp, map);
     if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
