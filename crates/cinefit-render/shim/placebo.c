@@ -1,5 +1,6 @@
 #include "placebo.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,11 @@
 /* The API the shim is written against. A different libplacebo fails the build
  * here rather than misbehaving at run time: update the shim, then this. */
 _Static_assert(PL_API_VER == 375, "shim written for libplacebo API 375 (scripts/build-libplacebo.sh)");
+
+/* cf_pl_map as src/ffi.rs declares it. */
+_Static_assert(sizeof(cf_pl_map) == 16, "cf_pl_map size");
+_Static_assert(offsetof(cf_pl_map, curve) == 8, "cf_pl_map.curve");
+_Static_assert(offsetof(cf_pl_map, peak_detect) == 12, "cf_pl_map.peak_detect");
 
 struct cf_pl {
     pl_log log;
@@ -470,6 +476,9 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
     cmp->tone_mapping_function = curve(map->curve);
     cmp->contrast_recovery = 0.0f;
     params->color_map_params = cmp;
+    // Only here, where there is a mapping to make: the callers turn it off for
+    // renders between identical spaces, where it would invent one.
+    if (map->peak_detect) params->peak_detect_params = &pl_peak_detect_default_params;
 }
 
 int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,

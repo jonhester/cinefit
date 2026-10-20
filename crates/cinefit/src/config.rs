@@ -67,6 +67,9 @@ pub struct Config {
     pub input_device: String,
     /// The tone curve for HDR into the SDR output.
     pub curve: Curve,
+    /// Whether that curve follows each frame's measured peak and average
+    /// (libplacebo's peak detection) or the title's static peak alone.
+    pub peak_detect: bool,
     /// The HDR10 source's peak for the curve, in nits, in place of its
     /// MaxCLL; 0 uses the metadata. A disc can declare far more than it
     /// holds: the test disc's 10,000-nit title says 10,000, its scenes peak
@@ -181,6 +184,9 @@ impl Default for Config {
             // snow on the screen (2026-10-13); no curve has been chosen on
             // evidence yet.
             curve: Curve::Spline,
+            // libplacebo's own default, and what its curves are designed
+            // around: from a static peak alone, one curve serves a whole film.
+            peak_detect: true,
             source_peak: 0,
             crop: true,
             record: true,
@@ -415,6 +421,16 @@ static SETTINGS: &[Setting] = &[
         help: "The tone curve for HDR into SDR output: libplacebo's, by name.",
         get: |c| Value::Name(c.curve.name().into()),
         set: Set::Name(|c, v| c.curve = Curve::from_name(v).unwrap_or(Curve::Spline)),
+    },
+    Setting {
+        key: "tonemap.peak_detect",
+        kind: Kind::Choice(&["on", "off"]),
+        apply: Apply::Live,
+        help: "on: the curve follows each frame's measured peak and average, scene by scene. off: one curve \
+               for the whole title, from its declared peak (or tonemap.source_peak). Only where HDR is \
+               tone-mapped; SDR input, low-latency Dolby Vision and passthrough are never measured.",
+        get: |c| Value::Name(if c.peak_detect { "on" } else { "off" }.into()),
+        set: Set::Name(|c, v| c.peak_detect = v == "on"),
     },
     Setting {
         key: "tonemap.source_peak",

@@ -67,7 +67,15 @@ pub struct Map {
     pub src_peak: f32,
     pub dst_peak: f32,
     pub curve: c_int,
+    pub peak_detect: c_int,
 }
+
+#[cfg(target_os = "linux")]
+const _: () = assert!(size_of::<Map>() == 16);
+#[cfg(target_os = "linux")]
+const _: () = assert!(offset_of!(Map, curve) == 8);
+#[cfg(target_os = "linux")]
+const _: () = assert!(offset_of!(Map, peak_detect) == 12);
 
 unsafe extern "C" {
     pub fn cf_pl_api_version() -> c_int;

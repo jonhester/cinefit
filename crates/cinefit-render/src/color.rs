@@ -283,4 +283,7 @@ pub struct Mapping {
     pub src_peak: f32,
     pub dst_peak: f32,
     pub curve: Curve,
+    /// Measure each frame, so the curve follows the scene's peak and average
+    /// rather than `src_peak` alone (libplacebo's peak detection).
+    pub peak_detect: bool,
 }

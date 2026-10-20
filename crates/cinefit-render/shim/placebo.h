@@ -99,11 +99,14 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
  * show the source's: the source's peak and the target's, in nits (0 leaves
  * libplacebo's default for that side), and the tone curve between them, one
  * of CF_PL_CURVE_*. NULL wherever one is taken means no mapping beyond what
- * the colour spaces imply, as before. */
+ * the colour spaces imply, as before. peak_detect nonzero measures each frame
+ * (libplacebo's peak detection, its default parameters), so the curve follows
+ * the scene instead of the title's static peak. */
 typedef struct {
     float src_peak;
     float dst_peak;
     int curve;
+    int peak_detect;
 } cf_pl_map;
 
 #define CF_PL_CURVE_CLIP 0

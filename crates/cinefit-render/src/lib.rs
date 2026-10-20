@@ -930,6 +930,7 @@ impl Mapping {
                 Curve::Mobius => 7,
                 Curve::Reinhard => 8,
             },
+            peak_detect: self.peak_detect.into(),
         }
     }
 }
