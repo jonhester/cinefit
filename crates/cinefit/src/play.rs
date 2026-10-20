@@ -361,8 +361,9 @@ struct Target<'a, 'p> {
     lldv_nits: f32,
     mapped_nits: f32,
     curve: Curve,
-    /// The `tonemap.peak_detect` setting.
+    /// The `tonemap.peak_detect` and `tonemap.contrast_recovery` settings.
     peak_detect: bool,
+    contrast_recovery: f32,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
     /// Which part of the frame is drawn and where it lands.
@@ -413,6 +414,7 @@ fn target<'a, 'p>(
         mapped_nits: f32::from(c.mapped_nits()),
         curve: c.curve,
         peak_detect: c.peak_detect,
+        contrast_recovery: c.contrast_recovery as f32,
         source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
         view,
     }
@@ -1070,6 +1072,12 @@ fn draw<'p>(
                         // it already and it passes one to one, which a measured
                         // peak below white_nits would turn into a mapping.
                         peak_detect: dst.peak_detect && !matches!(content, Content::Lldv(_)),
+                        // Likewise: one to one adds nothing back.
+                        contrast_recovery: if matches!(content, Content::Lldv(_)) {
+                            0.0
+                        } else {
+                            dst.contrast_recovery
+                        },
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
@@ -1084,6 +1092,7 @@ fn draw<'p>(
                 dst_peak: dst.mapped_nits,
                 curve: dst.curve,
                 peak_detect: dst.peak_detect,
+                contrast_recovery: dst.contrast_recovery,
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
         }

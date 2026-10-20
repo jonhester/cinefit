@@ -17,9 +17,10 @@
 _Static_assert(PL_API_VER == 375, "shim written for libplacebo API 375 (scripts/build-libplacebo.sh)");
 
 /* cf_pl_map as src/ffi.rs declares it. */
-_Static_assert(sizeof(cf_pl_map) == 16, "cf_pl_map size");
+_Static_assert(sizeof(cf_pl_map) == 20, "cf_pl_map size");
 _Static_assert(offsetof(cf_pl_map, curve) == 8, "cf_pl_map.curve");
 _Static_assert(offsetof(cf_pl_map, peak_detect) == 12, "cf_pl_map.peak_detect");
+_Static_assert(offsetof(cf_pl_map, contrast_recovery) == 16, "cf_pl_map.contrast_recovery");
 
 struct cf_pl {
     pl_log log;
@@ -463,8 +464,8 @@ static const struct pl_tone_map_function *curve(int c) {
 /* Applies a mapping to a render about to happen. The target's black is
  * libplacebo's HDR black, not SDR's default 1000:1: BT.1886 would otherwise
  * lift the shadows to emulate a display far greyer than a projector in a dark
- * room. Contrast recovery is off: it sharpens, and this path is to be judged
- * against Dolby's own renditions, which do not. */
+ * room. Contrast recovery is the caller's (libplacebo's default is 0.3): it
+ * sharpens, which Dolby's own renditions do not, so 0 is the default there. */
 static void apply_map(struct pl_frame *image, struct pl_frame *target,
                       struct pl_render_params *params, struct pl_color_map_params *cmp,
                       const cf_pl_map *map) {
@@ -474,7 +475,7 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
     target->color.hdr.min_luma = PL_COLOR_HDR_BLACK;
     *cmp = pl_color_map_default_params;
     cmp->tone_mapping_function = curve(map->curve);
-    cmp->contrast_recovery = 0.0f;
+    cmp->contrast_recovery = map->contrast_recovery;
     params->color_map_params = cmp;
     // Only here, where there is a mapping to make: the callers turn it off for
     // renders between identical spaces, where it would invent one.

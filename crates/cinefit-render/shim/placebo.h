@@ -101,12 +101,14 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
  * of CF_PL_CURVE_*. NULL wherever one is taken means no mapping beyond what
  * the colour spaces imply, as before. peak_detect nonzero measures each frame
  * (libplacebo's peak detection, its default parameters), so the curve follows
- * the scene instead of the title's static peak. */
+ * the scene instead of the title's static peak. contrast_recovery is
+ * libplacebo's, 0 (off) to 1: detail the curve flattened, added back. */
 typedef struct {
     float src_peak;
     float dst_peak;
     int curve;
     int peak_detect;
+    float contrast_recovery;
 } cf_pl_map;
 
 #define CF_PL_CURVE_CLIP 0

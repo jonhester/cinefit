@@ -931,6 +931,7 @@ impl Mapping {
                 Curve::Reinhard => 8,
             },
             peak_detect: self.peak_detect.into(),
+            contrast_recovery: self.contrast_recovery,
         }
     }
 }

@@ -70,6 +70,8 @@ pub struct Config {
     /// Whether that curve follows each frame's measured peak and average
     /// (libplacebo's peak detection) or the title's static peak alone.
     pub peak_detect: bool,
+    /// libplacebo's contrast recovery for that curve, 0 (off) to 1.
+    pub contrast_recovery: f64,
     /// The HDR10 source's peak for the curve, in nits, in place of its
     /// MaxCLL; 0 uses the metadata. A disc can declare far more than it
     /// holds: the test disc's 10,000-nit title says 10,000, its scenes peak
@@ -187,6 +189,10 @@ impl Default for Config {
             // libplacebo's own default, and what its curves are designed
             // around: from a static peak alone, one curve serves a whole film.
             peak_detect: true,
+            // Off, unlike libplacebo's 0.3: it sharpens, which Dolby's
+            // renditions do not; whether it helps at a projector's peak is a
+            // judgement at the screen.
+            contrast_recovery: 0.0,
             source_peak: 0,
             crop: true,
             record: true,
@@ -431,6 +437,16 @@ static SETTINGS: &[Setting] = &[
                tone-mapped; SDR input, low-latency Dolby Vision and passthrough are never measured.",
         get: |c| Value::Name(if c.peak_detect { "on" } else { "off" }.into()),
         set: Set::Name(|c, v| c.peak_detect = v == "on"),
+    },
+    Setting {
+        key: "tonemap.contrast_recovery",
+        kind: Kind::Float { min: 0.0, max: 1.0 },
+        apply: Apply::Live,
+        help: "Detail the tone curve flattens in bright areas (cloud texture, lamps, skies), added back by \
+               sharpening there: 0 off, libplacebo's own default 0.3. Higher can halo bright edges and sharpen \
+               grain. Only where HDR is tone-mapped.",
+        get: |c| Value::Float(c.contrast_recovery),
+        set: Set::Float(|c, v| c.contrast_recovery = v),
     },
     Setting {
         key: "tonemap.source_peak",

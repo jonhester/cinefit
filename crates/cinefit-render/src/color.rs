@@ -286,4 +286,7 @@ pub struct Mapping {
     /// Measure each frame, so the curve follows the scene's peak and average
     /// rather than `src_peak` alone (libplacebo's peak detection).
     pub peak_detect: bool,
+    /// libplacebo's contrast recovery, 0 (off) to 1: detail the curve
+    /// flattened in compressed highlights, added back by sharpening.
+    pub contrast_recovery: f32,
 }
