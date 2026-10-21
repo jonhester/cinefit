@@ -1985,6 +1985,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 pl.clear_black(&targets[free])?;
                 ready = Some(free);
                 dark = true;
+                // The next title after a break may send its block late: it
+                // must not go out with the last one's values meanwhile (#61).
+                pq_meta = None;
                 counts.signal_losses += 1;
                 receiver.nudge();
                 // A break in the input: the viewing so far is judged.
