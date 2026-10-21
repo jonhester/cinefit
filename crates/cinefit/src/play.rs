@@ -361,6 +361,12 @@ struct Target<'a, 'p> {
     lldv_nits: f32,
     mapped_nits: f32,
     curve: Curve,
+    /// The `tonemap.peak_detect`, `tonemap.contrast_recovery`,
+    /// `tonemap.peak_percentile` and `tonemap.knee_offset` settings.
+    peak_detect: bool,
+    contrast_recovery: f32,
+    peak_percentile: f32,
+    knee_offset: f32,
     /// The `tonemap.source_peak` override for HDR10, if set.
     source_peak: Option<f32>,
     /// Which part of the frame is drawn and where it lands.
@@ -473,6 +479,10 @@ fn target<'a, 'p>(
         lldv_nits: f32::from(c.lldv_nits),
         mapped_nits: f32::from(c.mapped_nits()),
         curve: c.curve,
+        peak_detect: c.peak_detect,
+        contrast_recovery: c.contrast_recovery as f32,
+        peak_percentile: c.peak_percentile as f32,
+        knee_offset: c.knee_offset as f32,
         source_peak: (c.source_peak > 0).then_some(f32::from(c.source_peak)),
         view,
     }
@@ -1126,6 +1136,22 @@ fn draw<'p>(
                         src_peak: peak.unwrap_or(1000.0),
                         dst_peak: white,
                         curve: dst.curve,
+                        // Never low-latency Dolby Vision: the player has mapped
+                        // it already and it passes one to one, which a measured
+                        // peak below white_nits would turn into a mapping.
+                        peak_detect: dst.peak_detect && !matches!(content, Content::Lldv(_)),
+                        // Likewise: one to one adds nothing back.
+                        contrast_recovery: if matches!(content, Content::Lldv(_)) {
+                            0.0
+                        } else {
+                            dst.contrast_recovery
+                        },
+                        peak_percentile: dst.peak_percentile,
+                        knee_offset: if matches!(content, Content::Lldv(_)) {
+                            0.0
+                        } else {
+                            dst.knee_offset
+                        },
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
@@ -1133,12 +1159,16 @@ fn draw<'p>(
         Content::Tunnel => {
             let tunnel = tunnel.expect("uploaded only with one");
             let p = sources.planes.as_mut().expect("uploaded");
-            // Into SDR from the grade's own peak, the whole title on one
-            // curve: the scene-by-scene metadata is not used yet.
+            // Into SDR from the grade's own peak: the scene-by-scene metadata
+            // is not used yet, so peak detection is what follows the scene.
             let map = (out.transfer == Transfer::Bt1886).then(|| Mapping {
                 src_peak: cinefit_dovi::pq_to_nits(tunnel.source_max_pq) as f32,
                 dst_peak: dst.mapped_nits,
                 curve: dst.curve,
+                peak_detect: dst.peak_detect,
+                contrast_recovery: dst.contrast_recovery,
+                peak_percentile: dst.peak_percentile,
+                knee_offset: dst.knee_offset,
             });
             pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
         }

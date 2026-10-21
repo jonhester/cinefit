@@ -283,4 +283,16 @@ pub struct Mapping {
     pub src_peak: f32,
     pub dst_peak: f32,
     pub curve: Curve,
+    /// Measure each frame, so the curve follows the scene's peak and average
+    /// rather than `src_peak` alone (libplacebo's peak detection).
+    pub peak_detect: bool,
+    /// libplacebo's contrast recovery, 0 (off) to 1: detail the curve
+    /// flattened in compressed highlights, added back by sharpening.
+    pub contrast_recovery: f32,
+    /// Where peak detection reads the scene's peak, as a percentile of its
+    /// brightness; 0 (or 100) the brightest pixel, libplacebo's default.
+    pub peak_percentile: f32,
+    /// BT.2390's knee offset; 0 leaves libplacebo's default. Other curves
+    /// ignore it.
+    pub knee_offset: f32,
 }
