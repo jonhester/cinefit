@@ -186,18 +186,17 @@ impl Default for Config {
             wait_hz: 23.976,
             input_device: String::new(),
             lldv: true,
-            // libplacebo's own default. Hable ranked closest to Dolby in the
-            // C++ version's step zero, but on a stand-in source, and blew out
-            // snow on the screen (2026-10-13); no curve has been chosen on
-            // evidence yet.
-            curve: Curve::Spline,
+            // Judged at the screen on 2026-10-20/21 with the settings below
+            // (the clouds), and the best HDR10 result against Dolby's
+            // low-latency renditions on the validation titles
+            // (cinefit-research docs/log.md). Spline was libplacebo's default.
+            curve: Curve::Bt2390,
             // libplacebo's own default, and what its curves are designed
             // around: from a static peak alone, one curve serves a whole film.
             peak_detect: true,
-            // Off, unlike libplacebo's 0.3: it sharpens, which Dolby's
-            // renditions do not; whether it helps at a projector's peak is a
-            // judgement at the screen.
-            contrast_recovery: 0.0,
+            // libplacebo's 0.3: judged at the screen (2026-10-21), it brings
+            // back the cloud texture the curve flattens.
+            contrast_recovery: 0.3,
             peak_percentile: PEAK_PERCENTILE_DEFAULT,
             knee_offset: KNEE_OFFSET_DEFAULT,
             source_peak: 0,
@@ -654,10 +653,11 @@ static SETTINGS: &[Setting] = &[
 // Chosen against Dolby's low-latency renditions on the development titles
 // (cinefit-research docs/log.md, 2026-10-20). Spline with the peak read at
 // 99.9 % and BT.2390 with knee offset 2 scored the same there (12.6 dE,
-// libplacebo's defaults 14.9 and 15.1), so the curve stays spline. 99.9 is
-// spline's: BT.2390 is better at 100, as it is already brighter than Dolby.
-// Knee offset 2 only touches BT.2390.
-const PEAK_PERCENTILE_DEFAULT: f64 = 99.9;
+// libplacebo's defaults 14.9 and 15.1); BT.2390 at 100 % held up best on the
+// validation titles and at the screen, so it is the default. BT.2390 is
+// better at 100 than 99.9, as it is already brighter than Dolby. Knee offset
+// 2 only touches BT.2390.
+const PEAK_PERCENTILE_DEFAULT: f64 = 100.0;
 const KNEE_OFFSET_DEFAULT: f64 = 2.0;
 
 const CURVES: &[&str] = &[
