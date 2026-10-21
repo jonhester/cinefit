@@ -367,6 +367,69 @@ struct Target<'a, 'p> {
     view: View,
 }
 
+/// How often to probe the connector again while its modes lack the one
+/// wanted. Each probe reads the display's EDID, so not every frame; a display
+/// coming on is followed within this.
+const MODE_PROBE_EVERY: Duration = Duration::from_secs(5);
+
+/// The wanted mode, from the modes the output offers, waiting for it when it
+/// is not there yet (#143): a receiver offers only its own 1080p fallback
+/// while the projector behind it is off. Exiting and letting the service
+/// restart did come back by itself, but every attempt reopened the capture
+/// card and wrote a run log (440 in an hour). Instead the list is logged once,
+/// probed again every few seconds, and logged again only when it changes. A
+/// connector that stops being connected still ends the run, so the service
+/// recovers from a display that is gone. A dry run does not wait.
+fn wait_for_mode(
+    out: &mut cinefit_kms::Output,
+    want: &cinefit_kms::ModeRequest,
+    dry_run: bool,
+) -> Result<(Vec<cinefit_kms::ModeTiming>, usize), Box<dyn Error>> {
+    let mut watch = cinefit_kms::ModeWatch::default();
+    let mut modes = out.modes();
+    let mut connected = true;
+    let mut waiting_since: Option<Instant> = None;
+    loop {
+        match watch.observe(connected, &modes, want) {
+            cinefit_kms::Watch::Ready(index) => {
+                if let Some(t) = waiting_since {
+                    info!(
+                        "mode offered after {:.0} s of waiting",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok((modes, index));
+            }
+            cinefit_kms::Watch::Gone => {
+                return Err("the display's connector is no longer connected".into());
+            }
+            cinefit_kms::Watch::Changed => {
+                info!("progressive modes offered:");
+                for m in modes.iter().filter(|m| !m.interlaced) {
+                    info!("  {m}{}", if m.preferred { " (preferred)" } else { "" });
+                }
+                let missing = format!(
+                    "no {}x{} mode within 0.01 Hz of {:.3}",
+                    want.width, want.height, want.refresh_hz
+                );
+                if dry_run {
+                    return Err(missing.into());
+                }
+                if waiting_since.is_none() {
+                    info!(
+                        "{missing}: waiting for the display to offer it (probing every {} s)",
+                        MODE_PROBE_EVERY.as_secs()
+                    );
+                    waiting_since = Some(Instant::now());
+                }
+            }
+            cinefit_kms::Watch::Unchanged => {}
+        }
+        std::thread::sleep(MODE_PROBE_EVERY);
+        (connected, modes) = out.probe_modes()?;
+    }
+}
+
 /// The render's rectangles for a frame: the detector's rows placed at constant
 /// image height in the screen's band of the raster, or the whole frame fitted
 /// to the raster when cropping is off. Geometry stays in these crop rects; a
@@ -1255,7 +1318,6 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // the source, in one commit.
     let mut out = cinefit_kms::Output::open(opts.card.as_deref())?;
     info!("output: {}", out.describe());
-    let modes = out.modes();
     let want = cinefit_kms::ModeRequest {
         width: cfg.width,
         height: cfg.height,
@@ -1263,17 +1325,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             .as_ref()
             .map_or(cfg.wait_hz, |s| s.2.frames_per_second()),
     };
-    let Some(index) = cinefit_kms::choose_mode(&modes, &want) else {
-        info!("progressive modes offered:");
-        for m in modes.iter().filter(|m| !m.interlaced) {
-            info!("  {m}{}", if m.preferred { " (preferred)" } else { "" });
-        }
-        return Err(format!(
-            "no {}x{} mode within 0.01 Hz of {:.3}",
-            want.width, want.height, want.refresh_hz
-        )
-        .into());
-    };
+    let (modes, index) = wait_for_mode(&mut out, &want, opts.dry_run)?;
     let mode = modes[index];
     info!("mode: {mode}");
     // What the first input is, resolved once (#99).

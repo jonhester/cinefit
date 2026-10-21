@@ -107,6 +107,45 @@ pub fn choose_mode(modes: &[ModeTiming], want: &ModeRequest) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// What one look at the connector's modes says, while waiting for a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watch {
+    /// The wanted mode is offered, at this index of the list just read.
+    Ready(usize),
+    /// Not offered, and the list differs from the last one seen (or is the
+    /// first): worth logging.
+    Changed,
+    /// Not offered, and the same list as last time.
+    Unchanged,
+    /// The connector is no longer connected: no display to wait for.
+    Gone,
+}
+
+/// Waiting for a display to offer a mode (#143). A receiver offers its own
+/// fallback modes while the projector behind it is off, and the projector's
+/// appear when it comes on; this tells the caller when to start, when to
+/// log the list, and when waiting is pointless. Pure, so it is tested here.
+#[derive(Debug, Default)]
+pub struct ModeWatch {
+    last: Option<Vec<ModeTiming>>,
+}
+
+impl ModeWatch {
+    pub fn observe(&mut self, connected: bool, modes: &[ModeTiming], want: &ModeRequest) -> Watch {
+        if !connected {
+            return Watch::Gone;
+        }
+        if let Some(i) = choose_mode(modes, want) {
+            return Watch::Ready(i);
+        }
+        if self.last.as_deref() == Some(modes) {
+            return Watch::Unchanged;
+        }
+        self.last = Some(modes.to_vec());
+        Watch::Changed
+    }
+}
+
 /// Flip pacing over a run, from each completed flip's vblank sequence number
 /// and timestamp.
 #[derive(Debug, Default, Clone)]
@@ -228,6 +267,36 @@ mod tests {
         assert_eq!(pick("3840x2160@60"), Some(0));
         assert_eq!(pick("3840x2160@30"), None);
         assert_eq!(pick("1920x1080@24"), None);
+    }
+
+    #[test]
+    fn waiting_for_a_mode_logs_each_new_list_once() {
+        let want: ModeRequest = "3840x2160@23.976".parse().unwrap();
+        let mut fallback = mode(1920, 1080, 148_500, 2200, 1125);
+        fallback.preferred = true;
+        let receiver = [fallback];
+        let mut w = ModeWatch::default();
+        // The receiver's own list: logged the first time, then quiet.
+        assert_eq!(w.observe(true, &receiver, &want), Watch::Changed);
+        assert_eq!(w.observe(true, &receiver, &want), Watch::Unchanged);
+        assert_eq!(w.observe(true, &receiver, &want), Watch::Unchanged);
+        // A different list still without the mode: logged again.
+        let partial = [fallback, uhd_60()];
+        assert_eq!(w.observe(true, &partial, &want), Watch::Changed);
+        assert_eq!(w.observe(true, &partial, &want), Watch::Unchanged);
+        // The projector's list: start, at the index in that list.
+        let projector = [uhd_60(), uhd_24(), uhd_23976()];
+        assert_eq!(w.observe(true, &projector, &want), Watch::Ready(2));
+    }
+
+    #[test]
+    fn a_disconnected_connector_ends_the_wait() {
+        let want: ModeRequest = "3840x2160@23.976".parse().unwrap();
+        let mut w = ModeWatch::default();
+        assert_eq!(w.observe(true, &[uhd_60()], &want), Watch::Changed);
+        assert_eq!(w.observe(false, &[], &want), Watch::Gone);
+        // Even a list that would do: disconnected is disconnected.
+        assert_eq!(w.observe(false, &[uhd_23976()], &want), Watch::Gone);
     }
 
     #[test]
