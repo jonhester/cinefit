@@ -1127,6 +1127,7 @@ fn detect_and_upload<'p>(
     finder: &mut CropFinder,
     frame: &Frame,
     kind: Kind,
+    lldv: bool,
     tunnel: Option<&Tunnel>,
     sources: &mut Sources<'p>,
     stages: &mut Stages,
@@ -1141,7 +1142,7 @@ fn detect_and_upload<'p>(
         // A thread a frame: starting one costs tens of microseconds, against
         // the milliseconds the detector takes.
         let worker = s.spawn(|| finder.find(&info, Some(bytes), kind, at.0, at.1));
-        let uploaded = upload(pl, &info, bytes, kind, tunnel, sources, stages);
+        let uploaded = upload(pl, &info, bytes, kind, lldv, tunnel, sources, stages);
         let found = worker
             .join()
             .unwrap_or_else(|e| std::panic::resume_unwind(e));
@@ -1149,15 +1150,25 @@ fn detect_and_upload<'p>(
     })
 }
 
+/// The capture chain's chroma bias on low-latency Dolby Vision, in 10-bit
+/// codes added back to Cb and Cr in the unpack: they arrive about 0.625 and
+/// 0.40 of a code low on every film and target measured, against
+/// independent decodes of the same frames (#146). Not Dolby's mapping, which
+/// would vary with the target; the mechanism is not proven. Luma shows no
+/// bias that can be told apart from Dolby's mapping, so it is left alone.
+const LLDV_CHROMA_BIAS: [f32; 2] = [0.625, 0.40];
+
 /// The first half of a frame: its bytes into the GPU, unpacked into planes
 /// (copy and unpack). Needs nothing from the detector, so it runs while the
 /// detector reads the same bytes on another thread. `false` for what nothing
-/// renders.
+/// renders. `lldv` is the `input.lldv` setting.
+#[allow(clippy::too_many_arguments)]
 fn upload<'p>(
     pl: &'p Placebo,
     info: &FrameInfo,
     bytes: &[u8],
     kind: Kind,
+    lldv: bool,
     tunnel: Option<&Tunnel>,
     sources: &mut Sources<'p>,
     stages: &mut Stages,
@@ -1180,7 +1191,11 @@ fn upload<'p>(
             if kind == Kind::Tunnel {
                 pl.unpack_tunnel(p, bytes, info.row_bytes)?;
             } else {
-                pl.unpack_v210(p, bytes, info.row_bytes)?;
+                // The chain's bias on low-latency Dolby Vision only: the
+                // rest has not been measured to carry it.
+                let bias =
+                    matches!(Content::of(kind, lldv), Content::Lldv(_)).then_some(LLDV_CHROMA_BIAS);
+                pl.unpack_v210_biased(p, bytes, info.row_bytes, bias)?;
             }
         }
         Kind::Rgb(format) => {
@@ -1690,6 +1705,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 &mut finder,
                 first,
                 key.kind,
+                cfg.lldv,
                 last_tunnel.as_ref(),
                 &mut sources,
                 &mut stages,
@@ -2455,6 +2471,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         &mut finder,
                         &frame,
                         k.kind,
+                        cfg.lldv,
                         last_tunnel.as_ref(),
                         &mut sources,
                         &mut stages,

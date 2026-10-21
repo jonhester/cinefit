@@ -547,6 +547,23 @@ impl Placebo {
         data: &[u8],
         row_bytes: usize,
     ) -> Result<(), Error> {
+        self.unpack_v210_biased(planes, data, row_bytes, None)
+    }
+
+    /// [`unpack_v210`](Self::unpack_v210), with `chroma_bias` (Cb, Cr, in
+    /// 10-bit codes) added to every chroma sample: a capture chain's known,
+    /// constant bias taken out where it is measured.
+    ///
+    /// # Errors
+    ///
+    /// As [`unpack_v210`](Self::unpack_v210).
+    pub fn unpack_v210_biased(
+        &self,
+        planes: &mut GpuPlanes<'_>,
+        data: &[u8],
+        row_bytes: usize,
+        chroma_bias: Option<[f32; 2]>,
+    ) -> Result<(), Error> {
         if !row_bytes.is_multiple_of(16)
             || row_bytes < v210::min_row_bytes(planes.width)
             || data.len() < row_bytes.saturating_mul(planes.height)
@@ -555,13 +572,17 @@ impl Placebo {
         }
         // SAFETY: `data` holds row_bytes * height bytes, which the shim
         // uploads; the planes belong to this live device, and `&mut` keeps
-        // anything else from using them meanwhile.
+        // anything else from using them meanwhile; the bias is null or two
+        // floats, read during the call.
         let rc = unsafe {
             ffi::cf_pl_unpack_v210(
                 self.handle.as_ptr(),
                 planes.raw.as_ptr(),
                 data.as_ptr(),
                 row_bytes,
+                chroma_bias
+                    .as_ref()
+                    .map_or(std::ptr::null(), |b| b.as_ptr()),
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
