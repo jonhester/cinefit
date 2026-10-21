@@ -1731,6 +1731,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // Black is on screen for want of a signal, and since when frames last
     // came. Each return of the signal is a new epoch for the detector.
     let (mut dark, mut last_frame_at, mut returns) = (start_key.is_none(), Instant::now(), 0u32);
+    // The output stopped for want of a signal (`output.idle_off`, #144), and
+    // since when; when it last came on again, which starts the wait over (the
+    // menu wakes it with no source); whether stopping it was refused, not to
+    // be tried again until the signal has come and gone.
+    let (mut asleep, mut woke_at, mut sleep_refused) = (None::<Instant>, None::<Instant>, false);
     let mut next_status = STATUS_EVERY;
     let mut last_source = first_source;
     let run_started = Instant::now();
@@ -1936,6 +1941,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 {
                     text.sections.insert(1, sec);
                 }
+                // Stopped (#144): seen on the web page only, as nothing
+                // reaches the screen.
+                if asleep.is_some()
+                    && let Some(o) = text.sections.iter_mut().find(|s| s.label == "OUT")
+                {
+                    o.line = "stopped, for the display to sleep".into();
+                    o.detail = format!(
+                        "no signal for {} min",
+                        last_frame_at.elapsed().as_secs() / 60
+                    );
+                }
                 // The receiver's input, first on the IN line's detail.
                 if let Some(s) = &last_seen {
                     let first = &mut text.sections[0];
@@ -1947,6 +1963,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(w) = &web {
                     let pill = match last_key.filter(|_| !dark).map(|k| k.kind) {
+                        None if asleep.is_some() => "Output stopped",
                         None => "Waiting",
                         Some(Kind::Unsupported(_)) => "Can't show this",
                         Some(_) => "Playing",
@@ -2275,19 +2292,72 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            let flip = out.wait_flip()?;
-            if flip.waited > cinefit_kms::FLIP_LATE {
-                warn!(
-                    "{:.1} s: a flip came {:.0} ms after it was waited for",
-                    run_started.elapsed().as_secs_f64(),
-                    flip.waited.as_secs_f64() * 1000.0
-                );
-            }
-            pacing.on_flip(flip.sequence, flip.at);
-            front = pending;
-            // Nothing is in flight now: the moment for a modeset or new metadata.
-            let now = run_started.elapsed();
-            match latest_want.take().and_then(|w| policy.next(&w, now)) {
+            let now;
+            let action = if asleep.is_some() {
+                // Stopped (#144): no flip is in flight and none comes to pace
+                // the loop; the wait for a frame above does. A source that
+                // says what it wants lights the output in that, and so does
+                // the menu, in the waiting mode, so it can be seen.
+                now = run_started.elapsed();
+                let want = if dark {
+                    latest_want = None;
+                    menu.is_open().then(|| follow::Want {
+                        rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
+                        signal: follow::Signal::Sdr,
+                    })
+                } else {
+                    latest_want.take()
+                };
+                let Some(a) = want.and_then(|w| policy.wake(&w, now)) else {
+                    ready = None;
+                    continue;
+                };
+                Some(a)
+            } else {
+                let flip = out.wait_flip()?;
+                if flip.waited > cinefit_kms::FLIP_LATE {
+                    warn!(
+                        "{:.1} s: a flip came {:.0} ms after it was waited for",
+                        run_started.elapsed().as_secs_f64(),
+                        flip.waited.as_secs_f64() * 1000.0
+                    );
+                }
+                pacing.on_flip(flip.sequence, flip.at);
+                front = pending;
+                // Nothing is in flight now: the moment for a modeset, new
+                // metadata, or stopping.
+                now = run_started.elapsed();
+                if !dark {
+                    sleep_refused = false;
+                }
+                let idle = Duration::from_secs(60 * u64::from(cfg.idle_off));
+                if dark
+                    && cfg.idle_off > 0
+                    && !sleep_refused
+                    && !menu.is_open()
+                    && last_frame_at.elapsed() >= idle
+                    && woke_at.is_none_or(|t| t.elapsed() >= idle)
+                {
+                    match out.sleep() {
+                        Ok(()) => {
+                            asleep = Some(Instant::now());
+                            ready = None;
+                            info!(
+                                "{:.1} s: no signal for {} min: output stopped, for the display to sleep",
+                                now.as_secs_f64(),
+                                cfg.idle_off
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            sleep_refused = true;
+                            warn!("{:.1} s: could not stop the output: {e}", now.as_secs_f64());
+                        }
+                    }
+                }
+                latest_want.take().and_then(|w| policy.next(&w, now))
+            };
+            match action {
                 Some(a @ follow::Action::Modeset(w)) => {
                     let request = cinefit_kms::ModeRequest {
                         width: cfg.width,
@@ -2317,6 +2387,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     match result {
                         Ok((i, show)) => {
                             policy.done(&a, true, now);
+                            if let Some(since) = asleep.take() {
+                                woke_at = Some(Instant::now());
+                                info!(
+                                    "{:.1} s: output on again after {:.0} min stopped",
+                                    now.as_secs_f64(),
+                                    since.elapsed().as_secs_f64() / 60.0
+                                );
+                            }
                             counts.modesets += 1;
                             if ready.take().is_some() {
                                 counts.shown += 1;
@@ -2384,6 +2462,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
                 None => {}
             }
+            // A wake that was refused: still stopped, nothing to flip.
+            if asleep.is_some() {
+                ready = None;
+                continue;
+            }
             match ready.take() {
                 Some(b) => {
                     counts.shown += 1;
@@ -2403,8 +2486,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     };
     let looped = run_loop();
     let ran = run_started.elapsed();
-    // After a failed flip no flip event may come: do not wait for one.
-    if looped.is_ok() {
+    // After a failed flip no flip event may come, and none is in flight
+    // while the output is stopped: do not wait for one.
+    if looped.is_ok() && asleep.is_none() {
         let _ = out.wait_flip();
     }
     match out.restore() {
