@@ -43,16 +43,24 @@ pub struct Config {
     /// the source is brighter, or HDR10 passed through as it came. Dolby
     /// Vision is never passed through.
     pub mode: OutputMode,
-    /// The brightness, in nits, that the SDR output's white stands for: what
-    /// HDR is mapped down to, and the peak a player's low-latency Dolby
-    /// Vision is taken to be mapped to, so that it passes one to one. One
-    /// setting for both: two that must be equal could drift apart.
-    pub white_nits: u16,
+    /// The peak, in nits, a player's low-latency Dolby Vision is mapped to:
+    /// what the EDID upstream declares, a fact of the input. It passes one
+    /// to one, the SDR output's white standing for this.
+    pub lldv_nits: u16,
+    /// The screen's measured peak white, in nits: the output's scale. What
+    /// HDR is mapped into when `target_nits` is not set.
+    pub peak_nits: u16,
+    /// What HDR10 and the Dolby Vision tunnel are mapped into, in nits, and
+    /// so what the SDR output's white stands for with them; 0 is
+    /// `peak_nits`. Above the peak it is madVR's "target nits": the curve
+    /// keeps more highlight separation and the screen shows the whole
+    /// picture at peak / target of the mapped levels.
+    pub target_nits: u16,
     /// The output's rate, in hertz, while there is no source to follow:
     /// the rate the sources start in saves a resync when one comes on.
     pub wait_hz: f64,
     /// Whether YCbCr input labelled SDR BT.2020 is a player's low-latency
-    /// Dolby Vision: PQ already mapped by the player to `white_nits`.
+    /// Dolby Vision: PQ already mapped by the player to `lldv_nits`.
     pub lldv: bool,
     /// The capture device by persistent ID (hex); empty for the first that
     /// can capture (#68).
@@ -160,7 +168,11 @@ impl Default for Config {
             mode: OutputMode::Passthrough,
             // The 96-nit low-latency Dolby Vision target the splitter's EDID
             // declares (2026-10-13), so that input maps one to one.
-            white_nits: 96,
+            lldv_nits: 96,
+            // SDR's reference white: an unmeasured screen is taken to be a
+            // standard one. A measured screen sets its own in the file.
+            peak_nits: 100,
+            target_nits: 0,
             wait_hz: 23.976,
             input_device: String::new(),
             lldv: true,
@@ -312,7 +324,7 @@ static SETTINGS: &[Setting] = &[
         key: "output.mode",
         kind: Kind::Choice(&["sdr2020", "passthrough"]),
         apply: Apply::Modeset,
-        help: "sdr2020: SDR in a BT.2020 container, HDR tone-mapped down to output.white_nits; set the display \
+        help: "sdr2020: SDR in a BT.2020 container, HDR tone-mapped into tonemap.target_nits; set the display \
                to an SDR BT.2020 mode. passthrough: HDR10 goes out as HDR10, for the display to map. Dolby \
                Vision always goes out as SDR BT.2020.",
         get: |c| {
@@ -331,16 +343,6 @@ static SETTINGS: &[Setting] = &[
                 OutputMode::Sdr2020
             }
         }),
-    },
-    Setting {
-        key: "output.white_nits",
-        kind: Kind::Int { min: 48, max: 1000 },
-        apply: Apply::Live,
-        help: "The brightness, in nits, that SDR output's white stands for: HDR above it is tone-mapped. \
-               Also the peak a player's low-latency Dolby Vision is mapped to, which passes one to one: set \
-               it to what the EDID upstream declares (96 for the usual low-latency Dolby Vision EDIDs).",
-        get: |c| Value::Int(c.white_nits.into()),
-        set: Set::Int(|c, v| c.white_nits = v as u16),
     },
     Setting {
         key: "output.wait_hz",
@@ -381,9 +383,19 @@ static SETTINGS: &[Setting] = &[
         kind: Kind::Choice(&["on", "off"]),
         apply: Apply::Live,
         help: "on: YCbCr input labelled SDR BT.2020 is a player's low-latency Dolby Vision, PQ already mapped \
-               to output.white_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
+               to input.lldv_nits. The capture card cannot tell the two apart, and SDR discs are BT.709.",
         get: |c| Value::Name(if c.lldv { "on" } else { "off" }.into()),
         set: Set::Name(|c, v| c.lldv = v == "on"),
+    },
+    Setting {
+        key: "input.lldv_nits",
+        kind: Kind::Int { min: 48, max: 1000 },
+        apply: Apply::Live,
+        help: "The peak, in nits, a player's low-latency Dolby Vision is mapped to: what the EDID upstream \
+               declares (96 for the usual low-latency Dolby Vision EDIDs). It passes one to one, the SDR \
+               output's white standing for this; the tone-mapping settings do not touch it.",
+        get: |c| Value::Int(c.lldv_nits.into()),
+        set: Set::Int(|c, v| c.lldv_nits = v as u16),
     },
     Setting {
         key: "input.device",
@@ -412,6 +424,26 @@ static SETTINGS: &[Setting] = &[
                mastering peak; 0 uses the metadata.",
         get: |c| Value::Int(c.source_peak.into()),
         set: Set::Int(|c, v| c.source_peak = v as u16),
+    },
+    Setting {
+        key: "tonemap.peak_nits",
+        kind: Kind::Int { min: 10, max: 1000 },
+        apply: Apply::Live,
+        help: "The screen's measured peak white, in nits, in the lamp mode in use. HDR is mapped into it \
+               unless tonemap.target_nits is set. 100, SDR's reference white, until it is measured.",
+        get: |c| Value::Int(c.peak_nits.into()),
+        set: Set::Int(|c, v| c.peak_nits = v as u16),
+    },
+    Setting {
+        key: "tonemap.target_nits",
+        kind: Kind::Int { min: 0, max: 2000 },
+        apply: Apply::Live,
+        help: "What HDR10 and Dolby Vision are mapped into, in nits; 0 is tonemap.peak_nits. Higher darkens \
+               the picture and keeps more highlight separation, lower brightens it and compresses more: the \
+               screen shows the mapped picture at peak / target, its peak staying the brightest code either \
+               way. Low-latency Dolby Vision is not affected (input.lldv_nits).",
+        get: |c| Value::Int(c.target_nits.into()),
+        set: Set::Int(|c, v| c.target_nits = v as u16),
     },
     Setting {
         key: "detect.crop",
@@ -567,6 +599,18 @@ const CURVES: &[&str] = &[
     "clip",
 ];
 
+impl Config {
+    /// What HDR10 and the Dolby Vision tunnel are mapped into, in nits:
+    /// the target if one is set, else the screen's peak.
+    pub fn mapped_nits(&self) -> u16 {
+        if self.target_nits > 0 {
+            self.target_nits
+        } else {
+            self.peak_nits
+        }
+    }
+}
+
 /// The table, in a stable order.
 pub fn settings() -> &'static [Setting] {
     SETTINGS
@@ -575,9 +619,9 @@ pub fn settings() -> &'static [Setting] {
 /// Settings that were removed, and what took their place: a file still
 /// holding one is told what to do, not just that the key is unknown.
 const RETIRED: &[(&str, &str)] = &[(
-    "input.lldv_nits",
-    "merged into output.white_nits (2026-10-14), which low-latency Dolby Vision now passes through at; \
-     remove the line, and set output.white_nits if it is not 96",
+    "output.white_nits",
+    "split (2026-10-16): low-latency Dolby Vision's peak is input.lldv_nits, the screen's peak \
+     tonemap.peak_nits and what HDR is mapped into tonemap.target_nits; remove the line and set those",
 )];
 
 pub fn find(key: &str) -> Option<&'static Setting> {
@@ -968,13 +1012,23 @@ mod tests {
     }
 
     #[test]
+    fn hdr_maps_into_the_target_else_the_screen_peak() {
+        let mut c = Config::default();
+        // Unmeasured: a standard screen.
+        assert_eq!((c.peak_nits, c.mapped_nits()), (100, 100));
+        set(&mut c, "tonemap.peak_nits=76").unwrap();
+        assert_eq!(c.mapped_nits(), 76);
+        set(&mut c, "tonemap.target_nits=150").unwrap();
+        assert_eq!(c.mapped_nits(), 150);
+        // Low-latency Dolby Vision keeps its own peak whatever HDR maps into.
+        assert_eq!(c.lldv_nits, 96);
+    }
+
+    #[test]
     fn a_retired_setting_says_what_replaced_it() {
-        let e = parse("[input]\nlldv_nits = 96\n", p()).unwrap_err();
-        assert!(
-            e.to_string().contains("merged into output.white_nits"),
-            "{e}"
-        );
-        assert!(set(&mut Config::default(), "input.lldv_nits=96").is_err());
+        let e = parse("[output]\nwhite_nits = 96\n", p()).unwrap_err();
+        assert!(e.to_string().contains("tonemap.target_nits"), "{e}");
+        assert!(set(&mut Config::default(), "output.white_nits=96").is_err());
     }
 
     #[test]
