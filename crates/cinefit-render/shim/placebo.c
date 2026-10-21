@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 #include <libplacebo/config.h>
@@ -17,11 +18,13 @@
 _Static_assert(PL_API_VER == 375, "shim written for libplacebo API 375 (scripts/build-libplacebo.sh)");
 
 /* cf_pl_map as src/ffi.rs declares it. */
-_Static_assert(sizeof(cf_pl_map) == 28, "cf_pl_map size");
+_Static_assert(sizeof(cf_pl_map) == 100, "cf_pl_map size");
 _Static_assert(offsetof(cf_pl_map, curve) == 8, "cf_pl_map.curve");
 _Static_assert(offsetof(cf_pl_map, peak_detect) == 12, "cf_pl_map.peak_detect");
 _Static_assert(offsetof(cf_pl_map, contrast_recovery) == 16, "cf_pl_map.contrast_recovery");
 _Static_assert(offsetof(cf_pl_map, peak_percentile) == 20, "cf_pl_map.peak_percentile");
+_Static_assert(offsetof(cf_pl_map, step) == 28, "cf_pl_map.step");
+_Static_assert(offsetof(cf_pl_map, step_v) == 32, "cf_pl_map.step_v");
 _Static_assert(offsetof(cf_pl_map, knee_offset) == 24, "cf_pl_map.knee_offset");
 
 /* cf_pl_dm as src/ffi.rs declares it. */
@@ -490,6 +493,30 @@ static const struct pl_tone_map_function *curve(int c) {
     }
 }
 
+/* The table of the last mapping with a step. libplacebo reuses its LUT while
+ * the function and the peaks are unchanged, and the table is a function of
+ * the peaks alone, so one static function serves every render; renders run on
+ * one thread. */
+static float step_v[CF_PL_STEP_POINTS];
+
+static void step_map(float *lut, const struct pl_tone_map_params *p) {
+    const int last = CF_PL_STEP_POINTS - 1;
+    for (size_t i = 0; i < p->lut_size; i++) {
+        float u = p->input_max > 0 ? lut[i] / p->input_max : 0.0f;
+        u = fminf(fmaxf(u, 0.0f), 1.0f) * last;
+        int k = (int) u < last ? (int) u : last - 1;
+        float v = step_v[k] + (u - k) * (step_v[k + 1] - step_v[k]);
+        lut[i] = v * p->output_max;
+    }
+}
+
+static const struct pl_tone_map_function step_fn = {
+    .name = "dolby-step",
+    .description = "Dolby's step between two of its own targets",
+    .scaling = PL_HDR_PQ,
+    .map = step_map,
+};
+
 /* Applies a mapping to a render about to happen. The target's black is
  * libplacebo's HDR black, not SDR's default 1000:1: BT.1886 would otherwise
  * lift the shadows to emulate a display far greyer than a projector in a dark
@@ -505,6 +532,13 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
     target->color.hdr.min_luma = PL_COLOR_HDR_BLACK;
     *cmp = pl_color_map_default_params;
     cmp->tone_mapping_function = curve(map->curve);
+    if (map->step) {
+        memcpy(step_v, map->step_v, sizeof(step_v));
+        cmp->tone_mapping_function = &step_fn;
+        // The step was measured on intensity with the colour scaled along:
+        // the chromaticity kept, which film strength 0 is.
+        cmp->film_strength = 0.0f;
+    }
     cmp->contrast_recovery = map->contrast_recovery;
     if (map->knee_offset > 0) cmp->tone_constants.knee_offset = map->knee_offset;
     params->color_map_params = cmp;

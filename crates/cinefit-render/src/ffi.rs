@@ -94,10 +94,12 @@ pub struct Map {
     pub contrast_recovery: f32,
     pub peak_percentile: f32,
     pub knee_offset: f32,
+    pub step: c_int,
+    pub step_v: [f32; 17],
 }
 
 #[cfg(target_os = "linux")]
-const _: () = assert!(size_of::<Map>() == 28);
+const _: () = assert!(size_of::<Map>() == 100);
 #[cfg(target_os = "linux")]
 const _: () = assert!(offset_of!(Map, curve) == 8);
 #[cfg(target_os = "linux")]
@@ -108,6 +110,10 @@ const _: () = assert!(offset_of!(Map, contrast_recovery) == 16);
 const _: () = assert!(offset_of!(Map, peak_percentile) == 20);
 #[cfg(target_os = "linux")]
 const _: () = assert!(offset_of!(Map, knee_offset) == 24);
+#[cfg(target_os = "linux")]
+const _: () = assert!(offset_of!(Map, step) == 28);
+#[cfg(target_os = "linux")]
+const _: () = assert!(offset_of!(Map, step_v) == 32);
 
 unsafe extern "C" {
     pub fn cf_pl_api_version() -> c_int;

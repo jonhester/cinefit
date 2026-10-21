@@ -110,6 +110,10 @@ fn rows(page: usize) -> &'static [Row] {
             label: "Dolby Vision low latency",
             key: "input.lldv",
         },
+        Row::Setting {
+            label: "Low latency to the screen's peak",
+            key: "input.lldv_step",
+        },
     ];
     [PICTURE, OUTPUT, SCREEN_ROWS, INPUT][page]
 }
@@ -154,6 +158,10 @@ fn choices(key: &str, c: &Config, rates: &[f64]) -> (Vec<Choice>, Option<usize>)
         "detect.crop" => named(&[("off", "Off"), ("on", "On")], on_off(c.crop)),
         "osd.banners" => named(&[("off", "Off"), ("on", "On")], on_off(c.banners)),
         "input.lldv" => named(&[("off", "Off"), ("on", "On")], on_off(c.lldv)),
+        "input.lldv_step" => named(
+            &[("off", "Dimmed evenly"), ("on", "Dolby's step")],
+            on_off(c.lldv_step),
+        ),
         "input.rgb_range" => named(
             &[("limited", "Limited"), ("full", "Full")],
             match c.rgb_range {

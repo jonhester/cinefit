@@ -198,6 +198,31 @@ mod tests {
     }
 
     #[test]
+    fn dolby_step_scales_with_the_step() {
+        // At its own size the step is the measured curve.
+        let v = dolby_step(155.0, 96.0);
+        assert!((v[8] - 0.5297).abs() < 1e-4, "{}", v[8]);
+        assert!((v[16] - 0.994).abs() < 1e-4, "{}", v[16]);
+        // 96 -> 76 is a smaller step: the same bend, about half as deep.
+        let v = dolby_step(96.0, 76.0);
+        assert_eq!(v[0], 0.0);
+        assert!(v.windows(2).all(|w| w[1] > w[0]), "{v:?}");
+        assert!(v[8] > 0.5 && v[8] < 0.5297, "{}", v[8]);
+        assert!(v[16] < 1.0 && v[16] > 0.994, "{}", v[16]);
+        // Mid-grey keeps more of its light than even dimming leaves it
+        // (76 / 96 of it), and white lands just under the screen's peak.
+        let nits = |n: f64, f: f32| pq_eotf(f64::from(f) * pq_oetf(n / 1e4)) * 1e4;
+        let grey = nits(96.0, 0.5);
+        let stepped = nits(76.0, v[8]);
+        assert!(stepped > grey * 76.0 / 96.0 * 1.05, "{grey} {stepped}");
+        assert!(nits(76.0, v[16]) > 74.0, "{}", nits(76.0, v[16]));
+        // No step up, or between equal peaks.
+        let id: [f32; 17] = std::array::from_fn(|k| k as f32 / 16.0);
+        assert_eq!(dolby_step(96.0, 96.0), id);
+        assert_eq!(dolby_step(96.0, 150.0), id);
+    }
+
+    #[test]
     fn pq_round_trips() {
         // Not exact at 0: the curve's foot puts 0 nits at 7e-7.
         for e in [0.0, 0.1, 0.5, 0.75, 1.0] {
@@ -295,4 +320,31 @@ pub struct Mapping {
     /// BT.2390's knee offset; 0 leaves libplacebo's default. Other curves
     /// ignore it.
     pub knee_offset: f32,
+    /// Map with [`dolby_step`] from `src_peak` to `dst_peak` in place of
+    /// `curve`: for low-latency Dolby Vision onto a screen dimmer than the
+    /// lowest target a player can be asked for.
+    pub step: bool,
+}
+
+/// Dolby's step from 155 to 96 nits, v - u in PQ scaled by each side's peak
+/// (u = I_155 / pq(155), v = I_96 / pq(96)), at u = 0, 1/16 .. 1. Fitted on
+/// low-latency renditions of the same frames at both targets, pooled over
+/// four films (cinefit-research `step.py`, store v2, 2026-10-21); u = 0 is
+/// pinned to black, where the fit's lowest bin read 0.008. Dolby's steps
+/// between its other targets share this shape, the bend in proportion to the
+/// step's size in PQ (cinefit-research docs/results/2026-10-20-targets.md).
+const STEP_155_96: [f64; 17] = [
+    0.0, 0.0023, 0.0059, 0.0101, 0.0151, 0.0202, 0.0240, 0.0278, 0.0297, 0.0315, 0.0319, 0.0326,
+    0.0323, 0.0299, 0.0210, 0.0120, -0.0060,
+];
+
+/// Dolby's step from a rendition at `src_nits` to one at `dst_nits`, below
+/// it: the 155 -> 96 shape scaled by the step's size in PQ. The output in PQ
+/// scaled by `dst_nits`'s, at input 0, 1/16 .. 1 scaled by `src_nits`'s; the
+/// identity where `dst_nits` is not below.
+pub fn dolby_step(src_nits: f32, dst_nits: f32) -> [f32; 17] {
+    let pq = |n: f64| pq_oetf(n / 10_000.0);
+    let size = pq(f64::from(src_nits)) - pq(f64::from(dst_nits));
+    let s = (size / (pq(155.0) - pq(96.0))).max(0.0);
+    std::array::from_fn(|k| (k as f64 / 16.0 + s * STEP_155_96[k]) as f32)
 }

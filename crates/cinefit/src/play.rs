@@ -380,6 +380,9 @@ struct Target<'a, 'p> {
     /// (the settings), with the curve.
     lldv_nits: f32,
     mapped_nits: f32,
+    /// Where low-latency Dolby Vision goes with Dolby's step, the screen's
+    /// peak it is stepped down to (`input.lldv_step`).
+    lldv_step_to: Option<f32>,
     curve: Curve,
     /// The `tonemap.peak_detect`, `tonemap.contrast_recovery`,
     /// `tonemap.peak_percentile` and `tonemap.knee_offset` settings.
@@ -498,6 +501,7 @@ fn target<'a, 'p>(
         rgb_range: c.rgb_range,
         lldv_nits: f32::from(c.lldv_nits),
         mapped_nits: f32::from(c.mapped_nits()),
+        lldv_step_to: c.lldv_stepped().then_some(f32::from(c.peak_nits)),
         curve: c.curve,
         peak_detect: c.peak_detect,
         contrast_recovery: c.contrast_recovery as f32,
@@ -1243,7 +1247,7 @@ fn draw<'p>(
                         ..color
                     },
                     Some(dst.lldv_nits),
-                    dst.lldv_nits,
+                    dst.lldv_step_to.unwrap_or(dst.lldv_nits),
                 ),
                 _ => {
                     if color.transfer == Transfer::Pq
@@ -1287,6 +1291,9 @@ fn draw<'p>(
                         } else {
                             dst.knee_offset
                         },
+                        // Down to the screen's peak, the way Dolby steps
+                        // between its own targets (`input.lldv_step`).
+                        step: matches!(content, Content::Lldv(_)) && dst.lldv_step_to.is_some(),
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
@@ -1307,6 +1314,7 @@ fn draw<'p>(
                     contrast_recovery: 0.0,
                     peak_percentile: dst.peak_percentile,
                     knee_offset: 0.0,
+                    step: false,
                 };
                 pl.render_dovi_dm(p, &tunnel.color, &frame, dst.tex, out, view, &map)?;
             } else {
@@ -1320,6 +1328,7 @@ fn draw<'p>(
                     contrast_recovery: dst.contrast_recovery,
                     peak_percentile: dst.peak_percentile,
                     knee_offset: dst.knee_offset,
+                    step: false,
                 });
                 pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
             }
@@ -1341,11 +1350,11 @@ fn draw<'p>(
 }
 
 /// What the SDR output's white stands for with this content: low-latency
-/// Dolby Vision's own peak, which passes one to one, else what HDR is mapped
-/// into. A readout of the output in nits uses it.
+/// Dolby Vision's own peak, which passes one to one, or the screen's where it
+/// is stepped down to it, else what HDR is mapped into. A readout of the output in nits uses it.
 fn white_for(content: Content, c: &Config) -> u16 {
     match content {
-        Content::Lldv(_) => c.lldv_nits,
+        Content::Lldv(_) => c.lldv_white(),
         _ => c.mapped_nits(),
     }
 }
@@ -1530,6 +1539,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             "signalling SDR BT.2020{}",
             match start_content {
                 None => ", no source".to_string(),
+                Some(Content::Lldv(_)) if cfg.lldv_stepped() => format!(
+                    ": low-latency Dolby Vision, stepped from {} nits to the screen's {} as Dolby does",
+                    cfg.lldv_nits, cfg.peak_nits
+                ),
                 Some(Content::Lldv(_)) => format!(
                     ": low-latency Dolby Vision, passed through at {} nits",
                     cfg.lldv_nits
@@ -2312,6 +2325,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             "lldv": {
                                 "labelled_lldv": matches!(content, Content::Lldv(_)),
                                 "lldv_nits": cfg.lldv_nits,
+                                "lldv_step": cfg.lldv_step,
                             },
                             "mapped_nits": cfg.mapped_nits(),
                             "crop": format!("{last_source:?}"),

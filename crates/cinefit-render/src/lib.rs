@@ -1042,6 +1042,12 @@ impl Mapping {
             contrast_recovery: self.contrast_recovery,
             peak_percentile: self.peak_percentile,
             knee_offset: self.knee_offset,
+            step: self.step.into(),
+            step_v: if self.step {
+                color::dolby_step(self.src_peak, self.dst_peak)
+            } else {
+                [0.0; 17]
+            },
         }
     }
 }

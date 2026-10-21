@@ -47,6 +47,10 @@ pub struct Config {
     /// what the EDID upstream declares, a fact of the input. It passes one
     /// to one, the SDR output's white standing for this.
     pub lldv_nits: u16,
+    /// Where the screen's peak is below `lldv_nits`, take low-latency Dolby
+    /// Vision down to it with Dolby's own step between targets, instead of
+    /// letting the screen dim it evenly.
+    pub lldv_step: bool,
     /// The screen's measured peak white, in nits: the output's scale. What
     /// HDR is mapped into when `target_nits` is not set.
     pub peak_nits: u16,
@@ -181,6 +185,8 @@ impl Default for Config {
             // The 96-nit low-latency Dolby Vision target the splitter's EDID
             // declares (2026-10-13), so that input maps one to one.
             lldv_nits: 96,
+            // Off until judged at the screen against even dimming.
+            lldv_step: false,
             // SDR's reference white: an unmeasured screen is taken to be a
             // standard one. A measured screen sets its own in the file.
             peak_nits: 100,
@@ -417,6 +423,17 @@ static SETTINGS: &[Setting] = &[
                output's white standing for this; the tone-mapping settings do not touch it.",
         get: |c| Value::Int(c.lldv_nits.into()),
         set: Set::Int(|c, v| c.lldv_nits = v as u16),
+    },
+    Setting {
+        key: "input.lldv_step",
+        kind: Kind::Choice(&["on", "off"]),
+        apply: Apply::Live,
+        help: "on: where the screen's peak (tonemap.peak_nits) is below input.lldv_nits, low-latency Dolby \
+               Vision is taken down to it with the step Dolby itself makes between two of its targets: \
+               shadows and mid-tones keep nearly their level, the top is compressed. off: it passes one to \
+               one and the screen dims it evenly. No player can be asked for a target below about 96 nits.",
+        get: |c| Value::Name(if c.lldv_step { "on" } else { "off" }.into()),
+        set: Set::Name(|c, v| c.lldv_step = v == "on"),
     },
     Setting {
         key: "input.device",
@@ -693,6 +710,22 @@ impl Config {
             self.target_nits
         } else {
             self.peak_nits
+        }
+    }
+
+    /// Whether low-latency Dolby Vision is stepped down to the screen's
+    /// peak: asked for, and the screen dimmer than the player's target.
+    pub fn lldv_stepped(&self) -> bool {
+        self.lldv_step && self.peak_nits < self.lldv_nits
+    }
+
+    /// What the SDR output's white stands for with low-latency Dolby Vision:
+    /// the screen's peak where it is stepped down to it, else its own peak.
+    pub fn lldv_white(&self) -> u16 {
+        if self.lldv_stepped() {
+            self.peak_nits
+        } else {
+            self.lldv_nits
         }
     }
 }
@@ -1108,6 +1141,21 @@ mod tests {
         assert_eq!(c.mapped_nits(), 150);
         // Low-latency Dolby Vision keeps its own peak whatever HDR maps into.
         assert_eq!(c.lldv_nits, 96);
+    }
+
+    #[test]
+    fn low_latency_is_stepped_only_down_to_a_dimmer_screen() {
+        let mut c = Config::default();
+        assert!(!c.lldv_stepped());
+        assert_eq!(c.lldv_white(), 96);
+        set(&mut c, "input.lldv_step=on").unwrap();
+        // The default screen (100) is not below the player's 96.
+        assert!(!c.lldv_stepped());
+        set(&mut c, "tonemap.peak_nits=76").unwrap();
+        assert!(c.lldv_stepped());
+        assert_eq!(c.lldv_white(), 76);
+        set(&mut c, "input.lldv_step=off").unwrap();
+        assert_eq!(c.lldv_white(), 96);
     }
 
     #[test]

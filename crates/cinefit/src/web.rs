@@ -319,6 +319,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "input.rgb_range" => ("Input", "RGB range"),
         "input.lldv" => ("Input", "Dolby Vision low latency"),
         "input.lldv_nits" => ("Input", "Low-latency Dolby Vision peak, nits"),
+        "input.lldv_step" => ("Input", "Low-latency Dolby Vision to the screen's peak"),
         "input.device" => ("Input", "Capture device (persistent ID)"),
         "web.port" => ("Web page", "Port"),
         "avr.denon" => ("Receiver", "Denon AVR (hostname or IP)"),

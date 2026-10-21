@@ -108,7 +108,10 @@ int cf_pl_planes_download(cf_pl *pl, cf_pl_planes *planes, uint16_t *luma, uint1
  * libplacebo's, 0 (off) to 1: detail the curve flattened, added back.
  * peak_percentile is where peak detection reads the scene's peak (0 or 100:
  * the brightest pixel, libplacebo's default), knee_offset BT.2390's knee
- * offset (0: libplacebo's default). */
+ * offset (0: libplacebo's default). step nonzero maps with step_v in place of
+ * the curve: in PQ scaled by each side's peak, the output at input 0, 1/16 ..
+ * 1, linear between (Dolby's step between two of its own targets). */
+#define CF_PL_STEP_POINTS 17
 typedef struct {
     float src_peak;
     float dst_peak;
@@ -117,6 +120,8 @@ typedef struct {
     float contrast_recovery;
     float peak_percentile;
     float knee_offset;
+    int step;
+    float step_v[CF_PL_STEP_POINTS];
 } cf_pl_map;
 
 #define CF_PL_CURVE_CLIP 0
