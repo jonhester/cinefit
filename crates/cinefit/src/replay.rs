@@ -452,7 +452,7 @@ fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
     let (mut skipped, mut detect_ms, mut unfaithful) = (0u64, Vec::new(), 0u64);
     let (mut epoch, mut format) = (1u32, None);
     let started = Instant::now();
-    record::for_each_frame::<Box<dyn Error>>(
+    let lost = record::for_each_frame::<Box<dyn Error>>(
         dir,
         &index,
         |_| true,
@@ -503,11 +503,14 @@ fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
         index.last().map_or(0.0, |f| f.time),
     );
     let size = index.first().map_or((3840, 2160), |f| (f.width, f.height));
-    let head = if skipped > 0 {
+    let mut head = if skipped > 0 {
         format!(", {skipped} frames not v210 skipped (no adapter yet)")
     } else {
         String::new()
     };
+    if lost > 0 {
+        head += &format!(", the stream cut short {lost} frames before the index ends");
+    }
     let frames = run.p.frames;
     let mut p = run.finish(det.policy(), span, size, &head, o.quiet)?;
     p.skipped = skipped;

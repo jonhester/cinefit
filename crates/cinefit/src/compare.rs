@@ -291,7 +291,7 @@ fn diff(tunnel: &[u16], hdr10: &[u16], step: usize) -> Diff {
 /// Fingerprints every frame of a clip.
 fn fingerprints(dir: &std::path::Path, index: &[ClipFrame]) -> Result<Vec<Print>, Box<dyn Error>> {
     let mut prints = Vec::with_capacity(index.len());
-    for_each_frame::<Box<dyn Error>>(
+    let lost = for_each_frame::<Box<dyn Error>>(
         dir,
         index,
         |_| true,
@@ -300,6 +300,11 @@ fn fingerprints(dir: &std::path::Path, index: &[ClipFrame]) -> Result<Vec<Print>
             Ok(())
         },
     )?;
+    // The prints stand for the index's frames: alignment over a cut stream
+    // would run past its end.
+    if lost > 0 {
+        return Err(format!("{}: the stream ends {lost} frames early", dir.display()).into());
+    }
     Ok(prints)
 }
 

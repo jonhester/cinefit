@@ -33,7 +33,7 @@ pub fn run(session: &Path) -> Result<(), Box<dyn Error>> {
     let mut ranges: BTreeMap<(u16, u16), usize> = BTreeMap::new();
     let mut other: BTreeMap<u8, usize> = BTreeMap::new();
     let mut l1_max = (u16::MAX, 0u16);
-    crate::record::for_each_frame::<std::io::Error>(
+    let lost = crate::record::for_each_frame::<std::io::Error>(
         &frames,
         &index,
         |f| f.pixel_format == "r210",
@@ -112,6 +112,9 @@ pub fn run(session: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::write(&out, csv)?;
 
     println!("{read} tunnel frames read, {decoded} with metadata");
+    if lost > 0 {
+        println!("the stream was cut short: the last {lost} frames of the index are missing");
+    }
     for ((lo, hi), n) in &ranges {
         println!(
             "grade's range {:.4}-{:.0} nits on {n} frames",
