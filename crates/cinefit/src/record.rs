@@ -75,8 +75,8 @@ pub struct ClipWriter {
     tx: Mutex<Option<SyncSender<Item>>>,
     free: Arc<Mutex<Vec<Vec<u8>>>>,
     next: AtomicU64,
-    /// Frames offered so far, which the pool grows with.
-    offered: AtomicU64,
+    /// Buffers made so far: the pool grows to POOL whenever none is free.
+    made: AtomicU64,
     dropped: AtomicU64,
     thread: Mutex<Option<JoinHandle<std::io::Result<u64>>>>,
     dir: PathBuf,
@@ -123,7 +123,7 @@ impl ClipWriter {
             tx: Mutex::new(Some(tx)),
             free,
             next: AtomicU64::new(0),
-            offered: AtomicU64::new(0),
+            made: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             thread: Mutex::new(Some(thread)),
             dir: dir.to_owned(),
@@ -141,15 +141,19 @@ impl ClipWriter {
     /// dataset keeps a few frames of many, numbered as its readings are
     /// (#91).
     pub fn offer_as(&self, index: u64, at: Duration, info: &FrameInfo, bytes: &[u8]) {
-        let offered = self.offered.fetch_add(1, Ordering::Relaxed);
-        let in_flight = POOL as u64;
         let mut buf = {
             let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
             match free.pop() {
                 Some(b) => b,
-                // Grow the pool to its size once; after that, a frame with no
-                // buffer free is dropped.
-                None if offered < in_flight => Vec::new(),
+                // Grow the pool when no buffer is free, up to its size; then a
+                // frame with none free is dropped. Not by frames offered: kept
+                // a few seconds apart, a session's first frames each found a
+                // buffer free, the pool stayed at one, and the second of two
+                // frames kept back to back was dropped (2026-10-22, 8 of 3790).
+                None if self.made.load(Ordering::Relaxed) < POOL as u64 => {
+                    self.made.fetch_add(1, Ordering::Relaxed);
+                    Vec::new()
+                }
                 None => {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -815,6 +819,44 @@ pub(crate) mod tests {
         // v210 rows padded past their six-pixel groups are stored as captured.
         assert!(pack_v210(&[0; 32], 6, 2, 16, &mut out));
         assert!(!pack_v210(&[0; 64], 6, 2, 32, &mut out));
+    }
+
+    #[test]
+    fn frames_kept_back_to_back_late_in_a_session_are_not_dropped() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-pool-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        // Noise, so writing a frame takes a while.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let frame: Vec<u8> = (0..1 << 23)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let i5 = FrameInfo {
+            width: 5,
+            ..info(16)
+        };
+        // Kept a while apart, as pairing passes keep them: each finds the
+        // buffer before it free.
+        for _ in 0..20 {
+            w.offer(Duration::ZERO, &i5, &frame);
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        // Then a cut the frame after a keep, and a few more at once.
+        for _ in 0..6 {
+            w.offer(Duration::ZERO, &i5, &frame);
+        }
+        let r = w.finish().expect("finish");
+        assert_eq!((r.written, r.dropped), (26, 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
