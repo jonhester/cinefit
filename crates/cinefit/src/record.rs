@@ -191,11 +191,22 @@ impl ClipWriter {
 /// zstd at its fastest level on six threads, in its own process group: a
 /// Ctrl-C at the terminal goes to cinefit, which closes the clip, and not to
 /// zstd, which would cut the stream short (the C++ version lost a clip's
-/// frames that way, 2026-10-08).
+/// frames that way, 2026-10-08). With SIGTERM ignored, for the same reason:
+/// stopping the service sends it to every process in the unit at once, and
+/// zstd died before cinefit could close its input (#142). It ends when its
+/// input does, or by the SIGKILL that follows a stop that hangs. Started
+/// through sh, whose ignored signals exec keeps, so nothing unsafe runs
+/// between fork and exec; zstd sets a handler for SIGINT alone.
 fn spawn_zstd(out: &Path) -> std::io::Result<Child> {
     use std::os::unix::process::CommandExt;
+    // Through sh a missing zstd would show only as a broken pipe later.
     Command::new("zstd")
-        .args(["-q", "-1", "-T6", "-o"])
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    Command::new("sh")
+        .args(["-c", "trap '' TERM; exec zstd -q -1 -T6 -o \"$1\"", "sh"])
         .arg(out)
         .stdin(Stdio::piped())
         .process_group(0)
@@ -364,17 +375,19 @@ fn frames_path(dir: &Path) -> std::path::PathBuf {
 
 /// Streams a clip's frames through `zstd -dc` in order, calling `each` with
 /// every frame for which `want` says yes. Frames are read one at a time, so a
-/// clip of any length needs one frame of memory.
+/// clip of any length needs one frame of memory. A stream cut short (zstd
+/// killed while writing it, #142) gives every frame before the cut; the
+/// result is how many of the index's frames it lacked, 0 for a whole clip.
 ///
 /// # Errors
 ///
-/// If zstd cannot run, the stream ends early, or `each` fails.
+/// If zstd cannot run, the stream and the index disagree, or `each` fails.
 pub fn for_each_frame<E: From<std::io::Error>>(
     dir: &Path,
     index: &[ClipFrame],
     mut want: impl FnMut(&ClipFrame) -> bool,
     mut each: impl FnMut(&ClipFrame, &[u8]) -> Result<(), E>,
-) -> Result<(), E> {
+) -> Result<usize, E> {
     use std::io::Read;
     let mut child = Command::new("zstd")
         .arg("-dc")
@@ -385,7 +398,7 @@ pub fn for_each_frame<E: From<std::io::Error>>(
     let mut buf = Vec::new();
     let mut at = 0u64;
     let result = (|| {
-        for f in index {
+        for (n, f) in index.iter().enumerate() {
             if f.offset != at {
                 return Err(std::io::Error::other(format!(
                     "frame {} is at {} in the stream, not {at}",
@@ -394,13 +407,18 @@ pub fn for_each_frame<E: From<std::io::Error>>(
                 .into());
             }
             buf.resize(f.size, 0);
-            out.read_exact(&mut buf)?;
+            match out.read_exact(&mut buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(index.len() - n);
+                }
+                r => r?,
+            }
             at += f.size as u64;
             if want(f) {
                 each(f, &buf)?;
             }
         }
-        Ok(())
+        Ok(0)
     })();
     drop(out);
     let _ = child.kill();
@@ -488,6 +506,100 @@ pub(crate) mod tests {
         assert_eq!(got[3], (4, frames[4].clone()));
         // A second recording into the same directory is refused, not mixed in.
         assert!(ClipWriter::create(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zstd_outlives_a_sigterm_and_finishes_the_stream() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-term-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let out = dir.join("frames.zst");
+        let mut z = spawn_zstd(&out).expect("zstd");
+        let mut stdin = z.stdin.take().expect("piped");
+        stdin.write_all(&[7u8; 1 << 16]).expect("write");
+        // What a service stop does to every process in the unit.
+        let killed = Command::new("kill")
+            .args(["-TERM", &z.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(killed.success());
+        std::thread::sleep(Duration::from_millis(200));
+        stdin
+            .write_all(&[9u8; 1 << 16])
+            .expect("still taking input");
+        drop(stdin);
+        assert!(z.wait().expect("wait").success());
+        let back = Command::new("zstd")
+            .arg("-dc")
+            .arg(&out)
+            .output()
+            .expect("zstd -dc");
+        assert!(back.status.success());
+        assert_eq!(back.stdout.len(), 1 << 17);
+        assert_eq!(back.stdout[(1 << 17) - 1], 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stream_cut_short_gives_the_frames_before_the_cut() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-cut-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        // Noise, so the stream is about as long as the frames and a cut
+        // partway through lands among them; 256 KB each spans several of
+        // zstd's 128 KB blocks.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let frames: Vec<Vec<u8>> = (0..6)
+            .map(|_| {
+                (0..1 << 18)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x as u8
+                    })
+                    .collect()
+            })
+            .collect();
+        for (i, f) in frames.iter().enumerate() {
+            w.offer(Duration::from_millis(42 * i as u64), &info(1 << 17), f);
+        }
+        w.finish().expect("finish");
+        // As a SIGTERM to zstd leaves it: the end of the stream missing.
+        let zst = dir.join("frames.zst");
+        let len = std::fs::metadata(&zst).expect("zst").len();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&zst)
+            .expect("open");
+        file.set_len(len * 6 / 10).expect("truncate");
+
+        let index = read_index(&dir).expect("index");
+        let mut got = Vec::new();
+        let lost = for_each_frame::<std::io::Error>(
+            &dir,
+            &index,
+            |_| true,
+            |f, b| {
+                got.push((f.index, b.to_vec()));
+                Ok(())
+            },
+        )
+        .expect("the complete frames, not an error");
+        assert!((1..6).contains(&lost), "{lost} lost");
+        assert_eq!(got.len() + lost, 6);
+        for (i, (n, b)) in got.iter().enumerate() {
+            assert_eq!((*n, b), (i as u64, &frames[i]));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
