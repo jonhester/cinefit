@@ -522,6 +522,7 @@ mod tests {
             height: 1080,
             row_bytes: 5120,
             pixel_format: "v210".to_string(),
+            planes: false,
             frame_number,
             time: 0.0,
         };

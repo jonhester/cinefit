@@ -13,6 +13,19 @@
 //!
 //! Raw 2160p is about 530 MB/s as v210 and 800 as r210; zstd at its fastest
 //! level on six threads kept up with v210 for the C++ version.
+//!
+//! A Dolby Vision tunnel frame arrives as r210 carrying 8 bits a channel:
+//! the low two bits of each 10 and the word's top two are always zero. It
+//! is stored as three planes of those 8 bits (`r210p8` in the CSV), 0.41 of
+//! its raw size through zstd against 0.72 as captured (2026-10-21, a film's
+//! tunnel), so every frame of it fits a SATA disk's write rate. A frame with
+//! any of those bits set is stored as captured: the planes are lossless or
+//! not used. The reader here gives back the r210 bytes either way.
+//!
+//! v210 (HDR10, low-latency Dolby Vision, SDR) uses all 10 bits, so every
+//! bit is kept, only rearranged (`v210p`): luma and chroma apart, each
+//! sample's top 8 bits and low 2 in planes of their own. 0.38 of raw against
+//! 0.67 as captured (the same day, a film's low-latency Dolby Vision).
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -24,7 +37,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use cinefit_decklink::FrameInfo;
+use cinefit_decklink::{FrameInfo, PixelFormat};
 
 /// Frames that can be in flight between the card and the disk: about 530 MB
 /// of r210 at 2160p, so a second of disk stall costs nothing.
@@ -35,7 +48,13 @@ A clip captured by cinefit capture --record, for testing on this machine.
 frames.zst is every frame's raw bytes, back to back, through zstd; frames.csv
 says where each frame starts in the decompressed stream, how many bytes it is,
 and what the card reported about it. Decompress with zstd -dc and split by
-offset and size.
+offset and size. A frame whose pixel_format is r210p8 is r210 stored as three
+planes of width x height bytes, R, G then B, each the top 8 of the channel's
+10 bits; its other bits were zero. The big-endian word is R << 22 | G << 12
+| B << 2. One whose pixel_format is v210p is v210 with its 10-bit samples, in
+the stream's order, as four planes of one byte a sample: luma's top 8 bits,
+luma's low 2, then chroma's top 8 and low 2. Each little-endian word of the
+v210 is s0 | s1 << 10 | s2 << 20 of its three samples.
 
 This is copyrighted content captured for private testing. Keep it on this
 machine, outside any repository. Never commit or publish it.
@@ -221,11 +240,28 @@ fn write_loop(
 ) -> std::io::Result<u64> {
     let mut stdin: ChildStdin = zstd.stdin.take().expect("piped");
     let (mut offset, mut written) = (0u64, 0u64);
+    let mut planes = Vec::new();
     let result = (|| {
         for item in rx {
-            stdin.write_all(&item.buf[..item.len])?;
-            writeln!(csv, "{}", csv_line(&item, offset))?;
-            offset += item.len as u64;
+            let i = &item.info;
+            let (bytes, w, h) = (&item.buf[..item.len], i.width as usize, i.height as usize);
+            let packed = match i.pixel_format {
+                PixelFormat::Rgb10 => {
+                    pack_r210(bytes, w, h, i.row_bytes, &mut planes).then_some(R210_PLANES)
+                }
+                PixelFormat::V210 => {
+                    pack_v210(bytes, w, h, i.row_bytes, &mut planes).then_some(V210_PLANES)
+                }
+                _ => None,
+            };
+            let stored: &[u8] = if packed.is_some() { &planes } else { bytes };
+            stdin.write_all(stored)?;
+            writeln!(
+                csv,
+                "{}",
+                csv_line(&item, offset, packed.map(|p| (p, stored.len())))
+            )?;
+            offset += stored.len() as u64;
             written += 1;
             free.lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -243,7 +279,150 @@ fn write_loop(
     Ok(written)
 }
 
-fn csv_line(item: &Item, offset: u64) -> String {
+/// The stream's name for r210 stored as planes.
+const R210_PLANES: &str = "r210p8";
+
+/// Bits of an r210 word a tunnel frame leaves zero: the word's top two and
+/// the low two of each channel.
+const R210_SPARE: u32 = 0xC030_0C03;
+
+/// An r210 frame as three planes of each channel's top 8 bits, into `out`;
+/// false, with `out` left unspecified, where any spare bit is set or the
+/// rows are padded, as the planes could not give the frame back.
+fn pack_r210(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+    row_bytes: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    let n = width * height;
+    if row_bytes != width * 4 || bytes.len() != n * 4 {
+        return false;
+    }
+    out.resize(n * 3, 0);
+    let (r, gb) = out.split_at_mut(n);
+    let (g, b) = gb.split_at_mut(n);
+    let mut spare = 0u32;
+    for (k, px) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        let w = u32::from_be_bytes(*px);
+        spare |= w;
+        r[k] = (w >> 22) as u8;
+        g[k] = (w >> 12) as u8;
+        b[k] = (w >> 2) as u8;
+    }
+    spare & R210_SPARE == 0
+}
+
+/// The stream's name for v210 stored as planes.
+const V210_PLANES: &str = "v210p";
+
+/// A v210 frame's 10-bit samples as four byte planes, into `out`: luma's top
+/// 8 bits, luma's low 2, chroma's top 8, chroma's low 2. False, with `out`
+/// left unspecified, where a word's top two bits are set or the rows are not
+/// exactly whole six-pixel groups, as the planes could not give it back.
+fn pack_v210(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+    row_bytes: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    if !width.is_multiple_of(6) || row_bytes != width / 6 * 16 || bytes.len() != row_bytes * height
+    {
+        return false;
+    }
+    // Two samples a pixel, half of them luma.
+    let n = width * height;
+    out.resize(n * 4, 0);
+    let (yh, rest) = out.split_at_mut(n);
+    let (yl, rest) = rest.split_at_mut(n);
+    let (ch, cl) = rest.split_at_mut(n);
+    let (mut y, mut c, mut spare) = (0, 0, 0u32);
+    for (k, word) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        let w = u32::from_le_bytes(*word);
+        spare |= w;
+        for j in 0..3 {
+            let s = (w >> (10 * j)) & 0x3FF;
+            // Within a group of 12 samples, the odd ones are luma.
+            if (k * 3 + j) % 2 == 1 {
+                (yh[y], yl[y]) = ((s >> 2) as u8, (s & 3) as u8);
+                y += 1;
+            } else {
+                (ch[c], cl[c]) = ((s >> 2) as u8, (s & 3) as u8);
+                c += 1;
+            }
+        }
+    }
+    spare >> 30 == 0
+}
+
+/// The v210 bytes of a frame [`pack_v210`] stored, into `out`.
+fn unpack_v210(
+    planes: &[u8],
+    width: usize,
+    height: usize,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let n = width * height;
+    if !width.is_multiple_of(6) || planes.len() != n * 4 {
+        return Err(std::io::Error::other(format!(
+            "a v210 plane frame of {} bytes, not {}",
+            planes.len(),
+            n * 4
+        )));
+    }
+    let (yh, rest) = planes.split_at(n);
+    let (yl, rest) = rest.split_at(n);
+    let (ch, cl) = rest.split_at(n);
+    let (mut y, mut c) = (0, 0);
+    out.clear();
+    out.reserve(n * 8 / 3);
+    for k in 0..n * 2 / 3 {
+        let mut w = 0u32;
+        for j in 0..3 {
+            let s = if (k * 3 + j) % 2 == 1 {
+                y += 1;
+                u32::from(yh[y - 1]) << 2 | u32::from(yl[y - 1])
+            } else {
+                c += 1;
+                u32::from(ch[c - 1]) << 2 | u32::from(cl[c - 1])
+            };
+            w |= s << (10 * j);
+        }
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// The r210 bytes of a frame [`pack_r210`] stored, into `out`.
+fn unpack_r210(
+    planes: &[u8],
+    width: usize,
+    height: usize,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let n = width * height;
+    if planes.len() != n * 3 {
+        return Err(std::io::Error::other(format!(
+            "an r210 plane frame of {} bytes, not {}",
+            planes.len(),
+            n * 3
+        )));
+    }
+    let (r, gb) = planes.split_at(n);
+    let (g, b) = gb.split_at(n);
+    out.clear();
+    out.reserve(n * 4);
+    for k in 0..n {
+        let w = u32::from(r[k]) << 22 | u32::from(g[k]) << 12 | u32::from(b[k]) << 2;
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// One CSV line; `stored` is the name and size of a frame stored as planes.
+fn csv_line(item: &Item, offset: u64, stored: Option<(&str, usize)>) -> String {
     let i = &item.info;
     let opt_i = |v: Option<i64>| v.map_or_else(String::new, |v| v.to_string());
     let opt_f = |v: Option<f64>| v.map_or_else(String::new, |v| v.to_string());
@@ -251,14 +430,17 @@ fn csv_line(item: &Item, offset: u64) -> String {
     format!(
         "{},{offset},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{}",
         item.index,
-        item.len,
+        stored.map_or(item.len, |(_, n)| n),
         item.at.as_secs_f64(),
         opt_i(i.stream_time),
         opt_i(i.duration),
         i.width,
         i.height,
         i.row_bytes,
-        i.pixel_format,
+        match stored {
+            Some((name, _)) => name.to_string(),
+            None => i.pixel_format.to_string(),
+        },
         i.color.eotf.map_or_else(String::new, |e| e.to_string()),
         i.color
             .colorspace
@@ -275,12 +457,17 @@ fn csv_line(item: &Item, offset: u64) -> String {
 pub struct ClipFrame {
     pub index: u64,
     pub offset: u64,
+    /// Its bytes in the stream: not the frame's own when `planes`.
     pub size: usize,
     pub width: usize,
     pub height: usize,
     pub row_bytes: usize,
-    /// As the card reported it: "v210", "r210", "8-bit ARGB".
+    /// As the card reported it: "v210", "r210", "8-bit ARGB". A frame stored
+    /// as planes reads as its own format, and [`for_each_frame`] gives its
+    /// own bytes.
     pub pixel_format: String,
+    /// Stored as planes (`r210p8`, `v210p`).
+    pub planes: bool,
     /// The frame's place in the source's stream, from the card's stream
     /// time: unlike `index`, it skips the frames a recording dropped.
     pub frame_number: u64,
@@ -309,6 +496,11 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
             return Err(bad(n + 1));
         }
         let num = |i: usize| f[i].parse::<u64>().map_err(|_| bad(n + 1));
+        let (format, planes) = match f[9] {
+            R210_PLANES => ("r210", true),
+            V210_PLANES => ("v210", true),
+            other => (other, false),
+        };
         frames.push(ClipFrame {
             index: num(0)?,
             offset: num(1)?,
@@ -316,7 +508,8 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
             width: num(6)? as usize,
             height: num(7)? as usize,
             row_bytes: num(8)? as usize,
-            pixel_format: f[9].to_string(),
+            pixel_format: format.to_string(),
+            planes,
             frame_number: match (num(4)?, num(5)?) {
                 (_, 0) => num(0)?,
                 (time, duration) => time / duration,
@@ -350,6 +543,7 @@ fn read_cpp_index(text: &str) -> std::io::Result<Vec<ClipFrame>> {
             height,
             row_bytes,
             pixel_format: "v210".into(),
+            planes: false,
             frame_number: match duration {
                 0 => num(0)?,
                 d => stream_time.max(0) as u64 / d,
@@ -374,7 +568,8 @@ fn frames_path(dir: &Path) -> std::path::PathBuf {
 }
 
 /// Streams a clip's frames through `zstd -dc` in order, calling `each` with
-/// every frame for which `want` says yes. Frames are read one at a time, so a
+/// every frame for which `want` says yes, a frame stored as planes as its
+/// r210 bytes. Frames are read one at a time, so a
 /// clip of any length needs one frame of memory. A stream cut short (zstd
 /// killed while writing it, #142) gives every frame before the cut; the
 /// result is how many of the index's frames it lacked, 0 for a whole clip.
@@ -395,7 +590,7 @@ pub fn for_each_frame<E: From<std::io::Error>>(
         .stdout(Stdio::piped())
         .spawn()?;
     let mut out = std::io::BufReader::with_capacity(1 << 24, child.stdout.take().expect("piped"));
-    let mut buf = Vec::new();
+    let (mut buf, mut own) = (Vec::new(), Vec::new());
     let mut at = 0u64;
     let result = (|| {
         for (n, f) in index.iter().enumerate() {
@@ -415,7 +610,16 @@ pub fn for_each_frame<E: From<std::io::Error>>(
             }
             at += f.size as u64;
             if want(f) {
-                each(f, &buf)?;
+                if f.planes {
+                    if f.pixel_format == "v210" {
+                        unpack_v210(&buf, f.width, f.height, &mut own)?;
+                    } else {
+                        unpack_r210(&buf, f.width, f.height, &mut own)?;
+                    }
+                    each(f, &own)?;
+                } else {
+                    each(f, &buf)?;
+                }
             }
         }
         Ok(0)
@@ -429,7 +633,7 @@ pub fn for_each_frame<E: From<std::io::Error>>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use cinefit_decklink::{ColorInfo, PixelFormat};
+    use cinefit_decklink::ColorInfo;
 
     pub(crate) fn info(row_bytes: usize) -> FrameInfo {
         FrameInfo {
@@ -462,8 +666,13 @@ pub(crate) mod tests {
         let frames: Vec<Vec<u8>> = (0..5u8)
             .map(|i| (0..32).map(|b| b ^ i.wrapping_mul(37)).collect())
             .collect();
+        // Five pixels wide: not whole six-pixel groups, so stored as captured.
+        let five = FrameInfo {
+            width: 5,
+            ..info(16)
+        };
         for (i, f) in frames.iter().enumerate() {
-            w.offer(Duration::from_millis(42 * i as u64), &info(16), f);
+            w.offer(Duration::from_millis(42 * i as u64), &five, f);
         }
         let r = w.finish().expect("finish");
         assert_eq!((r.written, r.dropped), (5, 0));
@@ -507,6 +716,105 @@ pub(crate) mod tests {
         // A second recording into the same directory is refused, not mixed in.
         assert!(ClipWriter::create(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frames_are_stored_as_planes_and_come_back_byte_for_byte() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-planes-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (w, h) = (6usize, 2usize);
+        let r210 = FrameInfo {
+            width: w as u32,
+            height: h as u32,
+            row_bytes: w * 4,
+            pixel_format: PixelFormat::Rgb10,
+            ..info(w * 4)
+        };
+        // A tunnel's words: 8 bits a channel, every spare bit zero.
+        let tunnel: Vec<u8> = (0..(w * h) as u32)
+            .flat_map(|k| {
+                let (r, g, b) = (k * 37 % 256, 255 - k * 11 % 256, k * 101 % 256);
+                (r << 22 | g << 12 | b << 2).to_be_bytes()
+            })
+            .collect();
+        // RGB input with all of its 10 bits: one low bit set is enough.
+        let mut rgb = tunnel.clone();
+        rgb[7] |= 1;
+        // v210 with every sample's 10 bits in use, and one with a word's
+        // spare top bit set.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let v210: Vec<u8> = (0..8)
+            .flat_map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x as u32) & 0x3FFF_FFFF).to_le_bytes()
+            })
+            .collect();
+        let mut odd = v210.clone();
+        odd[31] |= 0x40;
+        let wr = ClipWriter::create(&dir).expect("create");
+        wr.offer(Duration::ZERO, &r210, &tunnel);
+        wr.offer(Duration::ZERO, &r210, &rgb);
+        wr.offer(Duration::ZERO, &info(16), &v210);
+        wr.offer(Duration::ZERO, &info(16), &odd);
+        assert_eq!(wr.finish().expect("finish").written, 4);
+
+        let csv = std::fs::read_to_string(dir.join("frames.csv")).expect("csv");
+        let stored: Vec<(&str, &str)> = csv
+            .lines()
+            .skip(1)
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                (f[2], f[9])
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("36", "r210p8"),
+                ("48", "r210"),
+                ("48", "v210p"),
+                ("32", "v210")
+            ]
+        );
+        let index = read_index(&dir).expect("index");
+        assert_eq!(
+            (
+                index[0].pixel_format.as_str(),
+                index[2].pixel_format.as_str()
+            ),
+            ("r210", "v210")
+        );
+        assert!(index[0].planes && !index[1].planes && index[2].planes && !index[3].planes);
+        let mut got = Vec::new();
+        let lost = for_each_frame::<std::io::Error>(
+            &dir,
+            &index,
+            |_| true,
+            |_, b| {
+                got.push(b.to_vec());
+                Ok(())
+            },
+        )
+        .expect("read");
+        assert_eq!(lost, 0);
+        assert_eq!(got, [tunnel, rgb, v210, odd]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn padded_rows_are_not_stored_as_planes() {
+        let mut out = Vec::new();
+        assert!(pack_r210(&[0; 16], 2, 2, 8, &mut out));
+        assert!(!pack_r210(&[0; 24], 2, 2, 12, &mut out));
+        // v210 rows padded past their six-pixel groups are stored as captured.
+        assert!(pack_v210(&[0; 32], 6, 2, 16, &mut out));
+        assert!(!pack_v210(&[0; 64], 6, 2, 32, &mut out));
     }
 
     #[test]
