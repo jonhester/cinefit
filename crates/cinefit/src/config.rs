@@ -546,7 +546,7 @@ static SETTINGS: &[Setting] = &[
         apply: Apply::Live,
         help: "For pairing two passes of a title (Dolby Vision tunnel, then low-latency): keep in full the first \
                frame of every shot and every this many frames after it, and no other frames, so both passes keep \
-               the same frames of the film. 48 at 24p is one every two seconds; a tunnel frame is about 15 MB \
+               the same frames of the film. 48 at 24p is one every two seconds; a tunnel frame is about 14 MB \
                kept, so mind detect.frames_gb. 0: off, frames kept as usual.",
         get: |c| Value::Int(c.pair_every.into()),
         set: Set::Int(|c, v| c.pair_every = v as u32),
