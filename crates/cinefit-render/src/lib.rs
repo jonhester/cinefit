@@ -5,6 +5,7 @@
 //! [`Placebo::new`] reports that.
 
 pub mod color;
+pub mod dm;
 mod ffi;
 #[cfg(target_os = "linux")]
 pub mod power;
@@ -638,12 +639,7 @@ impl Placebo {
         let place = Rect::raw(view.dst.as_ref());
         let src_crop = Rect::raw(view.src.as_ref());
         let map = map.map(Mapping::raw);
-        let flat = |m: &[[f64; 3]; 3]| std::array::from_fn(|i| m[i / 3][i % 3] as f32);
-        let raw = ffi::Dovi {
-            ycc_to_lms: flat(&color.ycc_to_lms),
-            offset: color.offset.map(|o| o as f32),
-            linear: flat(&color.linear),
-        };
+        let raw = dovi_raw(color);
         // SAFETY: `raw` and `map` (null or not) are structs whose layout the
         // shim shares, and `place` null or four floats, all read during the
         // call; the planes and the texture belong to this live device.
@@ -661,6 +657,87 @@ impl Placebo {
             )
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// [`render_dovi`](Self::render_dovi) through Dolby's display mapping,
+    /// modelled ([`dm`]), in place of a libplacebo curve: the tunnel to
+    /// BT.2020 PQ, `frame`'s mapping on that, then into `dst` with `map`,
+    /// which is one to one at the mapping's target, as for the player's
+    /// low-latency rendering.
+    ///
+    /// # Errors
+    ///
+    /// As [`render_dovi`](Self::render_dovi).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_dovi_dm(
+        &self,
+        src: &GpuPlanes<'_>,
+        color: &DoviColor,
+        frame: &dm::Frame,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+        view: View,
+        map: &Mapping,
+    ) -> Result<(), Error> {
+        let place = Rect::raw(view.dst.as_ref());
+        let src_crop = Rect::raw(view.src.as_ref());
+        let map = map.raw();
+        let raw = dovi_raw(color);
+        let dm = frame.raw();
+        // SAFETY: `raw`, `dm` and `map` are structs whose layout the shim
+        // shares, `place` and `src_crop` null or four floats, all read during
+        // the call; the planes and the texture belong to this live device.
+        let rc = unsafe {
+            ffi::cf_pl_render_dovi_dm(
+                self.handle.as_ptr(),
+                src.raw.as_ptr(),
+                &raw,
+                &dm,
+                dst.tex.as_ptr(),
+                primaries_raw(dst_color.primaries),
+                transfer_raw(dst_color.transfer),
+                place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                &map,
+                src_crop.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
+    }
+
+    /// `frame`'s mapping alone on the GPU, over `width` x `height` BT.2020 PQ
+    /// RGBA16 pixels (alpha ignored): what [`render_dovi_dm`](Self::render_dovi_dm)
+    /// does between the tunnel and the target, for checking against
+    /// [`dm::Frame::apply`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadInput`] if `rgba` is not `width` x `height` x 4 values;
+    /// [`Error::Render`] if libplacebo fails.
+    pub fn dm_rgba16(
+        &self,
+        width: usize,
+        height: usize,
+        rgba: &[u16],
+        frame: &dm::Frame,
+    ) -> Result<Vec<u16>, Error> {
+        if rgba.len() != width * height * 4 {
+            return Err(Error::BadInput);
+        }
+        let mut out = vec![0u16; rgba.len()];
+        let dm = frame.raw();
+        // SAFETY: `rgba` and `out` hold width x height x 4 values, as the shim
+        // reads and writes; `dm` is a struct whose layout the shim shares.
+        let rc = unsafe {
+            ffi::cf_pl_dm_rgba16(
+                self.handle.as_ptr(),
+                c_int::try_from(width).map_err(|_| Error::BadInput)?,
+                c_int::try_from(height).map_err(|_| Error::BadInput)?,
+                rgba.as_ptr(),
+                &dm,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 { Ok(out) } else { Err(Error::Render) }
     }
 
     /// Renders the planes over the whole of `dst` with their colour, into an
@@ -910,6 +987,16 @@ impl Placebo {
     /// Never reached: no `Placebo` exists off Linux.
     pub fn render_rgba8(&self, _w: u32, _h: u32, _rgba: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::Unsupported)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dovi_raw(color: &DoviColor) -> ffi::Dovi {
+    let flat = |m: &[[f64; 3]; 3]| std::array::from_fn(|i| m[i / 3][i % 3] as f32);
+    ffi::Dovi {
+        ycc_to_lms: flat(&color.ycc_to_lms),
+        offset: color.offset.map(|o| o as f32),
+        linear: flat(&color.linear),
     }
 }
 

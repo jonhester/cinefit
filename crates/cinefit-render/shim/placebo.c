@@ -24,11 +24,23 @@ _Static_assert(offsetof(cf_pl_map, contrast_recovery) == 16, "cf_pl_map.contrast
 _Static_assert(offsetof(cf_pl_map, peak_percentile) == 20, "cf_pl_map.peak_percentile");
 _Static_assert(offsetof(cf_pl_map, knee_offset) == 24, "cf_pl_map.knee_offset");
 
+/* cf_pl_dm as src/ffi.rs declares it. */
+_Static_assert(sizeof(cf_pl_dm) == 4180, "cf_pl_dm size");
+_Static_assert(offsetof(cf_pl_dm, k1) == 4100, "cf_pl_dm.k1");
+_Static_assert(offsetof(cf_pl_dm, tmax) == 4116, "cf_pl_dm.tmax");
+_Static_assert(offsetof(cf_pl_dm, cs) == 4120, "cf_pl_dm.cs");
+_Static_assert(offsetof(cf_pl_dm, hue_s1) == 4136, "cf_pl_dm.hue_s1");
+_Static_assert(offsetof(cf_pl_dm, hue_fix) == 4140, "cf_pl_dm.hue_fix");
+_Static_assert(offsetof(cf_pl_dm, hue_cmp) == 4156, "cf_pl_dm.hue_cmp");
+
 struct cf_pl {
     pl_log log;
     pl_vulkan vk;
     pl_renderer renderer;
     pl_dispatch dispatch;
+    /* Dolby's display mapping: the tunnel in BT.2020 PQ, the mapped picture,
+     * and the frame's intensity table. Sized on first use. */
+    pl_tex dm_mid, dm_out, dm_lut;
     cf_pl_log_cb log_cb;
     void *log_ctx;
 };
@@ -79,6 +91,11 @@ cf_pl *cf_pl_create(cf_pl_log_cb log_cb, void *ctx, char *err, size_t err_len) {
 
 void cf_pl_destroy(cf_pl *pl) {
     if (!pl) return;
+    if (pl->vk) {
+        pl_tex_destroy(pl->vk->gpu, &pl->dm_mid);
+        pl_tex_destroy(pl->vk->gpu, &pl->dm_out);
+        pl_tex_destroy(pl->vk->gpu, &pl->dm_lut);
+    }
     pl_dispatch_destroy(&pl->dispatch);
     pl_renderer_destroy(&pl->renderer);
     pl_vulkan_destroy(&pl->vk);
@@ -834,9 +851,10 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
     return 0;
 }
 
-int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
-                      cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
-                      const cf_pl_map *map, const float *src_crop) {
+/* cf_pl_render_dovi into any texture. */
+static int render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d, pl_tex t,
+                       int dst_prim, int dst_trc, const float *place,
+                       const cf_pl_map *map, const float *src_crop) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -885,7 +903,6 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     // Co-sited, as clause 6.4.1 pairs Cb[0] and Cr[0] with Y[0].
     pl_frame_set_chroma_location(&image, PL_CHROMA_LEFT);
 
-    pl_tex t = unwrap_tex(dst);
     struct pl_frame target = {
         .num_planes = 1,
         .planes = {{ .texture = t, .components = 3, .component_mapping = {0, 1, 2} }},
@@ -902,7 +919,207 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     apply_map(&image, &target, &params, &cmp, &pdp, map);
-    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    return pl_render_image(pl->renderer, &image, &target, &params) ? 0 : -1;
+}
+
+int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
+                      cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
+                      const cf_pl_map *map, const float *src_crop) {
+    if (render_dovi(pl, src, d, unwrap_tex(dst), dst_prim, dst_trc, place, map, src_crop))
+        return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
+}
+
+/* Dolby's display mapping, per pixel, as src/dm.rs's Frame::apply: BT.2020
+ * PQ to ICtCp, the frame's intensity table, chroma following intensity, the
+ * pull on over-bright saturated colour and the hue turn, and back. PQ here is
+ * over linear light 0-1 (10,000 nits); the matrices are written column by
+ * column, as GLSL reads them. */
+static const char DM_HEADER[] =
+    "const float cf_m1 = 0.1593017578125, cf_m2 = 78.84375;\n"
+    "const float cf_c1 = 0.8359375, cf_c2 = 18.8515625, cf_c3 = 18.6875;\n"
+    "vec3 cf_pq_eotf(vec3 e) {\n"
+    "    vec3 p = pow(max(e, 0.0), vec3(1.0 / cf_m2));\n"
+    "    return pow(max(p - cf_c1, 0.0) / (cf_c2 - cf_c3 * p), vec3(1.0 / cf_m1));\n"
+    "}\n"
+    "vec3 cf_pq_oetf(vec3 y) {\n"
+    "    y = pow(max(y, 0.0), vec3(cf_m1));\n"
+    "    return pow((cf_c1 + cf_c2 * y) / (1.0 + cf_c3 * y), vec3(cf_m2));\n"
+    "}\n"
+    "const mat3 cf_rgb_lms = mat3(1688.0, 683.0, 99.0, 2146.0, 2951.0, 309.0,\n"
+    "                            262.0, 462.0, 3688.0) / 4096.0;\n"
+    "const mat3 cf_lms_ictcp = mat3(2048.0, 6610.0, 17933.0, 2048.0, -13613.0, -17390.0,\n"
+    "                              0.0, 7003.0, -543.0) / 4096.0;\n"
+    "const int cf_n = 1024;\n";
+
+static const char DM_BODY[] =
+    "ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n"
+    "if (id.x < cf_w && id.y < cf_h) {\n"
+    "    vec3 lms = cf_pq_oetf(cf_rgb_lms * cf_pq_eotf(texelFetch(cf_mid, id, 0).rgb));\n"
+    "    vec3 x = cf_lms_ictcp * lms;\n"
+    "    float i0 = x.x, ct = x.y, cp = x.z;\n"
+    "    float t = clamp(i0, 0.0, 1.0) * float(cf_n);\n"
+    "    int k = min(int(t), cf_n - 1);\n"
+    "    float l0 = texelFetch(cf_lut, ivec2(k, 0), 0).r;\n"
+    "    float l1 = texelFetch(cf_lut, ivec2(k + 1, 0), 0).r;\n"
+    "    float i = l0 + (t - float(k)) * (l1 - l0);\n"
+    "    float kk = (i0 > 1e-4 && i > 1e-4)\n"
+    "        ? (i * (cf_k1 * i0 + 1.0)) / (i0 * (cf_k1 * i + 1.0)) : 1.0;\n"
+    "    kk = (1.0 + (1.0 + cf_cw) * (kk - 1.0)) * (1.0 + cf_sg);\n"
+    "    vec3 o = vec3(max(i, 0.0), ct * kk, cp * kk);\n"
+    "    if (i0 > 0.02) {\n"
+    "        float sat = sqrt(0.25 * ct * ct + cp * cp) / i0;\n"
+    "        float w = cf_comp * max(sat - cf_cs.w, 0.0)\n"
+    "            * pow(clamp(o.x / cf_tmax, 0.0, 1.5), clamp(cf_cs.z, 0.0, 8.0));\n"
+    "        o.x = max(o.x - cf_cs.x * w, 0.0);\n"
+    "        o.yz *= clamp(1.0 - cf_cs.y * w, 0.0, 2.0);\n"
+    /* atan(0, 0) is undefined in GLSL; Rust's atan2 gives 0. */
+    "        float h = (abs(ct) + abs(cp) > 0.0) ? atan(cp, 0.5 * ct) : 0.0;\n"
+    "        vec4 b1 = vec4(cos(h), sin(h), cos(2.0 * h), sin(2.0 * h));\n"
+    "        vec2 b2 = vec2(cos(3.0 * h), sin(3.0 * h));\n"
+    "        float wh = cf_comp * max(sat - cf_hue_s1, 0.0);\n"
+    "        float ang = dot(b1, cf_fix) + wh * (dot(b1, cf_cmp_a) + dot(b2, cf_cmp_b));\n"
+    "        float oc = 0.5 * o.y, op = o.z;\n"
+    "        o.yz = vec2(2.0 * (oc * cos(ang) - op * sin(ang)), oc * sin(ang) + op * cos(ang));\n"
+    "    }\n"
+    "    vec3 rgb = inverse(cf_rgb_lms) * cf_pq_eotf(inverse(cf_lms_ictcp) * o);\n"
+    "    imageStore(cf_out, id, vec4(cf_pq_oetf(rgb), 1.0));\n"
+    "}\n";
+
+#define DM_LOCAL 16
+
+/* Maps `in` (sampleable, BT.2020 PQ) into `out` (storable, the same size). */
+static int dm_pass(cf_pl *pl, pl_tex in, pl_tex out, const cf_pl_dm *dm) {
+    pl_gpu gpu = pl->vk->gpu;
+    pl_fmt f_lut = pl_find_named_fmt(gpu, "r32f");
+    if (!f_lut) {
+        log_err(pl, "no r32f texture format");
+        return -1;
+    }
+    if (!pl_tex_recreate(gpu, &pl->dm_lut, pl_tex_params(
+            .w = CF_PL_DM_LUT, .h = 1, .format = f_lut,
+            .sampleable = true, .host_writable = true)))
+        return -1;
+    if (!pl_tex_upload(gpu, pl_tex_transfer_params(.tex = pl->dm_lut, .ptr = (void *)dm->lut)))
+        return -1;
+    int w = in->params.w, h = in->params.h;
+    float cmp_b[2] = {dm->hue_cmp[4], dm->hue_cmp[5]};
+    pl_shader sh = pl_dispatch_begin(pl->dispatch);
+    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = "Dolby display mapping",
+        .header = DM_HEADER,
+        .body = DM_BODY,
+        .input = PL_SHADER_SIG_NONE,
+        .output = PL_SHADER_SIG_NONE,
+        .compute = true,
+        .compute_group_size = {DM_LOCAL, DM_LOCAL},
+        .descriptors = (struct pl_shader_desc[]) {
+            {
+                .desc = { .name = "cf_mid", .type = PL_DESC_SAMPLED_TEX },
+                .binding = { .object = in, .sample_mode = PL_TEX_SAMPLE_NEAREST },
+            },
+            {
+                .desc = { .name = "cf_lut", .type = PL_DESC_SAMPLED_TEX },
+                // Interpolated by the shader, as the reference does, not by
+                // the sampler.
+                .binding = { .object = pl->dm_lut, .sample_mode = PL_TEX_SAMPLE_NEAREST },
+            },
+            {
+                .desc = { .name = "cf_out", .type = PL_DESC_STORAGE_IMG,
+                          .access = PL_DESC_ACCESS_WRITEONLY },
+                .binding.object = out,
+            },
+        },
+        .num_descriptors = 3,
+        .variables = (struct pl_shader_var[]) {
+            { .var = pl_var_int("cf_w"),        .data = &w },
+            { .var = pl_var_int("cf_h"),        .data = &h },
+            { .var = pl_var_float("cf_k1"),     .data = &dm->k1 },
+            { .var = pl_var_float("cf_cw"),     .data = &dm->chroma_weight },
+            { .var = pl_var_float("cf_sg"),     .data = &dm->saturation_gain },
+            { .var = pl_var_float("cf_comp"),   .data = &dm->compression },
+            { .var = pl_var_float("cf_tmax"),   .data = &dm->tmax },
+            { .var = pl_var_vec4("cf_cs"),      .data = dm->cs },
+            { .var = pl_var_float("cf_hue_s1"), .data = &dm->hue_s1 },
+            { .var = pl_var_vec4("cf_fix"),     .data = dm->hue_fix },
+            { .var = pl_var_vec4("cf_cmp_a"),   .data = dm->hue_cmp },
+            { .var = pl_var_vec2("cf_cmp_b"),   .data = cmp_b },
+        },
+        .num_variables = 12,
+    });
+    if (!ok) {
+        pl_dispatch_abort(pl->dispatch, &sh);
+        log_err(pl, "Dolby display mapping shader rejected");
+        return -1;
+    }
+    if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
+            .shader = &sh,
+            .dispatch_size = {(w + DM_LOCAL - 1) / DM_LOCAL, (h + DM_LOCAL - 1) / DM_LOCAL, 1})))
+        return -1;
+    return 0;
+}
+
+int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
+                         const cf_pl_dm *dm, cf_pl_tex *dst, int dst_prim, int dst_trc,
+                         const float *place, const cf_pl_map *map, const float *src_crop) {
+    pl_gpu gpu = pl->vk->gpu;
+    pl_fmt fmt = storable_fmt(pl, "rgba16");
+    if (!fmt) return -1;
+    // The whole frame at its own size: the bars are cropped and the picture
+    // placed by the last step, as for every other source.
+    if (!pl_tex_recreate(gpu, &pl->dm_mid, pl_tex_params(
+            .w = src->w, .h = src->h, .format = fmt, .renderable = true, .sampleable = true,
+            .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0)))
+        return -1;
+    if (!pl_tex_recreate(gpu, &pl->dm_out, pl_tex_params(
+            .w = src->w, .h = src->h, .format = fmt, .storable = true, .sampleable = true)))
+        return -1;
+    if (render_dovi(pl, src, d, pl->dm_mid, CF_PL_PRIM_BT2020, CF_PL_TRC_PQ, NULL, NULL, NULL))
+        return -1;
+    if (dm_pass(pl, pl->dm_mid, pl->dm_out, dm)) return -1;
+
+    struct pl_frame image = {
+        .num_planes = 1,
+        .planes = {{ .texture = pl->dm_out, .components = 3, .component_mapping = {0, 1, 2} }},
+        .repr = pl_color_repr_rgb,
+        .color = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ },
+    };
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes = {{ .texture = unwrap_tex(dst), .components = 3, .component_mapping = {0, 1, 2} }},
+        .repr = pl_color_repr_rgb,
+        .color = { .primaries = primaries(dst_prim), .transfer = transfer(dst_trc) },
+    };
+    set_place(&target, place);
+    set_source(&image, src_crop);
+    struct pl_render_params params = pl_render_default_params;
+    params.dither_params = NULL;
+    params.peak_detect_params = NULL;
+    struct pl_color_map_params cmp;
+    struct pl_peak_detect_params pdp;
+    apply_map(&image, &target, &params, &cmp, &pdp, map);
+    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    pl_gpu_finish(gpu);
+    return 0;
+}
+
+int cf_pl_dm_rgba16(cf_pl *pl, int w, int h, const uint16_t *in, const cf_pl_dm *dm,
+                    uint16_t *out) {
+    pl_gpu gpu = pl->vk->gpu;
+    pl_fmt fmt = storable_fmt(pl, "rgba16");
+    if (!fmt) return -1;
+    pl_tex t_in = pl_tex_create(gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .sampleable = true, .initial_data = in));
+    pl_tex t_out = pl_tex_create(gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .storable = true, .host_readable = true));
+    int rc = -1;
+    if (t_in && t_out && !dm_pass(pl, t_in, t_out, dm) &&
+        pl_tex_download(gpu, pl_tex_transfer_params(
+            .tex = t_out, .ptr = out, .row_pitch = (size_t)w * 8)))
+        rc = 0;
+    pl_gpu_finish(gpu);
+    pl_tex_destroy(gpu, &t_in);
+    pl_tex_destroy(gpu, &t_out);
+    return rc;
 }
