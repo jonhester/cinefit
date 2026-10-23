@@ -559,6 +559,9 @@ struct Dataset {
     source: Option<String>,
     /// What the Apple TV plays, by name, noted in each session (#115).
     playing: Option<String>,
+    /// The input's HDR static metadata, noted in each session: a title's
+    /// MaxCLL, MaxFALL and mastering peak, which its frames do not show.
+    hdr: Option<HdrMetadata>,
     /// Which frames to keep in full (#91), from the first frame recorded.
     picker: Option<dataset::Picker>,
     /// While pairing (#138): the session's recent frames with their
@@ -631,6 +634,9 @@ impl Dataset {
                     }
                     if let Some(p) = &self.playing {
                         r.note(&format!("playing: {p}"));
+                    }
+                    if let Some(h) = &self.hdr {
+                        r.note(&hdr_line(h));
                     }
                     self.recorder = Some(r);
                 }
@@ -875,6 +881,18 @@ impl Dataset {
             r.note(&format!("at {t:.1} s, source: {s}"));
         }
         self.source = source;
+    }
+
+    /// The input's HDR metadata changed: noted in the open session, and in
+    /// every session opened after.
+    fn set_hdr(&mut self, hdr: Option<HdrMetadata>, t: f64) {
+        if hdr == self.hdr {
+            return;
+        }
+        if let (Some(r), Some(h)) = (&self.recorder, &hdr) {
+            r.note(&format!("at {t:.1} s, {}", hdr_line(h)));
+        }
+        self.hdr = hdr;
     }
 
     /// What the Apple TV plays changed: noted in the open session, and in
@@ -2303,6 +2321,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         (t, epoch),
                     )?;
                     noted(&found, &frame_info, t);
+                    dataset.set_hdr(frame_info.color.hdr, t);
                     dataset.record(cfg.record, &found, t, epoch, content);
                     dataset.keep(&cfg, &found, t, &frame);
                     let source = found.source;
@@ -2634,9 +2653,40 @@ fn hdr_note(hdr: Option<&HdrMetadata>) -> String {
     )
 }
 
+/// HDR metadata for a session's notes, every value or "unreported".
+fn hdr_line(h: &HdrMetadata) -> String {
+    let n = |v: Option<f64>, d: usize| v.map_or("unreported".to_string(), |v| format!("{v:.d$}"));
+    format!(
+        "HDR metadata: MaxCLL {}, MaxFALL {}, mastering {}-{} nits",
+        n(h.max_cll, 0),
+        n(h.max_fall, 0),
+        n(h.min_mastering, 4),
+        n(h.max_mastering, 0)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's HDR note keeps an unreported value apart from zero.
+    #[test]
+    fn the_hdr_note_says_what_was_not_reported() {
+        let h = HdrMetadata {
+            red: None,
+            green: None,
+            blue: None,
+            white: None,
+            max_mastering: Some(1000.0),
+            min_mastering: Some(0.0001),
+            max_cll: Some(1445.0),
+            max_fall: None,
+        };
+        assert_eq!(
+            hdr_line(&h),
+            "HDR metadata: MaxCLL 1445, MaxFALL unreported, mastering 0.0001-1000 nits"
+        );
+    }
 
     /// A v210 frame, 10-bit luma by row and column, neutral chroma: what the
     /// detector reads, without the capture card.
