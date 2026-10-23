@@ -452,9 +452,8 @@ pub(crate) fn rate_mhz(f: &InputFormat) -> u32 {
 /// reads. Each is a crop change's reason and the info panel's CROP detail.
 pub(crate) fn unread_by_detector(kind: Kind) -> Option<&'static str> {
     match kind {
-        Kind::Ycbcr(_) => None,
+        Kind::Ycbcr(_) | Kind::Tunnel => None,
         Kind::Rgb(_) => Some("the detector does not read RGB"),
-        Kind::Tunnel => Some("the detector does not read the Dolby Vision tunnel"),
         Kind::Unsupported(_) => Some("nothing reads this format"),
     }
 }
