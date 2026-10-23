@@ -38,6 +38,9 @@ const SCREEN: [(f64, f64, &str); 8] = [
 /// standard ratio wider than the screen.
 const FILL: [f64; 5] = [2.37, 2.39, 2.40, 2.55, 2.76];
 
+/// What `output.idle_off` steps through, in minutes; 0 is never.
+const IDLE_OFF: [u16; 7] = [0, 5, 10, 15, 30, 60, 120];
+
 /// One row: what it shows, and the setting behind it.
 #[derive(Clone, Copy)]
 enum Row {
@@ -77,6 +80,10 @@ fn rows(page: usize) -> &'static [Row] {
         Row::Setting {
             label: "Rate while waiting",
             key: "output.wait_hz",
+        },
+        Row::Setting {
+            label: "Stop without a signal",
+            key: "output.idle_off",
         },
     ];
     const SCREEN_ROWS: &[Row] = &[
@@ -122,6 +129,14 @@ struct Choice {
 
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
+}
+
+fn idle_label(minutes: u16) -> String {
+    if minutes == 0 {
+        "Never".into()
+    } else {
+        format!("After {minutes} min")
+    }
 }
 
 fn rate_label(hz: f64) -> String {
@@ -215,6 +230,17 @@ fn choices(key: &str, c: &Config, rates: &[f64]) -> (Vec<Choice>, Option<usize>)
             let at = rates.iter().position(|&hz| (hz - c.wait_hz).abs() < 0.01);
             (list, at)
         }
+        "output.idle_off" => {
+            let list = IDLE_OFF
+                .iter()
+                .map(|&m| Choice {
+                    value: Value::Int(m.into()),
+                    label: idle_label(m),
+                })
+                .collect();
+            let at = IDLE_OFF.iter().position(|&m| m == c.idle_off);
+            (list, at)
+        }
         _ => (Vec::new(), None),
     }
 }
@@ -230,6 +256,7 @@ fn value_label(key: &str, c: &Config, rates: &[f64]) -> String {
         "geometry.screen_ar" => ratio_label(c.screen_ar),
         "geometry.fill_max_ar" => format!("{:.2} : 1", c.fill_max_ar.value()),
         "output.wait_hz" => rate_label(c.wait_hz),
+        "output.idle_off" => idle_label(c.idle_off),
         _ => String::new(),
     }
 }
@@ -247,6 +274,7 @@ fn step(key: &str, c: &Config, rates: &[f64], up: bool) -> Option<Value> {
                 "geometry.screen_ar" => c.screen_ar.value(),
                 "geometry.fill_max_ar" => c.fill_max_ar.value(),
                 "output.wait_hz" => c.wait_hz,
+                "output.idle_off" => f64::from(c.idle_off),
                 _ => return list.first().map(|x| x.value.clone()),
             };
             let num = |v: &Value| match v {
@@ -455,6 +483,25 @@ mod tests {
         press(&mut m, &mut c, &[Action::Back, Action::Back]);
         assert!(!m.is_open());
         assert_eq!(c.fill_max_ar.value(), 2.55);
+    }
+
+    #[test]
+    fn idle_off_steps_through_minutes_from_never() {
+        let mut c = Config::default();
+        assert_eq!(value_label("output.idle_off", &c, &RATES), "Never");
+        assert_eq!(
+            step("output.idle_off", &c, &RATES, true),
+            Some(Value::Int(5))
+        );
+        assert_eq!(step("output.idle_off", &c, &RATES, false), None);
+        // Set by hand between two: shown as it is, stepping to a neighbour.
+        c.idle_off = 20;
+        assert_eq!(value_label("output.idle_off", &c, &RATES), "After 20 min");
+        assert_eq!(
+            step("output.idle_off", &c, &RATES, true),
+            Some(Value::Int(30))
+        );
+        assert_eq!(cost("output.idle_off"), "Applies now, no resync");
     }
 
     #[test]

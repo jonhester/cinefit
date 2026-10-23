@@ -1016,6 +1016,31 @@ impl Output {
         Ok(())
     }
 
+    /// Stops scanning out: the CRTC goes inactive with its planes left
+    /// bound, so the link goes quiet and the display sees no signal, as when
+    /// a source is switched off (#144). [`Self::modeset`] lights it again, as
+    /// from off, with the signalling it then holds in the same commit. No
+    /// flips in between: there are no vblanks to carry them.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal; the output is then as it was.
+    pub fn sleep(&mut self) -> Result<(), Error> {
+        if !self.modeset {
+            return Ok(());
+        }
+        let crtc: RawResourceHandle = self.crtc.into();
+        commit(
+            &self.card,
+            AtomicCommitFlags::ALLOW_MODESET,
+            request(&[(crtc, self.props.active, 0)]),
+        )?;
+        // Nothing on screen: the next modeset is a start from off, which
+        // always carries the signalling, not a switch to go dark for.
+        self.hdr_on_screen = None;
+        Ok(())
+    }
+
     /// Modesets that took the output dark first, into or out of HDR (see
     /// [`Self::modeset`]).
     pub fn relights(&self) -> u64 {
