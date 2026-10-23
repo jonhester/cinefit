@@ -567,15 +567,23 @@ struct Dataset {
     /// buffers and lag.
     history: std::collections::VecDeque<(u64, Option<[u8; dataset::THUMB]>)>,
     kept: std::collections::BTreeSet<u64>,
-    /// The `detect.pair_follow` in force and its follower; `None` inside
-    /// when there is nothing to follow (another session, frames not held).
-    follow: Option<(String, Option<pairfollow::Follower>)>,
+    /// The `detect.pair_follow` in force and its follower.
+    follow: Option<(String, Following)>,
 }
 
 /// Frames of history held while pairing: 45 minutes at 24p, about 38 MB.
-/// A runner that plays every chapter's tunnel pass first and the low-latency
-/// ones after needs the whole run's.
+/// Older frames are read back from the session's files (#160): a clips run
+/// of 23 chapters and four passes plays its last pass more than an hour after
+/// the tunnel's.
 const HISTORY: usize = 1 << 16;
+
+/// A follower, or the thumbnails it needs still being read from disk.
+enum Following {
+    /// `None` when there is nothing to follow (another session, frames not
+    /// recorded), said why when it was made.
+    Ready(Option<Box<pairfollow::Follower>>),
+    Reading(std::sync::mpsc::Receiver<Option<Box<pairfollow::Follower>>>),
+}
 
 /// The signal gone this long ends a viewing: the dataset's session closes,
 /// and the next frame opens a new one. Short drops (a player changing HDR or
@@ -739,7 +747,22 @@ impl Dataset {
             let f = self.follower(spec);
             self.follow = Some((spec.to_string(), f));
         }
-        let fl = self.follow.as_mut()?.1.as_mut()?;
+        let following = &mut self.follow.as_mut()?.1;
+        if let Following::Reading(rx) = following {
+            // Frames go by unfollowed while the thumbnails are read, tens of
+            // milliseconds: a runner sets the follow seconds before the
+            // tunnel's first kept frame.
+            match rx.try_recv() {
+                Ok(f) => *following = Following::Ready(f),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *following = Following::Ready(None)
+                }
+            }
+        }
+        let Following::Ready(Some(fl)) = following else {
+            return None;
+        };
         let s = fl.step(index, thumb);
         match s.event {
             Some(pairfollow::Event::Locked(d)) => {
@@ -758,9 +781,55 @@ impl Dataset {
         s.keep.then_some("follow")
     }
 
-    /// The follower `spec` asks for, from the history: `None`, said why,
-    /// when it names another session or frames no longer held.
-    fn follower(&self, spec: &str) -> Option<pairfollow::Follower> {
+    /// The follower `spec` asks for: from the history, or for frames older
+    /// than it from the session's files, on a thread of its own so the frame
+    /// loop does not wait on the disk.
+    fn follower(&self, spec: &str) -> Following {
+        let Some((lo, hi)) = self.follow_range(spec) else {
+            return Following::Ready(None);
+        };
+        let kept = self.kept.range(lo..=hi).copied().collect();
+        let dir = self.recorder.as_ref().map(|r| r.dir().to_path_buf());
+        match (self.history.front(), dir) {
+            (Some(&(front, _)), _) if lo >= front => {
+                let held = |i: u64| {
+                    self.history
+                        .binary_search_by_key(&i, |h| h.0)
+                        .ok()
+                        .and_then(|k| self.history[k].1)
+                };
+                let thumbs: Vec<_> = (lo..=hi).map(held).collect();
+                Following::Ready(make_follower(lo, hi, &thumbs, kept, "held").map(Box::new))
+            }
+            (_, Some(dir)) => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let spawned = std::thread::Builder::new()
+                    .name("pair-follow".into())
+                    .spawn(move || {
+                        let f = match dataset::read_thumbs(&dir, lo, hi) {
+                            Ok(thumbs) => make_follower(lo, hi, &thumbs, kept, "on disk").map(Box::new),
+                            Err(e) => {
+                                warn!("pair follow: frames {lo}-{hi}: reading thumbnails: {e}: keeping nothing");
+                                None
+                            }
+                        };
+                        let _ = tx.send(f);
+                    });
+                match spawned {
+                    Ok(_) => Following::Reading(rx),
+                    Err(e) => {
+                        warn!("pair follow: no thread to read thumbnails: {e}: keeping nothing");
+                        Following::Ready(None)
+                    }
+                }
+            }
+            (_, None) => Following::Ready(None),
+        }
+    }
+
+    /// The frames `spec` names, when it is well formed and names the open
+    /// session: `None`, said why, otherwise.
+    fn follow_range(&self, spec: &str) -> Option<(u64, u64)> {
         let open = self
             .recorder
             .as_ref()
@@ -793,26 +862,7 @@ impl Dataset {
             );
             return None;
         }
-        let held = |i: u64| {
-            self.history
-                .binary_search_by_key(&i, |h| h.0)
-                .ok()
-                .and_then(|k| self.history[k].1)
-        };
-        let thumbs: Vec<_> = (lo..=hi).map(held).collect();
-        let have = thumbs.iter().filter(|t| t.is_some()).count();
-        if have == 0 {
-            warn!("pair follow: no thumbnails held for frames {lo}-{hi}: keeping nothing");
-            return None;
-        }
-        let kept = self.kept.range(lo..=hi).copied().collect();
-        let fl = pairfollow::Follower::new(lo, &thumbs, kept);
-        info!(
-            "pair follow: following frames {lo}-{hi}: {have} thumbnails of {}, {} kept",
-            thumbs.len(),
-            fl.size().1
-        );
-        Some(fl)
+        Some((lo, hi))
     }
 
     /// The receiver's input changed: noted in the open session, and in
@@ -897,6 +947,29 @@ impl Dataset {
             }
         }
     }
+}
+
+/// A follower of frames `lo..=hi` from their thumbnails (`whence`, for the
+/// log): `None`, said why, when none of them has one.
+fn make_follower(
+    lo: u64,
+    hi: u64,
+    thumbs: &[Option<[u8; dataset::THUMB]>],
+    kept: std::collections::BTreeSet<u64>,
+    whence: &str,
+) -> Option<pairfollow::Follower> {
+    let have = thumbs.iter().filter(|t| t.is_some()).count();
+    if have == 0 {
+        warn!("pair follow: no thumbnails {whence} for frames {lo}-{hi}: keeping nothing");
+        return None;
+    }
+    let fl = pairfollow::Follower::new(lo, thumbs, kept);
+    info!(
+        "pair follow: following frames {lo}-{hi}: {have} thumbnails {whence} of {}, {} kept",
+        thumbs.len(),
+        fl.size().1
+    );
+    Some(fl)
 }
 
 impl CropFinder {

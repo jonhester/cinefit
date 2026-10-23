@@ -28,7 +28,7 @@
 //! reaches it keeps no more.
 
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
@@ -112,6 +112,48 @@ pub fn note_in(dir: &Path, line: &str) {
     {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// The thumbnails of frames `lo..=hi` of session `dir`, from its
+/// `frames.csv` and `thumbs.bin`, in order: `None` for a frame without one or
+/// not on disk yet. The files are written through buffers, so the newest
+/// frames are missing and the last line may be cut short; it is ignored.
+pub fn read_thumbs(dir: &Path, lo: u64, hi: u64) -> io::Result<Vec<Option<[u8; THUMB]>>> {
+    let csv = fs::read_to_string(dir.join("frames.csv"))?;
+    // Each frame's place in thumbs.bin: the frames marked before it.
+    let mut want = Vec::new();
+    let mut n = 0u64;
+    for line in csv.lines().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        let (Some(index), 9) = (f[0].parse::<u64>().ok(), f.len()) else {
+            break;
+        };
+        if index > hi {
+            break;
+        }
+        if f[7] == "1" {
+            if index >= lo {
+                want.push(((index - lo) as usize, n));
+            }
+            n += 1;
+        }
+    }
+    let mut out = vec![None; (hi - lo + 1) as usize];
+    let (Some(&(_, first)), Some(&(_, last))) = (want.first(), want.last()) else {
+        return Ok(out);
+    };
+    let mut f = File::open(dir.join("thumbs.bin"))?;
+    f.seek(io::SeekFrom::Start(first * THUMB as u64))?;
+    let mut bytes = Vec::new();
+    f.take((last - first + 1) * THUMB as u64)
+        .read_to_end(&mut bytes)?;
+    for (slot, k) in want {
+        let at = (k - first) as usize * THUMB;
+        if let Some(t) = bytes.get(at..at + THUMB) {
+            out[slot] = Some(t.try_into().expect("THUMB bytes"));
+        }
+    }
+    Ok(out)
 }
 
 /// The session directory for a run starting now: `caught/<UTC date-time>`
@@ -746,6 +788,49 @@ mod tests {
         let thumbs = fs::read(dir.join("thumbs.bin")).unwrap();
         assert_eq!(thumbs.len(), 3 * THUMB);
         assert_eq!(thumbs[THUMB], 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A follower's thumbnails read back from the files: frames without one
+    /// counted out of thumbs.bin's order, and a line cut short ignored.
+    #[test]
+    fn thumbnails_read_back_from_the_files_by_frame() {
+        let dir = std::env::temp_dir().join(format!("cinefit-thumbs-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut rec = Recorder::start(dir.clone()).unwrap();
+        for i in 0..8u64 {
+            rec.record(Record {
+                index: i,
+                time: i as f64 / 24.0,
+                epoch: 1,
+                content: "tunnel",
+                crop: (0, 0),
+                reading: None,
+                thumb: (i % 3 != 1).then_some([i as u8 * 10; THUMB]),
+                cut: false,
+            });
+        }
+        rec.finish().unwrap();
+        let mut csv = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("frames.csv"))
+            .unwrap();
+        write!(csv, "8,0.33").unwrap();
+        let got = read_thumbs(&dir, 2, 9).unwrap();
+        let first: Vec<Option<u8>> = got.iter().map(|t| t.map(|t| t[0])).collect();
+        assert_eq!(
+            first,
+            [
+                Some(20),
+                Some(30),
+                None,
+                Some(50),
+                Some(60),
+                None,
+                None,
+                None
+            ]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }
