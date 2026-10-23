@@ -25,6 +25,7 @@ use crate::menu::Menu;
 use crate::osd::InfoText;
 use crate::pairfollow;
 use crate::runlog;
+use crate::snapshot;
 use crate::status::{self, Window};
 use crate::times::Times;
 use crate::ui::{Slate, Ui};
@@ -1869,6 +1870,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let (mut dark, mut last_frame_at, mut returns) = (start_key.is_none(), Instant::now(), 0u32);
     let mut next_status = STATUS_EVERY;
     let mut last_source = first_source;
+    // Save frame (#92): asked for, and the writer's answers, written off the
+    // frame loop.
+    let mut save_wanted = false;
+    let (saved_tx, saved_rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
+    let mut last_saved: Option<String> = None;
     let run_started = Instant::now();
     // The loop's errors are held until the summary is written: a run that
     // fails at minute 40 needs its summary more than one that ends on time.
@@ -1944,10 +1950,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 match a {
                     Action::Info => ui.toggle_info(Instant::now()),
                     Action::Back => ui.close_info(),
+                    Action::Save => save_wanted = true,
                     _ => {}
                 }
             }
             if let Some(w) = &web {
+                save_wanted |= w.take_save();
                 for (key, text) in w.take_changes() {
                     // Checked by the server already; a race with another
                     // change can still make one fail, which is logged.
@@ -2099,11 +2107,36 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             "now": now_rows,
                             "settings": crate::web::settings_json(&cfg),
                             "dataset": dataset.state(),
+                            "saved": last_saved,
                         }),
                         &cfg,
                     );
                 }
                 ui.set_info(text);
+            }
+            for r in saved_rx.try_iter() {
+                let t = run_started.elapsed().as_secs_f64();
+                let said = match r {
+                    Ok(dir) => {
+                        info!("{t:.1} s: frame saved to {}", dir.display());
+                        ui.picture(
+                            crate::osd::BannerText {
+                                title: "Frame saved".into(),
+                                detail: dir
+                                    .file_name()
+                                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                            },
+                            false,
+                            Instant::now(),
+                        );
+                        format!("Saved to {}", dir.display())
+                    }
+                    Err(e) => {
+                        warn!("{t:.1} s: frame not saved: {e}");
+                        format!("Not saved: {e}")
+                    }
+                };
+                last_saved = Some(said);
             }
             let taken = if ready.is_none() {
                 mailbox.take_wait(take_timeout)
@@ -2237,6 +2270,68 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let k = classify(&frame, &mut last_tunnel);
                 // What this frame is, resolved once for everything below.
                 let content = Content::of(k.kind, cfg.lldv);
+                if save_wanted && let Some(p) = frame.pixels() {
+                    save_wanted = false;
+                    let info = *frame.info();
+                    let at = run_started.elapsed().as_secs_f64();
+                    let save = snapshot::Save {
+                        info,
+                        // The one copy on this thread; the decoding and the
+                        // writing are the writer's.
+                        bytes: p.bytes().to_vec(),
+                        at,
+                        context: serde_json::json!({
+                            "version": crate::VERSION,
+                            "run_seconds": at,
+                            "content": format!("{content:?}"),
+                            "card": {
+                                "eotf": info.color.eotf.map(|e| e.to_string()),
+                                "colorspace": info.color.colorspace.map(|c| c.to_string()),
+                                "dolby_vision_flagged": info.dolby_vision_flagged,
+                                "dolby_vision_bytes": info.dolby_vision_bytes,
+                            },
+                            "hdr10": info.color.hdr.as_ref().map(snapshot::hdr),
+                            // What low-latency Dolby Vision is taken to be,
+                            // and what HDR10 and the tunnel are mapped into.
+                            "lldv": {
+                                "labelled_lldv": matches!(content, Content::Lldv(_)),
+                                "lldv_nits": cfg.lldv_nits,
+                            },
+                            "mapped_nits": cfg.mapped_nits(),
+                            "crop": format!("{last_source:?}"),
+                            "receiver": last_seen.as_ref().map(|s| serde_json::json!({
+                                "on": s.on,
+                                "input": s.input,
+                                "name": s.name,
+                            })),
+                            "apple_tv": apple_tv.now().map(|np| {
+                                snapshot::apple_tv(
+                                    &np,
+                                    appletv::on_screen(&cfg.atv_input, last_seen.as_ref()),
+                                )
+                            }),
+                            "apple_tv_label": last_playing,
+                            "settings": crate::web::settings_json(&cfg),
+                        }),
+                    };
+                    let tx = saved_tx.clone();
+                    let player = cfg.ub820.clone();
+                    std::thread::spawn(move || {
+                        let mut save = save;
+                        if !player.is_empty() {
+                            save.context["ub820"] = snapshot::ub820(&player);
+                        }
+                        if let Some(t) = snapshot::tunnel(&save.info, &save.bytes) {
+                            save.context["tunnel"] = t;
+                        }
+                        let r = snapshot::default_dir()
+                            .ok_or_else(|| "HOME is not set".to_string())
+                            .and_then(|root| {
+                                snapshot::write(&root, &save).map_err(|e| e.to_string())
+                            });
+                        let _ = tx.send(r);
+                    });
+                }
                 {
                     let info = frame.info();
                     let first = counts.dv_flagged + counts.dv_bytes == 0;

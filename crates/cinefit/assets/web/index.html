@@ -85,6 +85,8 @@
     .wordmark { font-size: 28px; }
   }
   @media (min-width: 1300px) { .now { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  .save { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+  .save .detail { color: var(--secondary); font-size: 14px; overflow-wrap: anywhere; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -93,6 +95,7 @@
   <header><div class="wordmark">cine<span>fit</span></div><div id="pill" class="pill">…</div></header>
   <section id="status">
     <div class="card now" id="now"></div>
+    <div class="save"><button id="save" type="button">Save frame</button><span id="saved" class="detail"></span></div>
   </section>
   <section id="settings">
     <h2>Settings</h2>
@@ -223,7 +226,19 @@ function update(state) {
     if (r && document.activeElement !== r.control) r.control.value = s.value;
   }
   document.getElementById("version").textContent = "cinefit " + (state.version || "");
+  // The last save, as play wrote it (#92).
+  if (state.saved) document.getElementById("saved").textContent = state.saved;
 }
+
+// Save frame (#92): the frame on screen with everything it was shown with, under ~/cinefit-clips/frames.
+document.getElementById("save").onclick = async () => {
+  const out = document.getElementById("saved");
+  out.textContent = "Saving…";
+  try {
+    const r = await fetch("/api/save", { method: "POST" });
+    if (!r.ok) out.textContent = "cinefit refused";
+  } catch (e) { out.textContent = "cinefit did not answer"; }
+};
 
 async function poll() {
   try { update(await (await fetch("/api/state", { cache: "no-store" })).json()); }

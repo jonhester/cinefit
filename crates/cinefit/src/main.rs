@@ -30,6 +30,7 @@ mod record;
 mod replay;
 #[cfg(target_os = "linux")]
 mod runlog;
+mod snapshot;
 mod splitter;
 #[cfg(target_os = "linux")]
 mod status;
