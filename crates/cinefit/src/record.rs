@@ -28,7 +28,7 @@
 //! 0.67 as captured (the same day, a film's low-latency Dolby Vision).
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -228,12 +228,24 @@ fn spawn_zstd(out: &Path) -> std::io::Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    Command::new("sh")
-        .args(["-c", "trap '' TERM; exec zstd -q -1 -T6 -o \"$1\"", "sh"])
+    // A service stop sends TERM to the whole unit; zstd must ignore it and
+    // finish the stream when its input closes. The shell says when its trap
+    // is set, and nothing is written before: a TERM in the moment before the
+    // trap killed the shell, and the next write was a broken pipe.
+    let mut z = Command::new("sh")
+        .args([
+            "-c",
+            "trap '' TERM; echo; exec zstd -q -1 -T6 -o \"$1\" >/dev/null",
+            "sh",
+        ])
         .arg(out)
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .process_group(0)
-        .spawn()
+        .spawn()?;
+    let mut ready = [0u8; 1];
+    z.stdout.take().expect("piped").read_exact(&mut ready)?;
+    Ok(z)
 }
 
 fn write_loop(
