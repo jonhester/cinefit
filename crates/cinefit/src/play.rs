@@ -265,16 +265,35 @@ fn decode_tunnel(info: &FrameInfo, bytes: &[u8]) -> Option<Option<Tunnel>> {
     // No metadata this frame, or offsets on no known scale: a tunnel whose
     // last good conversion still applies.
     let m = tunnel.metadata?;
-    Some(m.conversion().map(|c| Tunnel {
-        color: DoviColor {
-            ycc_to_lms: c.ycc_to_rgb,
-            offset: c.offset,
-            linear: c.rgb_to_lms,
-        },
-        source_min_pq: m.source_min_pq,
-        source_max_pq: m.source_max_pq,
-        scene_max_pq: m.level1.map(|l| l.max_pq),
-        scene_avg_pq: m.level1.map(|l| l.avg_pq),
+    Some(m.conversion().map(|c| {
+        Tunnel {
+            color: DoviColor {
+                ycc_to_lms: c.ycc_to_rgb,
+                offset: c.offset,
+                linear: c.rgb_to_lms,
+            },
+            source_min_pq: m.source_min_pq,
+            source_max_pq: m.source_max_pq,
+            scene_max_pq: m.level1.map(|l| l.max_pq),
+            scene_avg_pq: m.level1.map(|l| l.avg_pq),
+            scene_min_pq: m.level1.map(|l| l.min_pq),
+            trims: m
+                .level2
+                .iter()
+                .map(|t| {
+                    cinefit_render::dm::Trim::from_codes(
+                        t.target_max_pq,
+                        [
+                            t.trim_slope,
+                            t.trim_offset,
+                            t.trim_power,
+                            t.trim_chroma_weight,
+                            t.trim_saturation_gain,
+                        ],
+                    )
+                })
+                .collect(),
+        }
     }))
 }
 
@@ -1159,18 +1178,35 @@ fn draw<'p>(
         Content::Tunnel => {
             let tunnel = tunnel.expect("uploaded only with one");
             let p = sources.planes.as_mut().expect("uploaded");
-            // Into SDR from the grade's own peak: the scene-by-scene metadata
-            // is not used yet, so peak detection is what follows the scene.
-            let map = (out.transfer == Transfer::Bt1886).then(|| Mapping {
-                src_peak: cinefit_dovi::pq_to_nits(tunnel.source_max_pq) as f32,
-                dst_peak: dst.mapped_nits,
-                curve: dst.curve,
-                peak_detect: dst.peak_detect,
-                contrast_recovery: dst.contrast_recovery,
-                peak_percentile: dst.peak_percentile,
-                knee_offset: dst.knee_offset,
-            });
-            pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
+            // Into SDR: Dolby's display mapping, modelled, from the frame's own
+            // metadata, onto the target, then one to one into SDR as the
+            // player's low-latency rendering is.
+            if let (Transfer::Bt1886, Some(scene)) = (out.transfer, tunnel.dm_scene()) {
+                let frame = cinefit_render::dm::Frame::new(&scene, f64::from(dst.mapped_nits));
+                let map = Mapping {
+                    src_peak: dst.mapped_nits,
+                    dst_peak: dst.mapped_nits,
+                    curve: dst.curve,
+                    peak_detect: false,
+                    contrast_recovery: 0.0,
+                    peak_percentile: dst.peak_percentile,
+                    knee_offset: 0.0,
+                };
+                pl.render_dovi_dm(p, &tunnel.color, &frame, dst.tex, out, view, &map)?;
+            } else {
+                // No level 1: from the grade's own peak, with peak detection
+                // to follow the scene.
+                let map = (out.transfer == Transfer::Bt1886).then(|| Mapping {
+                    src_peak: cinefit_dovi::pq_to_nits(tunnel.source_max_pq) as f32,
+                    dst_peak: dst.mapped_nits,
+                    curve: dst.curve,
+                    peak_detect: dst.peak_detect,
+                    contrast_recovery: dst.contrast_recovery,
+                    peak_percentile: dst.peak_percentile,
+                    knee_offset: dst.knee_offset,
+                });
+                pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
+            }
         }
         Content::Rgb(_) => {
             let r = sources.rgb.as_mut().expect("uploaded");
