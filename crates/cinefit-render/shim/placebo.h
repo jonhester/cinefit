@@ -73,9 +73,12 @@ void cf_pl_planes_destroy(cf_pl *pl, cf_pl_planes *planes);
 
 /* Uploads a v210 frame of the planes' size and unpacks it into them on the
  * GPU. row_bytes is the capture card's stride, a multiple of 16 that covers
- * every 16-byte group of six pixels; data holds row_bytes * h bytes. Returns
+ * every 16-byte group of six pixels; data holds row_bytes * h bytes.
+ * chroma_bias, if not NULL, is two floats added to every Cb and Cr code, in
+ * 10-bit codes, as the planes store them (a capture chain's known bias). Returns
  * 0, or -1 with the reason logged. */
-int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size_t row_bytes);
+int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size_t row_bytes,
+                      const float *chroma_bias);
 
 /* Reads the planes back as stored, rows packed: w * h luma samples and
  * ceil(w/2) * h Cb, Cr pairs. For checks. Returns 0, or -1, logged; -1 also

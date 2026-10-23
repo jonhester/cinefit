@@ -325,7 +325,11 @@ void cf_pl_planes_destroy(cf_pl *pl, cf_pl_planes *p) {
  * libplacebo undoes with bit_shift = 6. The names carry a prefix because
  * libplacebo #defines each one over the whole shader. */
 static const char V210_HEADER[] =
-    "float cf_unorm(uint code) { return float(code << 6) / 65535.0; }\n";
+    "float cf_unorm(uint code) { return float(code << 6) / 65535.0; }\n"
+    /* A fraction of a code fits: the planes hold 16 bits, the code in the top 10. */
+    "float cf_unorm_biased(uint code, float bias) {\n"
+    "    return clamp(float(code << 6) + bias * 64.0, 0.0, 65535.0) / 65535.0;\n"
+    "}\n";
 
 static const char V210_BODY[] =
     "ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n"
@@ -347,15 +351,19 @@ static const char V210_BODY[] =
     "        int x = 3 * id.x + i;\n"
     "        if (x < (cf_width + 1) / 2)\n"
     "            imageStore(cf_chroma, ivec2(x, id.y),\n"
-    "                       vec4(cf_unorm(cb[i] & 0x3FFu), cf_unorm(cr[i] & 0x3FFu), 0.0, 1.0));\n"
+    "                       vec4(cf_unorm_biased(cb[i] & 0x3FFu, cf_cb_bias),\n"
+    "                            cf_unorm_biased(cr[i] & 0x3FFu, cf_cr_bias), 0.0, 1.0));\n"
     "    }\n"
     "}\n";
 
 /* Workgroup width; one row of groups per workgroup row. */
 #define V210_LOCAL 64
 
-int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t row_bytes) {
+int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t row_bytes,
+                      const float *chroma_bias) {
     pl_gpu gpu = pl->vk->gpu;
+    float cb_bias = chroma_bias ? chroma_bias[0] : 0.0f;
+    float cr_bias = chroma_bias ? chroma_bias[1] : 0.0f;
     int groups = (p->w + 5) / 6;
     if (row_bytes % 16 || row_bytes < (size_t)groups * 16) {
         log_err(pl, "v210 stride is not a multiple of 16 covering the width");
@@ -405,8 +413,10 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
             { .var = pl_var_int("cf_width"),  .data = &p->w },
             { .var = pl_var_int("cf_height"), .data = &p->h },
             { .var = pl_var_int("cf_groups"), .data = &groups },
+            { .var = pl_var_float("cf_cb_bias"), .data = &cb_bias, .dynamic = true },
+            { .var = pl_var_float("cf_cr_bias"), .data = &cr_bias, .dynamic = true },
         },
-        .num_variables = 3,
+        .num_variables = 5,
     });
     if (!ok) {
         pl_dispatch_abort(pl->dispatch, &sh);

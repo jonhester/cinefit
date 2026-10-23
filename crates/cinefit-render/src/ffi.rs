@@ -147,6 +147,7 @@ unsafe extern "C" {
         planes: *mut Planes,
         data: *const u8,
         row_bytes: usize,
+        chroma_bias: *const f32,
     ) -> c_int;
     pub fn cf_pl_planes_download(
         pl: *mut Handle,
