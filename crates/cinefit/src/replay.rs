@@ -465,12 +465,29 @@ fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
             let v = (f.pixel_format == "v210")
                 .then(|| V210::new(bytes, f.width as u32, f.height as u32, f.row_bytes))
                 .flatten();
-            let Some(v) = v else {
-                skipped += 1;
-                return Ok(());
+            // r210 is read only if it carries a tunnel, as play reads it
+            // (#69); plain RGB still has no adapter.
+            let is_tunnel = f.pixel_format == "r210"
+                && !matches!(
+                    cinefit_dovi::decode(cinefit_dovi::r210_parity(bytes, f.width, f.row_bytes)),
+                    Err(cinefit_dovi::Error::NoPacket { packet: 0 })
+                );
+            let tunnel = is_tunnel
+                .then(|| {
+                    cinefit_detect::Tunnel::new(bytes, f.width as u32, f.height as u32, f.row_bytes)
+                })
+                .flatten()
+                .map(cinefit_detect::TunnelBars);
+            let read: &dyn cinefit_detect::Samples = match (&v, &tunnel) {
+                (Some(v), _) => v,
+                (_, Some(t)) => t,
+                _ => {
+                    skipped += 1;
+                    return Ok(());
+                }
             };
             let t = Instant::now();
-            let (d, obs, cut) = det.push_reading(&v, f.time, epoch);
+            let (d, obs, cut) = det.push_reading(read, f.time, epoch);
             detect_ms.push(t.elapsed().as_secs_f64() * 1000.0);
             run.step(f.frame_number, f.time, &d)?;
             if let Some(w) = saved.as_mut() {

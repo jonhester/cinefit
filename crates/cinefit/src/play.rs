@@ -1022,8 +1022,12 @@ impl CropFinder {
             .filter(|_| matches!(kind, Kind::Ycbcr(_)))
             .and_then(|b| V210::new(b, info.width, info.height, info.row_bytes));
         let peak = v210.as_ref().map(peak_luma);
-        // The tunnel, read for the dataset only: its fingerprint and its
-        // cuts, while recording (#109).
+        // The tunnel: its bars for the detector, in v210's scale (#69), and
+        // for the dataset its fingerprint and cuts, while recording (#109).
+        let bars = bytes
+            .filter(|_| matches!(kind, Kind::Tunnel))
+            .and_then(|b| cinefit_detect::Tunnel::new(b, info.width, info.height, info.row_bytes))
+            .map(cinefit_detect::TunnelBars);
         let tunnel = bytes
             .filter(|_| self.thumbs && matches!(kind, Kind::Tunnel))
             .and_then(|b| cinefit_detect::Tunnel::new(b, info.width, info.height, info.row_bytes));
@@ -1051,9 +1055,9 @@ impl CropFinder {
                 cut: tunnel_cut,
             };
         }
-        // A crop belongs to the picture it was found on: held over RGB or the
-        // tunnel, a scope title's crop would trim whatever followed it. Those
-        // have no adapter yet (#69), so they get the full frame. The detector
+        // A crop belongs to the picture it was found on: held over RGB, a
+        // scope title's crop would trim whatever followed it. RGB has no
+        // adapter yet (#69), so it gets the full frame. The detector
         // itself starts again on the next YCbCr frame: a format change is a
         // new epoch, which resets it.
         if let Some(why) = unread_by_detector(kind) {
@@ -1076,7 +1080,12 @@ impl CropFinder {
         }
         self.unread = false;
         let (mut took, mut change, mut reading, mut candidate) = (None, None, None, false);
-        if let Some(v) = &v210 {
+        let read: Option<&dyn cinefit_detect::Samples> = match (&v210, &bars) {
+            (Some(v), _) => Some(v),
+            (_, Some(b)) => Some(b),
+            _ => None,
+        };
+        if let Some(v) = read {
             let t0 = Instant::now();
             let (d, obs, cut) = self.det.push_reading(v, t, epoch);
             took = Some(ms(t0));
@@ -2796,21 +2805,17 @@ mod tests {
         };
         assert!(top > 0 && bottom > 0, "scope frames never cropped");
 
-        // RGB at a new size, then the tunnel: full frame, and one change
-        // logged for it, not one a frame.
+        // RGB at a new size: full frame, and one change logged for it, not
+        // one a frame.
         let rgb_info = FrameInfo {
             width: 3840,
             height: 2160,
             ..info
         };
         let mut changes = Vec::new();
-        for (i, kind) in [
-            Kind::Rgb(rgb::Format::R210),
-            Kind::Rgb(rgb::Format::R210),
-            Kind::Tunnel,
-        ]
-        .into_iter()
-        .enumerate()
+        for (i, kind) in [Kind::Rgb(rgb::Format::R210), Kind::Rgb(rgb::Format::R210)]
+            .into_iter()
+            .enumerate()
         {
             let found = finder.find(&rgb_info, None, kind, 1.0 + i as f64 / 24.0, 2);
             assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
@@ -2829,6 +2834,59 @@ mod tests {
         });
         let found = finder.find(&info, Some(&full), sdr, 2.0, 3);
         assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
+    }
+
+    #[test]
+    fn a_tunnel_frame_is_cropped_as_its_bars_say() {
+        // A 2.40 picture in a 1080p tunnel frame: full-range luma, bars at 0
+        // and chroma at neutral 2048, packed as HDMI packs 12-bit 4:2:2.
+        let (w, h, bar) = (1920u32, 1080u32, 140u32);
+        let row_bytes = w as usize * 4;
+        let mut bytes = vec![0u8; row_bytes * h as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let hash = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 7;
+                let l = if y < bar || y >= h - bar {
+                    0
+                } else {
+                    (600 + hash % 2400) as u16
+                };
+                let c = 2048u16;
+                let (r, g, b) = (c >> 4, l >> 4, (c & 0xF) << 4 | (l & 0xF));
+                let word = u32::from(r) << 22 | u32::from(g) << 12 | u32::from(b) << 2;
+                let o = y as usize * row_bytes + 4 * x as usize;
+                bytes[o..o + 4].copy_from_slice(&word.to_be_bytes());
+            }
+        }
+        let info = FrameInfo {
+            width: w,
+            height: h,
+            row_bytes,
+            pixel_format: PixelFormat::Rgb10,
+            ..v210(2, 2, |_, _| 64).0
+        };
+        let mut finder = CropFinder {
+            det: Detector::default(),
+            on: true,
+            crops: 0,
+            unread: false,
+            thumbs: false,
+            tunnel_cuts: Default::default(),
+            tunnel_epoch: 0,
+        };
+        let mut found = None;
+        for i in 0..24u32 {
+            found = Some(finder.find(&info, Some(&bytes), Kind::Tunnel, f64::from(i) / 24.0, 1));
+        }
+        let found = found.expect("frames");
+        let geo::Source::Rows { top, bottom } = found.source else {
+            panic!("no rows: {:?}", found.source);
+        };
+        assert!(
+            top.abs_diff(bar) <= 2 && bottom.abs_diff(bar) <= 2,
+            "{top}/{bottom}"
+        );
+        assert!(found.ms.is_some(), "the detector read it");
     }
 
     #[test]
