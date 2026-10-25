@@ -74,7 +74,8 @@ struct Item {
 /// closed once (#230).
 pub struct ClipWriter {
     feed: ClipFeed,
-    thread: JoinHandle<std::io::Result<u64>>,
+    /// Taken by [`ClipWriter::finish`].
+    thread: Option<JoinHandle<std::io::Result<u64>>>,
     dir: PathBuf,
 }
 
@@ -134,7 +135,7 @@ impl ClipWriter {
                 made: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
             })),
-            thread,
+            thread: Some(thread),
             dir: dir.to_owned(),
         })
     }
@@ -150,19 +151,13 @@ impl ClipWriter {
     ///
     /// If writing failed or zstd did not exit cleanly: the clip is then
     /// incomplete, and says so rather than looking whole.
-    pub fn finish(self) -> std::io::Result<Recorded> {
-        let shared = &self.feed.0;
-        drop(
-            shared
-                .tx
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take(),
-        );
-        let written = self
-            .thread
+    pub fn finish(mut self) -> std::io::Result<Recorded> {
+        self.close();
+        let thread = self.thread.take().expect("taken only here, once");
+        let written = thread
             .join()
             .map_err(|_| std::io::Error::other("the clip writer panicked"))??;
+        let shared = &self.feed.0;
         Ok(Recorded {
             written,
             dropped: shared.dropped.load(Ordering::Relaxed),
@@ -171,6 +166,28 @@ impl ClipWriter {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// No more frames: the writer writes what is queued and closes zstd.
+    fn close(&self) {
+        drop(
+            self.feed
+                .0
+                .tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
+/// A writer dropped without [`ClipWriter::finish`] (an early error) still
+/// closes its clip: a feed kept elsewhere would otherwise hold the channel
+/// open, and the writer thread and zstd would wait for frames forever. Not
+/// waited for here: the thread ends on its own.
+impl Drop for ClipWriter {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -1141,6 +1158,37 @@ pub(crate) mod tests {
         assert_eq!((r.written, r.dropped), (3, 0));
         feed.offer(Duration::from_secs(1), &info(16), &[9; 32]);
         assert_eq!(read_index(&dir).expect("index").len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A writer dropped without finish, its feed kept: the clip still
+    // closes, the stream complete, rather than zstd waiting on an open
+    // channel for good.
+    #[test]
+    fn a_dropped_writer_closes_its_clip() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-drop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        let feed = w.feed().clone();
+        feed.offer(Duration::ZERO, &info(16), &[7; 32]);
+        drop(w);
+        let complete = || {
+            Command::new("zstd")
+                .arg("-tq")
+                .arg(dir.join("frames.zst"))
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !complete() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(complete(), "the stream was never finished");
+        drop(feed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
