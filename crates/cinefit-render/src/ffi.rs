@@ -29,6 +29,29 @@ const _: () = assert!(size_of::<Dovi>() == 84);
 const _: () = assert!(offset_of!(Dovi, offset) == 36);
 const _: () = assert!(offset_of!(Dovi, linear) == 48);
 
+/// `cf_pl_dm`.
+#[repr(C)]
+pub struct Dm {
+    pub lut: [f32; crate::dm::LUT_POINTS],
+    pub k1: f32,
+    pub chroma_weight: f32,
+    pub saturation_gain: f32,
+    pub compression: f32,
+    pub tmax: f32,
+    pub cs: [f32; 4],
+    pub hue_s1: f32,
+    pub hue_fix: [f32; 4],
+    pub hue_cmp: [f32; 6],
+}
+
+const _: () = assert!(size_of::<Dm>() == 4180);
+const _: () = assert!(offset_of!(Dm, k1) == 4100);
+const _: () = assert!(offset_of!(Dm, tmax) == 4116);
+const _: () = assert!(offset_of!(Dm, cs) == 4120);
+const _: () = assert!(offset_of!(Dm, hue_s1) == 4136);
+const _: () = assert!(offset_of!(Dm, hue_fix) == 4140);
+const _: () = assert!(offset_of!(Dm, hue_cmp) == 4156);
+
 /// Opaque `cf_pl`.
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -124,6 +147,7 @@ unsafe extern "C" {
         planes: *mut Planes,
         data: *const u8,
         row_bytes: usize,
+        chroma_bias: *const f32,
     ) -> c_int;
     pub fn cf_pl_planes_download(
         pl: *mut Handle,
@@ -160,6 +184,26 @@ unsafe extern "C" {
         place: *const f32,
         map: *const Map,
         src_crop: *const f32,
+    ) -> c_int;
+    pub fn cf_pl_render_dovi_dm(
+        pl: *mut Handle,
+        src: *mut Planes,
+        dovi: *const Dovi,
+        dm: *const Dm,
+        dst: *mut Tex,
+        dst_primaries: c_int,
+        dst_trc: c_int,
+        place: *const f32,
+        map: *const Map,
+        src_crop: *const f32,
+    ) -> c_int;
+    pub fn cf_pl_dm_rgba16(
+        pl: *mut Handle,
+        w: c_int,
+        h: c_int,
+        input: *const u16,
+        dm: *const Dm,
+        out: *mut u16,
     ) -> c_int;
     pub fn cf_pl_rgb_create(pl: *mut Handle, w: c_int, h: c_int) -> *mut Rgb;
     pub fn cf_pl_rgb_destroy(pl: *mut Handle, rgb: *mut Rgb);

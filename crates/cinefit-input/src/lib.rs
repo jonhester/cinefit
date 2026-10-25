@@ -43,6 +43,8 @@ pub enum Action {
     Back,
     Menu,
     Info,
+    /// Save the frame on screen (#92).
+    Save,
 }
 
 impl Action {
@@ -56,6 +58,7 @@ impl Action {
             Action::Back => "back",
             Action::Menu => "menu",
             Action::Info => "info",
+            Action::Save => "save",
         }
     }
 }
@@ -71,6 +74,8 @@ pub fn action_for(key: KeyCode) -> Option<Action> {
         KeyCode::KEY_BACKSPACE | KeyCode::KEY_ESC | KeyCode::KEY_B => Action::Back,
         KeyCode::KEY_C | KeyCode::KEY_M => Action::Menu,
         KeyCode::KEY_I | KeyCode::KEY_D => Action::Info,
+        // S on a keyboard; a remote's button learnt as S (a Flirc's).
+        KeyCode::KEY_S => Action::Save,
         _ => return None,
     })
 }

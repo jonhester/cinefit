@@ -160,12 +160,55 @@ pub fn on_screen(input: &str, seen: Option<&crate::avr::Seen>) -> bool {
     }
 }
 
+/// Apps by bundle ID, for those that send no name with what they play
+/// (#124): the names the theatre's Apple TV lists for its video and music
+/// apps (2026-10-21); any other shows as its ID.
+const APPS: &[(&str, &str)] = &[
+    ("com.apple.TVAirPlay", "AirPlay"),
+    ("com.apple.TVHomeSharing", "Computers"),
+    ("com.apple.TVMusic", "Music"),
+    ("com.apple.TVPhotos", "Photos"),
+    ("com.apple.TVWatchList", "TV"),
+    ("com.apple.podcasts", "Podcasts"),
+    ("com.amazon.aiv.AIVApp", "Prime Video"),
+    ("com.cbsvideo.app", "Paramount+"),
+    ("com.collegehumor.chdropout", "Dropout"),
+    ("com.criterionchannel", "Criterion"),
+    ("com.disney.disneyplus", "Disney+"),
+    ("com.firecore.infuse", "Infuse"),
+    ("com.fxnetworks.ios.FXNOW", "FXNOW"),
+    ("com.google.ios.youtube", "YouTube"),
+    ("com.hulu.plus", "Hulu"),
+    ("com.moviesanywhere.ma", "Movies Anywhere"),
+    ("com.nbcuni.nbc.portal", "NBC"),
+    ("com.netflix.Netflix", "Netflix"),
+    ("com.peacocktv.peacock", "Peacock"),
+    ("com.plexapp.plex", "Plex"),
+    ("com.showtime.standalone", "Showtime"),
+    ("com.spotify.client", "Spotify"),
+    ("com.tcm.tcm", "TCM"),
+    ("com.timewarnercable.simulcast", "Spectrum TV"),
+    ("com.wbd.stream", "HBO Max"),
+    ("org.jellyfin.swiftfin", "Swiftfin"),
+    ("org.pbs.playeripad", "PBS"),
+    ("stream.yattee.app", "Yattee"),
+];
+
+/// The app by the name it sends, else by its bundle ID's known name, else
+/// by the ID itself.
+fn app(np: &NowPlaying) -> Option<&str> {
+    np.app_name.as_deref().or_else(|| {
+        let id = np.app.as_deref()?;
+        Some(APPS.iter().find(|(b, _)| *b == id).map_or(id, |(_, n)| n))
+    })
+}
+
 /// What is playing as one line, for the log and the dataset; `None` when the
 /// app says nothing of it.
 pub fn label(np: &NowPlaying) -> Option<String> {
     let title = np.title.as_deref().filter(|t| !t.is_empty())?;
     let mut parts = Vec::new();
-    if let Some(a) = np.app_name.as_deref().or(np.app.as_deref()) {
+    if let Some(a) = app(np) {
         parts.push(a.to_string());
     }
     if let Some(series) = np.series.as_deref().filter(|s| !s.is_empty()) {
@@ -207,7 +250,7 @@ pub fn section(np: &NowPlaying, now: SystemTime) -> Option<crate::osd::InfoSecti
         _ => title.to_string(),
     };
     let mut detail: Vec<String> = Vec::new();
-    if let Some(a) = np.app_name.as_deref().or(np.app.as_deref()) {
+    if let Some(a) = app(np) {
         detail.push(a.to_string());
     }
     if let (Some(s), Some(e)) = (np.season, np.episode) {
@@ -303,6 +346,31 @@ mod tests {
             section(&song, SystemTime::UNIX_EPOCH).unwrap().line,
             "A Song \u{b7} A Band"
         );
+    }
+
+    /// #124: an app that sends no name is named from its bundle ID, and
+    /// an unknown ID shows as itself; a name it sends wins.
+    #[test]
+    fn an_app_without_a_name_is_named_by_its_id() {
+        let max = NowPlaying {
+            app: Some("com.wbd.stream".into()),
+            app_name: None,
+            ..np()
+        };
+        assert_eq!(label(&max).as_deref(), Some("HBO Max \u{b7} A Film"));
+        let other = NowPlaying {
+            app: Some("org.example.player".into()),
+            ..max.clone()
+        };
+        assert_eq!(
+            label(&other).as_deref(),
+            Some("org.example.player \u{b7} A Film")
+        );
+        let named = NowPlaying {
+            app_name: Some("Max".into()),
+            ..max
+        };
+        assert_eq!(label(&named).as_deref(), Some("Max \u{b7} A Film"));
     }
 
     #[test]

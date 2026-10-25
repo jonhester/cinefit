@@ -88,7 +88,7 @@ impl Content {
 
 /// A decoded tunnel: its conversion, and the grade's range for the output's
 /// static metadata.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Tunnel {
     pub(crate) color: DoviColor,
     pub(crate) source_min_pq: u16,
@@ -99,6 +99,22 @@ pub(crate) struct Tunnel {
     /// This scene's average maxRGB, as a 12-bit PQ code (level 1 `avg_PQ`),
     /// sent as MaxFALL.
     pub(crate) scene_avg_pq: Option<u16>,
+    /// This scene's darkest maxRGB (level 1 `min_PQ`).
+    pub(crate) scene_min_pq: Option<u16>,
+    /// The colourist's trims (level 2), one per target display.
+    pub(crate) trims: Vec<cinefit_render::dm::Trim>,
+}
+
+impl Tunnel {
+    /// What Dolby's display mapping reads from this frame: none without
+    /// level 1, which every frame a UB820 sends carries.
+    pub(crate) fn dm_scene(&self) -> Option<cinefit_render::dm::Scene> {
+        Some(cinefit_render::dm::Scene::from_codes(
+            [self.scene_min_pq?, self.scene_avg_pq?, self.scene_max_pq?],
+            [self.source_min_pq, self.source_max_pq],
+            self.trims.clone(),
+        ))
+    }
 }
 
 /// What the output signals and renders into for an input.
@@ -474,9 +490,8 @@ pub(crate) fn rate_mhz(f: &InputFormat) -> u32 {
 /// reads. Each is a crop change's reason and the info panel's CROP detail.
 pub(crate) fn unread_by_detector(kind: Kind) -> Option<&'static str> {
     match kind {
-        Kind::Ycbcr(_) => None,
+        Kind::Ycbcr(_) | Kind::Tunnel => None,
         Kind::Rgb(_) => Some("the detector does not read RGB"),
-        Kind::Tunnel => Some("the detector does not read the Dolby Vision tunnel"),
         Kind::Unsupported(_) => Some("nothing reads this format"),
     }
 }
@@ -737,6 +752,35 @@ mod tests {
     }
 
     #[test]
+    fn the_display_mapping_reads_level_1_and_the_trims_or_nothing() {
+        let trim = cinefit_render::dm::Trim::from_codes(2081, [2100, 2048, 2048, 2048, 2048]);
+        let t = Tunnel {
+            color: DoviColor {
+                ycc_to_lms: [[0.0; 3]; 3],
+                offset: [0.0; 3],
+                linear: [[0.0; 3]; 3],
+            },
+            source_min_pq: 62,
+            source_max_pq: 3696,
+            scene_max_pq: Some(3079),
+            scene_avg_pq: Some(1200),
+            scene_min_pq: Some(0),
+            trims: vec![trim],
+        };
+        let s = t.dm_scene().expect("level 1");
+        assert_eq!((s.crush, s.clip), (0.0, 3079.0 / 4095.0));
+        assert!((s.mid - 1200.0 / 4095.0).abs() < 1e-12);
+        assert!((s.source_max - 3696.0 / 4095.0).abs() < 1e-12);
+        assert_eq!(s.trims, vec![trim]);
+        // Without level 1 there is no scene to map from.
+        let none = Tunnel {
+            scene_min_pq: None,
+            ..t
+        };
+        assert!(none.dm_scene().is_none());
+    }
+
+    #[test]
     fn a_tunnel_signals_pq_with_its_grade_as_mastering_and_its_scene_as_maxcll() {
         let t = Tunnel {
             color: DoviColor {
@@ -748,6 +792,8 @@ mod tests {
             source_max_pq: 3696,
             scene_max_pq: None,
             scene_avg_pq: None,
+            scene_min_pq: None,
+            trims: Vec::new(),
         };
         let (h, out) = output_for(Content::Tunnel, None, Some(&t));
         let h = h.expect("HDR");
@@ -766,7 +812,7 @@ mod tests {
         // one brighter than the grade is capped at the grade's peak.
         let scene = |pq| Tunnel {
             scene_max_pq: Some(pq),
-            ..t
+            ..t.clone()
         };
         let (h, _) = output_for(Content::Tunnel, None, Some(&scene(3079)));
         assert!((h.expect("HDR").max_cll - 1001.0).abs() < 2.0);

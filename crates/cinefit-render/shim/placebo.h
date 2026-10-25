@@ -73,9 +73,12 @@ void cf_pl_planes_destroy(cf_pl *pl, cf_pl_planes *planes);
 
 /* Uploads a v210 frame of the planes' size and unpacks it into them on the
  * GPU. row_bytes is the capture card's stride, a multiple of 16 that covers
- * every 16-byte group of six pixels; data holds row_bytes * h bytes. Returns
+ * every 16-byte group of six pixels; data holds row_bytes * h bytes.
+ * chroma_bias, if not NULL, is two floats added to every Cb and Cr code, in
+ * 10-bit codes, as the planes store them (a capture chain's known bias). Returns
  * 0, or -1 with the reason logged. */
-int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size_t row_bytes);
+int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *planes, const uint8_t *data, size_t row_bytes,
+                      const float *chroma_bias);
 
 /* Reads the planes back as stored, rows packed: w * h luma samples and
  * ceil(w/2) * h Cb, Cr pairs. For checks. Returns 0, or -1, logged; -1 also
@@ -157,6 +160,34 @@ typedef struct {
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
                       cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
                       const cf_pl_map *map, const float *src_crop);
+
+/* Points in a cf_pl_dm intensity table. */
+#define CF_PL_DM_LUT 1025
+
+/* One frame's Dolby display mapping (src/dm.rs): the intensity table over PQ
+ * 0-1 and the per-pixel constants, in ICtCp. Hue terms in radians. */
+typedef struct {
+    float lut[CF_PL_DM_LUT];
+    float k1, chroma_weight, saturation_gain, compression, tmax;
+    float cs[4];            /* pull on over-bright colour: gain, chroma, power, start */
+    float hue_s1;
+    float hue_fix[4];
+    float hue_cmp[6];
+} cf_pl_dm;
+
+/* As cf_pl_render_dovi, with Dolby's display mapping in place of
+ * libplacebo's: the tunnel to BT.2020 PQ at the source's size, the mapping
+ * applied there, then into dst with map, which should be one to one at the
+ * mapping's target (src_peak = dst_peak). Returns 0, or -1, logged. */
+int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
+                         const cf_pl_dm *dm, cf_pl_tex *dst, int dst_primaries, int dst_trc,
+                         const float *place, const cf_pl_map *map, const float *src_crop);
+
+/* The mapping alone, on w x h BT.2020 PQ RGBA16 pixels (rows packed, alpha
+ * ignored) into out, the same size. For checking the GPU against src/dm.rs.
+ * Returns 0, or -1, logged. */
+int cf_pl_dm_rgba16(cf_pl *pl, int w, int h, const uint16_t *in, const cf_pl_dm *dm,
+                    uint16_t *out);
 
 /* Captured RGB on the GPU: one rgba16 texture, w x h, each component stored
  * as its code shifted to the top of 16 bits (10-bit << 6, 8-bit << 8), plus

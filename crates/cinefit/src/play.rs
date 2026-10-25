@@ -25,6 +25,7 @@ use crate::menu::Menu;
 use crate::osd::InfoText;
 use crate::pairfollow;
 use crate::runlog;
+use crate::snapshot;
 use crate::status::{self, Window};
 use crate::times::Times;
 use crate::ui::{Slate, Ui};
@@ -265,16 +266,35 @@ fn decode_tunnel(info: &FrameInfo, bytes: &[u8]) -> Option<Option<Tunnel>> {
     // No metadata this frame, or offsets on no known scale: a tunnel whose
     // last good conversion still applies.
     let m = tunnel.metadata?;
-    Some(m.conversion().map(|c| Tunnel {
-        color: DoviColor {
-            ycc_to_lms: c.ycc_to_rgb,
-            offset: c.offset,
-            linear: c.rgb_to_lms,
-        },
-        source_min_pq: m.source_min_pq,
-        source_max_pq: m.source_max_pq,
-        scene_max_pq: m.level1.map(|l| l.max_pq),
-        scene_avg_pq: m.level1.map(|l| l.avg_pq),
+    Some(m.conversion().map(|c| {
+        Tunnel {
+            color: DoviColor {
+                ycc_to_lms: c.ycc_to_rgb,
+                offset: c.offset,
+                linear: c.rgb_to_lms,
+            },
+            source_min_pq: m.source_min_pq,
+            source_max_pq: m.source_max_pq,
+            scene_max_pq: m.level1.map(|l| l.max_pq),
+            scene_avg_pq: m.level1.map(|l| l.avg_pq),
+            scene_min_pq: m.level1.map(|l| l.min_pq),
+            trims: m
+                .level2
+                .iter()
+                .map(|t| {
+                    cinefit_render::dm::Trim::from_codes(
+                        t.target_max_pq,
+                        [
+                            t.trim_slope,
+                            t.trim_offset,
+                            t.trim_power,
+                            t.trim_chroma_weight,
+                            t.trim_saturation_gain,
+                        ],
+                    )
+                })
+                .collect(),
+        }
     }))
 }
 
@@ -377,6 +397,54 @@ struct Target<'a, 'p> {
 /// wanted. Each probe reads the display's EDID, so not every frame; a display
 /// coming on is followed within this.
 const MODE_PROBE_EVERY: Duration = Duration::from_secs(5);
+
+/// The output, waiting for a connected display when there is none yet (#177):
+/// at boot the service can start before the display's connector reads
+/// connected. Exiting and letting the service restart came back by itself,
+/// as for a missing mode (#143), but reopened the capture card and wrote a run
+/// log every time. Logged once, probed again every few seconds. Any other
+/// error, and a dry run, still end the run.
+fn wait_for_display(
+    card: Option<&std::path::Path>,
+    dry_run: bool,
+) -> Result<cinefit_kms::Output, Box<dyn Error>> {
+    let out = retry_no_display(
+        || cinefit_kms::Output::open(card),
+        dry_run,
+        MODE_PROBE_EVERY,
+    )?;
+    Ok(out)
+}
+
+/// `open` again every `every` while it says no display is connected; any
+/// other answer, or the first one in a dry run, is the result.
+fn retry_no_display<T>(
+    mut open: impl FnMut() -> Result<T, cinefit_kms::Error>,
+    dry_run: bool,
+    every: Duration,
+) -> Result<T, cinefit_kms::Error> {
+    let mut waiting_since: Option<Instant> = None;
+    loop {
+        match open() {
+            Err(e @ cinefit_kms::Error::NoDisplay) if !dry_run => {
+                if waiting_since.is_none() {
+                    info!("{e}: waiting for one (probing every {} s)", every.as_secs());
+                    waiting_since = Some(Instant::now());
+                }
+            }
+            result => {
+                if let (Ok(_), Some(t)) = (&result, waiting_since) {
+                    info!(
+                        "display connected after {:.0} s of waiting",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                return result;
+            }
+        }
+        std::thread::sleep(every);
+    }
+}
 
 /// The wanted mode, from the modes the output offers, waiting for it when it
 /// is not there yet (#143): a receiver offers only its own 1080p fallback
@@ -559,6 +627,9 @@ struct Dataset {
     source: Option<String>,
     /// What the Apple TV plays, by name, noted in each session (#115).
     playing: Option<String>,
+    /// The input's HDR static metadata, noted in each session: a title's
+    /// MaxCLL, MaxFALL and mastering peak, which its frames do not show.
+    hdr: Option<HdrMetadata>,
     /// Which frames to keep in full (#91), from the first frame recorded.
     picker: Option<dataset::Picker>,
     /// While pairing (#138): the session's recent frames with their
@@ -567,15 +638,23 @@ struct Dataset {
     /// buffers and lag.
     history: std::collections::VecDeque<(u64, Option<[u8; dataset::THUMB]>)>,
     kept: std::collections::BTreeSet<u64>,
-    /// The `detect.pair_follow` in force and its follower; `None` inside
-    /// when there is nothing to follow (another session, frames not held).
-    follow: Option<(String, Option<pairfollow::Follower>)>,
+    /// The `detect.pair_follow` in force and its follower.
+    follow: Option<(String, Following)>,
 }
 
 /// Frames of history held while pairing: 45 minutes at 24p, about 38 MB.
-/// A runner that plays every chapter's tunnel pass first and the low-latency
-/// ones after needs the whole run's.
+/// Older frames are read back from the session's files (#160): a clips run
+/// of 23 chapters and four passes plays its last pass more than an hour after
+/// the tunnel's.
 const HISTORY: usize = 1 << 16;
+
+/// A follower, or the thumbnails it needs still being read from disk.
+enum Following {
+    /// `None` when there is nothing to follow (another session, frames not
+    /// recorded), said why when it was made.
+    Ready(Option<Box<pairfollow::Follower>>),
+    Reading(std::sync::mpsc::Receiver<Option<Box<pairfollow::Follower>>>),
+}
 
 /// The signal gone this long ends a viewing: the dataset's session closes,
 /// and the next frame opens a new one. Short drops (a player changing HDR or
@@ -623,6 +702,9 @@ impl Dataset {
                     }
                     if let Some(p) = &self.playing {
                         r.note(&format!("playing: {p}"));
+                    }
+                    if let Some(h) = &self.hdr {
+                        r.note(&hdr_line(h));
                     }
                     self.recorder = Some(r);
                 }
@@ -739,7 +821,22 @@ impl Dataset {
             let f = self.follower(spec);
             self.follow = Some((spec.to_string(), f));
         }
-        let fl = self.follow.as_mut()?.1.as_mut()?;
+        let following = &mut self.follow.as_mut()?.1;
+        if let Following::Reading(rx) = following {
+            // Frames go by unfollowed while the thumbnails are read, tens of
+            // milliseconds: a runner sets the follow seconds before the
+            // tunnel's first kept frame.
+            match rx.try_recv() {
+                Ok(f) => *following = Following::Ready(f),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *following = Following::Ready(None)
+                }
+            }
+        }
+        let Following::Ready(Some(fl)) = following else {
+            return None;
+        };
         let s = fl.step(index, thumb);
         match s.event {
             Some(pairfollow::Event::Locked(d)) => {
@@ -758,9 +855,55 @@ impl Dataset {
         s.keep.then_some("follow")
     }
 
-    /// The follower `spec` asks for, from the history: `None`, said why,
-    /// when it names another session or frames no longer held.
-    fn follower(&self, spec: &str) -> Option<pairfollow::Follower> {
+    /// The follower `spec` asks for: from the history, or for frames older
+    /// than it from the session's files, on a thread of its own so the frame
+    /// loop does not wait on the disk.
+    fn follower(&self, spec: &str) -> Following {
+        let Some((lo, hi)) = self.follow_range(spec) else {
+            return Following::Ready(None);
+        };
+        let kept = self.kept.range(lo..=hi).copied().collect();
+        let dir = self.recorder.as_ref().map(|r| r.dir().to_path_buf());
+        match (self.history.front(), dir) {
+            (Some(&(front, _)), _) if lo >= front => {
+                let held = |i: u64| {
+                    self.history
+                        .binary_search_by_key(&i, |h| h.0)
+                        .ok()
+                        .and_then(|k| self.history[k].1)
+                };
+                let thumbs: Vec<_> = (lo..=hi).map(held).collect();
+                Following::Ready(make_follower(lo, hi, &thumbs, kept, "held").map(Box::new))
+            }
+            (_, Some(dir)) => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let spawned = std::thread::Builder::new()
+                    .name("pair-follow".into())
+                    .spawn(move || {
+                        let f = match dataset::read_thumbs(&dir, lo, hi) {
+                            Ok(thumbs) => make_follower(lo, hi, &thumbs, kept, "on disk").map(Box::new),
+                            Err(e) => {
+                                warn!("pair follow: frames {lo}-{hi}: reading thumbnails: {e}: keeping nothing");
+                                None
+                            }
+                        };
+                        let _ = tx.send(f);
+                    });
+                match spawned {
+                    Ok(_) => Following::Reading(rx),
+                    Err(e) => {
+                        warn!("pair follow: no thread to read thumbnails: {e}: keeping nothing");
+                        Following::Ready(None)
+                    }
+                }
+            }
+            (_, None) => Following::Ready(None),
+        }
+    }
+
+    /// The frames `spec` names, when it is well formed and names the open
+    /// session: `None`, said why, otherwise.
+    fn follow_range(&self, spec: &str) -> Option<(u64, u64)> {
         let open = self
             .recorder
             .as_ref()
@@ -793,26 +936,7 @@ impl Dataset {
             );
             return None;
         }
-        let held = |i: u64| {
-            self.history
-                .binary_search_by_key(&i, |h| h.0)
-                .ok()
-                .and_then(|k| self.history[k].1)
-        };
-        let thumbs: Vec<_> = (lo..=hi).map(held).collect();
-        let have = thumbs.iter().filter(|t| t.is_some()).count();
-        if have == 0 {
-            warn!("pair follow: no thumbnails held for frames {lo}-{hi}: keeping nothing");
-            return None;
-        }
-        let kept = self.kept.range(lo..=hi).copied().collect();
-        let fl = pairfollow::Follower::new(lo, &thumbs, kept);
-        info!(
-            "pair follow: following frames {lo}-{hi}: {have} thumbnails of {}, {} kept",
-            thumbs.len(),
-            fl.size().1
-        );
-        Some(fl)
+        Some((lo, hi))
     }
 
     /// The receiver's input changed: noted in the open session, and in
@@ -825,6 +949,18 @@ impl Dataset {
             r.note(&format!("at {t:.1} s, source: {s}"));
         }
         self.source = source;
+    }
+
+    /// The input's HDR metadata changed: noted in the open session, and in
+    /// every session opened after.
+    fn set_hdr(&mut self, hdr: Option<HdrMetadata>, t: f64) {
+        if hdr == self.hdr {
+            return;
+        }
+        if let (Some(r), Some(h)) = (&self.recorder, &hdr) {
+            r.note(&format!("at {t:.1} s, {}", hdr_line(h)));
+        }
+        self.hdr = hdr;
     }
 
     /// What the Apple TV plays changed: noted in the open session, and in
@@ -899,6 +1035,29 @@ impl Dataset {
     }
 }
 
+/// A follower of frames `lo..=hi` from their thumbnails (`whence`, for the
+/// log): `None`, said why, when none of them has one.
+fn make_follower(
+    lo: u64,
+    hi: u64,
+    thumbs: &[Option<[u8; dataset::THUMB]>],
+    kept: std::collections::BTreeSet<u64>,
+    whence: &str,
+) -> Option<pairfollow::Follower> {
+    let have = thumbs.iter().filter(|t| t.is_some()).count();
+    if have == 0 {
+        warn!("pair follow: no thumbnails {whence} for frames {lo}-{hi}: keeping nothing");
+        return None;
+    }
+    let fl = pairfollow::Follower::new(lo, thumbs, kept);
+    info!(
+        "pair follow: following frames {lo}-{hi}: {have} thumbnails {whence} of {}, {} kept",
+        thumbs.len(),
+        fl.size().1
+    );
+    Some(fl)
+}
+
 impl CropFinder {
     fn find(
         &mut self,
@@ -912,8 +1071,12 @@ impl CropFinder {
             .filter(|_| matches!(kind, Kind::Ycbcr(_)))
             .and_then(|b| V210::new(b, info.width, info.height, info.row_bytes));
         let peak = v210.as_ref().map(peak_luma);
-        // The tunnel, read for the dataset only: its fingerprint and its
-        // cuts, while recording (#109).
+        // The tunnel: its bars for the detector, in v210's scale (#69), and
+        // for the dataset its fingerprint and cuts, while recording (#109).
+        let bars = bytes
+            .filter(|_| matches!(kind, Kind::Tunnel))
+            .and_then(|b| cinefit_detect::Tunnel::new(b, info.width, info.height, info.row_bytes))
+            .map(cinefit_detect::TunnelBars);
         let tunnel = bytes
             .filter(|_| self.thumbs && matches!(kind, Kind::Tunnel))
             .and_then(|b| cinefit_detect::Tunnel::new(b, info.width, info.height, info.row_bytes));
@@ -941,9 +1104,9 @@ impl CropFinder {
                 cut: tunnel_cut,
             };
         }
-        // A crop belongs to the picture it was found on: held over RGB or the
-        // tunnel, a scope title's crop would trim whatever followed it. Those
-        // have no adapter yet (#69), so they get the full frame. The detector
+        // A crop belongs to the picture it was found on: held over RGB, a
+        // scope title's crop would trim whatever followed it. RGB has no
+        // adapter yet (#69), so it gets the full frame. The detector
         // itself starts again on the next YCbCr frame: a format change is a
         // new epoch, which resets it.
         if let Some(why) = unread_by_detector(kind) {
@@ -966,7 +1129,12 @@ impl CropFinder {
         }
         self.unread = false;
         let (mut took, mut change, mut reading, mut candidate) = (None, None, None, false);
-        if let Some(v) = &v210 {
+        let read: Option<&dyn cinefit_detect::Samples> = match (&v210, &bars) {
+            (Some(v), _) => Some(v),
+            (_, Some(b)) => Some(b),
+            _ => None,
+        };
+        if let Some(v) = read {
             let t0 = Instant::now();
             let (d, obs, cut) = self.det.push_reading(v, t, epoch);
             took = Some(ms(t0));
@@ -1007,6 +1175,7 @@ fn detect_and_upload<'p>(
     finder: &mut CropFinder,
     frame: &Frame,
     kind: Kind,
+    lldv: bool,
     tunnel: Option<&Tunnel>,
     sources: &mut Sources<'p>,
     stages: &mut Stages,
@@ -1021,7 +1190,7 @@ fn detect_and_upload<'p>(
         // A thread a frame: starting one costs tens of microseconds, against
         // the milliseconds the detector takes.
         let worker = s.spawn(|| finder.find(&info, Some(bytes), kind, at.0, at.1));
-        let uploaded = upload(pl, &info, bytes, kind, tunnel, sources, stages);
+        let uploaded = upload(pl, &info, bytes, kind, lldv, tunnel, sources, stages);
         let found = worker
             .join()
             .unwrap_or_else(|e| std::panic::resume_unwind(e));
@@ -1029,15 +1198,25 @@ fn detect_and_upload<'p>(
     })
 }
 
+/// The capture chain's chroma bias on low-latency Dolby Vision, in 10-bit
+/// codes added back to Cb and Cr in the unpack: they arrive about 0.625 and
+/// 0.40 of a code low on every film and target measured, against
+/// independent decodes of the same frames (#146). Not Dolby's mapping, which
+/// would vary with the target; the mechanism is not proven. Luma shows no
+/// bias that can be told apart from Dolby's mapping, so it is left alone.
+const LLDV_CHROMA_BIAS: [f32; 2] = [0.625, 0.40];
+
 /// The first half of a frame: its bytes into the GPU, unpacked into planes
 /// (copy and unpack). Needs nothing from the detector, so it runs while the
 /// detector reads the same bytes on another thread. `false` for what nothing
-/// renders.
+/// renders. `lldv` is the `input.lldv` setting.
+#[allow(clippy::too_many_arguments)]
 fn upload<'p>(
     pl: &'p Placebo,
     info: &FrameInfo,
     bytes: &[u8],
     kind: Kind,
+    lldv: bool,
     tunnel: Option<&Tunnel>,
     sources: &mut Sources<'p>,
     stages: &mut Stages,
@@ -1060,7 +1239,11 @@ fn upload<'p>(
             if kind == Kind::Tunnel {
                 pl.unpack_tunnel(p, bytes, info.row_bytes)?;
             } else {
-                pl.unpack_v210(p, bytes, info.row_bytes)?;
+                // The chain's bias on low-latency Dolby Vision only: the
+                // rest has not been measured to carry it.
+                let bias =
+                    matches!(Content::of(kind, lldv), Content::Lldv(_)).then_some(LLDV_CHROMA_BIAS);
+                pl.unpack_v210_biased(p, bytes, info.row_bytes, bias)?;
             }
         }
         Kind::Rgb(format) => {
@@ -1159,18 +1342,35 @@ fn draw<'p>(
         Content::Tunnel => {
             let tunnel = tunnel.expect("uploaded only with one");
             let p = sources.planes.as_mut().expect("uploaded");
-            // Into SDR from the grade's own peak: the scene-by-scene metadata
-            // is not used yet, so peak detection is what follows the scene.
-            let map = (out.transfer == Transfer::Bt1886).then(|| Mapping {
-                src_peak: cinefit_dovi::pq_to_nits(tunnel.source_max_pq) as f32,
-                dst_peak: dst.mapped_nits,
-                curve: dst.curve,
-                peak_detect: dst.peak_detect,
-                contrast_recovery: dst.contrast_recovery,
-                peak_percentile: dst.peak_percentile,
-                knee_offset: dst.knee_offset,
-            });
-            pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
+            // Into SDR: Dolby's display mapping, modelled, from the frame's own
+            // metadata, onto the target, then one to one into SDR as the
+            // player's low-latency rendering is.
+            if let (Transfer::Bt1886, Some(scene)) = (out.transfer, tunnel.dm_scene()) {
+                let frame = cinefit_render::dm::Frame::new(&scene, f64::from(dst.mapped_nits));
+                let map = Mapping {
+                    src_peak: dst.mapped_nits,
+                    dst_peak: dst.mapped_nits,
+                    curve: dst.curve,
+                    peak_detect: false,
+                    contrast_recovery: 0.0,
+                    peak_percentile: dst.peak_percentile,
+                    knee_offset: 0.0,
+                };
+                pl.render_dovi_dm(p, &tunnel.color, &frame, dst.tex, out, view, &map)?;
+            } else {
+                // No level 1: from the grade's own peak, with peak detection
+                // to follow the scene.
+                let map = (out.transfer == Transfer::Bt1886).then(|| Mapping {
+                    src_peak: cinefit_dovi::pq_to_nits(tunnel.source_max_pq) as f32,
+                    dst_peak: dst.mapped_nits,
+                    curve: dst.curve,
+                    peak_detect: dst.peak_detect,
+                    contrast_recovery: dst.contrast_recovery,
+                    peak_percentile: dst.peak_percentile,
+                    knee_offset: dst.knee_offset,
+                });
+                pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
+            }
         }
         Content::Rgb(_) => {
             let r = sources.rgb.as_mut().expect("uploaded");
@@ -1346,7 +1546,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
 
     // The output: the panel at the source's own rate, signalling chosen from
     // the source, in one commit.
-    let mut out = cinefit_kms::Output::open(opts.card.as_deref())?;
+    let mut out = wait_for_display(opts.card.as_deref(), opts.dry_run)?;
     info!("output: {}", out.describe());
     let want = cinefit_kms::ModeRequest {
         width: cfg.width,
@@ -1409,11 +1609,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             }
         }
     } else {
-        info!("gpu clocks: default policy (--no-pstate)");
+        info!("gpu clocks: the driver's default policy");
         None
     };
     // Only a hold taken at startup is given back and taken again: one refused
-    // then (another holder, --no-pstate) stays refused for the run.
+    // then (another holder), or not asked for, stays as it is for the run.
     let holds_clocks = clocks.is_some();
 
     let pl = Placebo::new()?;
@@ -1553,6 +1753,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 &mut finder,
                 first,
                 key.kind,
+                cfg.lldv,
                 last_tunnel.as_ref(),
                 &mut sources,
                 &mut stages,
@@ -1735,6 +1936,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let (mut dark, mut last_frame_at, mut returns) = (start_key.is_none(), Instant::now(), 0u32);
     let mut next_status = STATUS_EVERY;
     let mut last_source = first_source;
+    // Save frame (#92): asked for, and the writer's answers, written off the
+    // frame loop.
+    let mut save_wanted = false;
+    let (saved_tx, saved_rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
+    let mut last_saved: Option<String> = None;
     let run_started = Instant::now();
     // The loop's errors are held until the summary is written: a run that
     // fails at minute 40 needs its summary more than one that ends on time.
@@ -1810,10 +2016,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 match a {
                     Action::Info => ui.toggle_info(Instant::now()),
                     Action::Back => ui.close_info(),
+                    Action::Save => save_wanted = true,
                     _ => {}
                 }
             }
             if let Some(w) = &web {
+                save_wanted |= w.take_save();
                 for (key, text) in w.take_changes() {
                     // Checked by the server already; a race with another
                     // change can still make one fail, which is logged.
@@ -1965,11 +2173,36 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             "now": now_rows,
                             "settings": crate::web::settings_json(&cfg),
                             "dataset": dataset.state(),
+                            "saved": last_saved,
                         }),
                         &cfg,
                     );
                 }
                 ui.set_info(text);
+            }
+            for r in saved_rx.try_iter() {
+                let t = run_started.elapsed().as_secs_f64();
+                let said = match r {
+                    Ok(dir) => {
+                        info!("{t:.1} s: frame saved to {}", dir.display());
+                        ui.picture(
+                            crate::osd::BannerText {
+                                title: "Frame saved".into(),
+                                detail: dir
+                                    .file_name()
+                                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                            },
+                            false,
+                            Instant::now(),
+                        );
+                        format!("Saved to {}", dir.display())
+                    }
+                    Err(e) => {
+                        warn!("{t:.1} s: frame not saved: {e}");
+                        format!("Not saved: {e}")
+                    }
+                };
+                last_saved = Some(said);
             }
             let taken = if ready.is_none() {
                 mailbox.take_wait(take_timeout)
@@ -2106,6 +2339,68 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let k = classify(&frame, &mut last_tunnel);
                 // What this frame is, resolved once for everything below.
                 let content = Content::of(k.kind, cfg.lldv);
+                if save_wanted && let Some(p) = frame.pixels() {
+                    save_wanted = false;
+                    let info = *frame.info();
+                    let at = run_started.elapsed().as_secs_f64();
+                    let save = snapshot::Save {
+                        info,
+                        // The one copy on this thread; the decoding and the
+                        // writing are the writer's.
+                        bytes: p.bytes().to_vec(),
+                        at,
+                        context: serde_json::json!({
+                            "version": crate::VERSION,
+                            "run_seconds": at,
+                            "content": format!("{content:?}"),
+                            "card": {
+                                "eotf": info.color.eotf.map(|e| e.to_string()),
+                                "colorspace": info.color.colorspace.map(|c| c.to_string()),
+                                "dolby_vision_flagged": info.dolby_vision_flagged,
+                                "dolby_vision_bytes": info.dolby_vision_bytes,
+                            },
+                            "hdr10": info.color.hdr.as_ref().map(snapshot::hdr),
+                            // What low-latency Dolby Vision is taken to be,
+                            // and what HDR10 and the tunnel are mapped into.
+                            "lldv": {
+                                "labelled_lldv": matches!(content, Content::Lldv(_)),
+                                "lldv_nits": cfg.lldv_nits,
+                            },
+                            "mapped_nits": cfg.mapped_nits(),
+                            "crop": format!("{last_source:?}"),
+                            "receiver": last_seen.as_ref().map(|s| serde_json::json!({
+                                "on": s.on,
+                                "input": s.input,
+                                "name": s.name,
+                            })),
+                            "apple_tv": apple_tv.now().map(|np| {
+                                snapshot::apple_tv(
+                                    &np,
+                                    appletv::on_screen(&cfg.atv_input, last_seen.as_ref()),
+                                )
+                            }),
+                            "apple_tv_label": last_playing,
+                            "settings": crate::web::settings_json(&cfg),
+                        }),
+                    };
+                    let tx = saved_tx.clone();
+                    let player = cfg.ub820.clone();
+                    std::thread::spawn(move || {
+                        let mut save = save;
+                        if !player.is_empty() {
+                            save.context["ub820"] = snapshot::ub820(&player);
+                        }
+                        if let Some(t) = snapshot::tunnel(&save.info, &save.bytes) {
+                            save.context["tunnel"] = t;
+                        }
+                        let r = snapshot::default_dir()
+                            .ok_or_else(|| "HOME is not set".to_string())
+                            .and_then(|root| {
+                                snapshot::write(&root, &save).map_err(|e| e.to_string())
+                            });
+                        let _ = tx.send(r);
+                    });
+                }
                 {
                     let info = frame.info();
                     let first = counts.dv_flagged + counts.dv_bytes == 0;
@@ -2222,12 +2517,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         &mut finder,
                         &frame,
                         k.kind,
+                        cfg.lldv,
                         last_tunnel.as_ref(),
                         &mut sources,
                         &mut stages,
                         (t, epoch),
                     )?;
                     noted(&found, &frame_info, t);
+                    dataset.set_hdr(frame_info.color.hdr, t);
                     dataset.record(cfg.record, &found, t, epoch, content);
                     dataset.keep(&cfg, &found, t, &frame);
                     let source = found.source;
@@ -2559,9 +2856,58 @@ fn hdr_note(hdr: Option<&HdrMetadata>) -> String {
     )
 }
 
+/// HDR metadata for a session's notes, every value or "unreported".
+fn hdr_line(h: &HdrMetadata) -> String {
+    let n = |v: Option<f64>, d: usize| v.map_or("unreported".to_string(), |v| format!("{v:.d$}"));
+    format!(
+        "HDR metadata: MaxCLL {}, MaxFALL {}, mastering {}-{} nits",
+        n(h.max_cll, 0),
+        n(h.max_fall, 0),
+        n(h.min_mastering, 4),
+        n(h.max_mastering, 0)
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_display_is_waited_for() {
+        use cinefit_kms::Error as Kms;
+        // Two refusals, then a display: the third answer is the result.
+        let mut answers = vec![Ok(7), Err(Kms::NoDisplay), Err(Kms::NoDisplay)];
+        let got = retry_no_display(|| answers.pop().unwrap(), false, Duration::ZERO);
+        assert_eq!(got.ok(), Some(7));
+        assert!(answers.is_empty());
+        // A dry run does not wait.
+        let mut answers = vec![Ok(7), Err(Kms::NoDisplay)];
+        let got = retry_no_display(|| answers.pop().unwrap(), true, Duration::ZERO);
+        assert!(matches!(got, Err(Kms::NoDisplay)));
+        // Any other error ends it at once.
+        let mut answers = vec![Ok(7), Err(Kms::NoCrtc)];
+        let got = retry_no_display(|| answers.pop().unwrap(), false, Duration::ZERO);
+        assert!(matches!(got, Err(Kms::NoCrtc)));
+    }
+
     use super::*;
+
+    /// A session's HDR note keeps an unreported value apart from zero.
+    #[test]
+    fn the_hdr_note_says_what_was_not_reported() {
+        let h = HdrMetadata {
+            red: None,
+            green: None,
+            blue: None,
+            white: None,
+            max_mastering: Some(1000.0),
+            min_mastering: Some(0.0001),
+            max_cll: Some(1445.0),
+            max_fall: None,
+        };
+        assert_eq!(
+            hdr_line(&h),
+            "HDR metadata: MaxCLL 1445, MaxFALL unreported, mastering 0.0001-1000 nits"
+        );
+    }
 
     /// A v210 frame, 10-bit luma by row and column, neutral chroma: what the
     /// detector reads, without the capture card.
@@ -2635,21 +2981,17 @@ mod tests {
         };
         assert!(top > 0 && bottom > 0, "scope frames never cropped");
 
-        // RGB at a new size, then the tunnel: full frame, and one change
-        // logged for it, not one a frame.
+        // RGB at a new size: full frame, and one change logged for it, not
+        // one a frame.
         let rgb_info = FrameInfo {
             width: 3840,
             height: 2160,
             ..info
         };
         let mut changes = Vec::new();
-        for (i, kind) in [
-            Kind::Rgb(rgb::Format::R210),
-            Kind::Rgb(rgb::Format::R210),
-            Kind::Tunnel,
-        ]
-        .into_iter()
-        .enumerate()
+        for (i, kind) in [Kind::Rgb(rgb::Format::R210), Kind::Rgb(rgb::Format::R210)]
+            .into_iter()
+            .enumerate()
         {
             let found = finder.find(&rgb_info, None, kind, 1.0 + i as f64 / 24.0, 2);
             assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
@@ -2668,6 +3010,59 @@ mod tests {
         });
         let found = finder.find(&info, Some(&full), sdr, 2.0, 3);
         assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
+    }
+
+    #[test]
+    fn a_tunnel_frame_is_cropped_as_its_bars_say() {
+        // A 2.40 picture in a 1080p tunnel frame: full-range luma, bars at 0
+        // and chroma at neutral 2048, packed as HDMI packs 12-bit 4:2:2.
+        let (w, h, bar) = (1920u32, 1080u32, 140u32);
+        let row_bytes = w as usize * 4;
+        let mut bytes = vec![0u8; row_bytes * h as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let hash = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 7;
+                let l = if y < bar || y >= h - bar {
+                    0
+                } else {
+                    (600 + hash % 2400) as u16
+                };
+                let c = 2048u16;
+                let (r, g, b) = (c >> 4, l >> 4, (c & 0xF) << 4 | (l & 0xF));
+                let word = u32::from(r) << 22 | u32::from(g) << 12 | u32::from(b) << 2;
+                let o = y as usize * row_bytes + 4 * x as usize;
+                bytes[o..o + 4].copy_from_slice(&word.to_be_bytes());
+            }
+        }
+        let info = FrameInfo {
+            width: w,
+            height: h,
+            row_bytes,
+            pixel_format: PixelFormat::Rgb10,
+            ..v210(2, 2, |_, _| 64).0
+        };
+        let mut finder = CropFinder {
+            det: Detector::default(),
+            on: true,
+            crops: 0,
+            unread: false,
+            thumbs: false,
+            tunnel_cuts: Default::default(),
+            tunnel_epoch: 0,
+        };
+        let mut found = None;
+        for i in 0..24u32 {
+            found = Some(finder.find(&info, Some(&bytes), Kind::Tunnel, f64::from(i) / 24.0, 1));
+        }
+        let found = found.expect("frames");
+        let geo::Source::Rows { top, bottom } = found.source else {
+            panic!("no rows: {:?}", found.source);
+        };
+        assert!(
+            top.abs_diff(bar) <= 2 && bottom.abs_diff(bar) <= 2,
+            "{top}/{bottom}"
+        );
+        assert!(found.ms.is_some(), "the detector read it");
     }
 
     #[test]

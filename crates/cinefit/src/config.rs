@@ -112,6 +112,8 @@ pub struct Config {
     /// The receiver input the Apple TV is on, by its name or code; empty
     /// for any.
     pub atv_input: String,
+    /// The Panasonic UB820: a hostname or an IP address; empty for none.
+    pub ub820: String,
     /// A banner on each change of picture type.
     pub banners: bool,
     /// The web page's port on the home network; 0 for none.
@@ -211,6 +213,7 @@ impl Default for Config {
             denon: String::new(),
             atv_host: String::new(),
             atv_input: String::new(),
+            ub820: String::new(),
             banners: true,
             web_port: 8080,
         }
@@ -611,7 +614,7 @@ static SETTINGS: &[Setting] = &[
         key: "avr.denon",
         kind: Kind::Text { max: 253 },
         apply: Apply::Live,
-        help: "The Denon receiver, by hostname or IP address (for example 10.42.1.172): cinefit reads which \
+        help: "The Denon receiver, by hostname or IP address (for example 192.168.1.20): cinefit reads which \
                input is on, by its name on the receiver, and whether the receiver is on, for the info panel, the \
                slate and the detector's dataset. Reads only. Empty: none.",
         get: |c| Value::Name(c.denon.clone()),
@@ -638,6 +641,16 @@ static SETTINGS: &[Setting] = &[
                Empty: always, as without a receiver.",
         get: |c| Value::Name(c.atv_input.clone()),
         set: Set::Name(|c, v| c.atv_input = v.trim().to_string()),
+    },
+    Setting {
+        key: "player.ub820",
+        kind: Kind::Text { max: 253 },
+        apply: Apply::Live,
+        help: "The Panasonic UB820, by hostname or IP address: cinefit reads whether it is playing and where in \
+               the title, kept with a saved frame. Reads only; the player's Voice Control must be on (Setup > \
+               Network). Empty: none.",
+        get: |c| Value::Name(c.ub820.clone()),
+        set: Set::Name(|c, v| c.ub820 = v.trim().to_string()),
     },
     Setting {
         key: "web.port",
