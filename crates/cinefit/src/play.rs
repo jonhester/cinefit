@@ -735,7 +735,8 @@ struct Dataset {
     /// judged in hindsight (#91) when the input goes dark, at the end of the
     /// run, or every [`JUDGE_EVERY`] frames at a cut.
     pending: Vec<(cinefit_detect::readings::Reading, (u32, u32))>,
-    judging: Option<std::thread::JoinHandle<()>>,
+    /// Judging and closing sessions, off the play loop (#208).
+    worker: Worker,
     /// The receiver's input by name, noted in each session (#116).
     source: Option<String>,
     /// What the Apple TV plays, by name, noted in each session (#115).
@@ -1106,34 +1107,29 @@ impl Dataset {
         }
         let rest = self.pending.split_off(keep_from);
         let batch = std::mem::replace(&mut self.pending, rest);
-        // One at a time, so the file's shots stay in order.
-        if let Some(previous) = self.judging.take() {
-            let _ = previous.join();
-        }
-        self.judging = std::thread::Builder::new()
-            .name("hindsight".into())
-            .spawn(move || match crate::hindsight::append(&dir, &batch) {
+        // On the one worker, in order, so the file's shots stay in order.
+        self.worker.run(Box::new(move || {
+            match crate::hindsight::append(&dir, &batch) {
                 Ok(summary) => info!("hindsight: {summary}"),
                 Err(e) => warn!("hindsight: not written: {e}"),
-            })
-            .ok();
+            }
+        }));
     }
 
     /// Ends the viewing: the last judging, then its session closed. The next
     /// frame recorded opens a new one.
     fn end_session(&mut self) {
         self.judge(true);
-        if let Some(j) = self.judging.take() {
-            let _ = j.join();
-        }
         self.next = 0;
         self.picker = None;
         // Frame numbers start again in the next session.
         self.history.clear();
         self.kept.clear();
         self.follow = None;
+        // Closed after its last judging, on the same worker: flushing and
+        // closing zstd takes as long as it takes, off the loop.
         if let Some(r) = self.recorder.take() {
-            match r.finish() {
+            self.worker.run(Box::new(move || match r.finish() {
                 Ok(s) => info!(
                     "dataset: {} frames recorded to {}, {} dropped; {} full frames kept, {} dropped",
                     s.frames,
@@ -1143,9 +1139,78 @@ impl Dataset {
                     s.kept_dropped
                 ),
                 Err(e) => warn!("dataset: writing failed: {e}"),
-            }
+            }));
         }
     }
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The dataset's background work on one thread, in the order it was handed
+/// over (#208): judging a session's readings, then closing it. The play loop
+/// hands each job over and goes on; only the end of the run waits, for what
+/// is queued. Started with the first job, so a run without research capture
+/// has no thread.
+#[derive(Default)]
+struct Worker {
+    tx: Option<std::sync::mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// The thread could not be started: jobs run where they are handed over.
+    inline: bool,
+}
+
+impl Worker {
+    fn run(&mut self, job: Job) {
+        if self.tx.is_none() && !self.inline {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            match std::thread::Builder::new()
+                .name("dataset".into())
+                .spawn(move || rx.into_iter().for_each(caught))
+            {
+                Ok(t) => (self.tx, self.thread) = (Some(tx), Some(t)),
+                Err(e) => {
+                    warn!("dataset: no worker thread ({e}): judging and closing on the play loop");
+                    self.inline = true;
+                }
+            }
+        }
+        match &self.tx {
+            Some(tx) => {
+                if let Err(std::sync::mpsc::SendError(job)) = tx.send(job) {
+                    // The worker is gone: done here rather than lost.
+                    caught(job);
+                }
+            }
+            None => caught(job),
+        }
+    }
+}
+
+/// Runs a job, saying so if it panics: the next one still runs, and a job
+/// run on the play loop does not take it down.
+fn caught(job: Job) {
+    if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+        warn!("dataset: a job panicked: {}", panic_text(&*p));
+    }
+}
+
+impl Drop for Worker {
+    /// The end of the run: what is queued is finished first.
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take()
+            && let Err(p) = t.join()
+        {
+            warn!("dataset: the worker panicked: {}", panic_text(&*p));
+        }
+    }
+}
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(no message)")
 }
 
 /// A follower of frames `lo..=hi` from their thumbnails (`whence`, for the
@@ -3343,6 +3408,35 @@ mod tests {
     }
 
     use super::*;
+
+    // The dataset's background work does not hold up the play loop: a slow
+    // job is handed over at once, jobs run in order (a panic in one does not
+    // stop the next), and the end of the run waits for what is queued (#208).
+    #[test]
+    fn the_dataset_worker_runs_in_order_off_the_loop() {
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = Worker::default();
+        let started = Instant::now();
+        let d = Arc::clone(&done);
+        worker.run(Box::new(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            d.lock().unwrap().push(1);
+        }));
+        worker.run(Box::new(|| panic!("a bad batch")));
+        let d = Arc::clone(&done);
+        worker.run(Box::new(move || d.lock().unwrap().push(2)));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "handing over waited {:?}",
+            started.elapsed()
+        );
+        drop(worker);
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the end waits"
+        );
+        assert_eq!(*done.lock().unwrap(), [1, 2]);
+    }
 
     /// The tone mapping's peak goes with the HDR10 metadata in force: held
     /// over frames without a block, forgotten when HDR10 ends (#195).
