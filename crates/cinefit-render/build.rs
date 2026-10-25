@@ -48,12 +48,12 @@ fn main() {
         prefix.display()
     );
     let placebo = pkg_config::Config::new()
-        .atleast_version("7.375")
+        .atleast_version("7.387")
         .statik(true)
         .probe("libplacebo")
         .unwrap_or_else(|e| {
             panic!(
-                "libplacebo >= 7.375 not found in {}: run scripts/build-libplacebo.sh ({e})",
+                "libplacebo >= 7.387 not found in {}: run scripts/build-libplacebo.sh ({e})",
                 prefix.display()
             )
         });

@@ -1,6 +1,6 @@
 //! Rendering with libplacebo on Vulkan, through a small C shim.
 //!
-//! libplacebo is the pinned build from `scripts/build-libplacebo.sh` (API 375,
+//! libplacebo is the pinned build from `scripts/build-libplacebo.sh` (API 387,
 //! or the shim fails to build), and rendering is Linux only; elsewhere
 //! [`Placebo::new`] reports that.
 

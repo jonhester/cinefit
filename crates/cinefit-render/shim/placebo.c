@@ -14,7 +14,7 @@
 
 /* The API the shim is written against. A different libplacebo fails the build
  * here rather than misbehaving at run time: update the shim, then this. */
-_Static_assert(PL_API_VER == 375, "shim written for libplacebo API 375 (scripts/build-libplacebo.sh)");
+_Static_assert(PL_API_VER == 387, "shim written for libplacebo API 387 (scripts/build-libplacebo.sh)");
 
 /* cf_pl_map as src/ffi.rs declares it. */
 _Static_assert(sizeof(cf_pl_map) == 28, "cf_pl_map size");
@@ -881,7 +881,11 @@ static int render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d, pl_tex
             meta.linear.m[i][j] = d->linear[3 * i + j];
         }
         // The player has composed the picture already: reshaping is the
-        // identity, one polynomial piece y = x over the whole range.
+        // identity, one polynomial piece y = x over the whole range. Since
+        // API 387 the pivots are codes / 2^depth (they were / (2^depth - 1)):
+        // 0 and 1 still span every code, and the tunnel renders within 0.05
+        // of a 12-bit code of what it did before (measured on FEL and MEL
+        // dumps, 2026-10-25).
         meta.comp[i].num_pivots = 2;
         meta.comp[i].pivots[0] = 0.0f;
         meta.comp[i].pivots[1] = 1.0f;
