@@ -114,6 +114,10 @@ const GRADE_KNEE_NITS: f64 = 1200.0;
 const GRADE_PEAK: f64 = 0.227;
 const GRADE_ROLLOFF: f64 = -0.379;
 const GRADE_SHIFT: f64 = -2.372;
+/// The share of the scene's minimum above the target's black that the curve's
+/// low end keeps (#235). Fitted on Hitman at 96 and 155; A Quiet Place Part II
+/// held out.
+const DARK_KEEP: f64 = 0.75;
 /// The least spread, PQ, of a scene's L1 and of its curve's ends for the
 /// curve to be fitted (16 of the metadata's 12-bit codes); the mid point
 /// keeps 1e-3 from either end.
@@ -184,7 +188,17 @@ impl Frame {
         let key = (smid - crush) / (clip - crush).max(1e-6);
         let shift = kshift * smid * (1.0 - s2t) * (2.0 * key);
         let r = rolloff.clamp(0.05, 2.0);
-        let (lo, hi) = ((crush - shift).max(tmin), (clip - shift).min(tmax));
+        let hi = (clip - shift).min(tmax);
+        // The low end is held above the target's black by a share of how far
+        // the scene's minimum sits above it: on grades whose L1 minimum is a
+        // pinned value (both 4000-nit titles, 0.0151 on every frame), the
+        // shift alone takes it to black and everything below the minimum
+        // with it, where Dolby keeps the separation (#235). Never so far up
+        // that it meets the top: a scene with nothing dark in it would lose
+        // its curve.
+        let lo = (crush - shift)
+            .max(tmin)
+            .max((tmin + DARK_KEEP * (crush - tmin)).min(hi - MIN_SPAN));
         let n = slope / r;
         let (x1, x2, x3) = (crush.max(1e-6).powf(n), smid.powf(n), clip.powf(n));
         let (y1, y2, y3) = (
@@ -472,6 +486,41 @@ mod tests {
             let got = f64::from(Frame::new(&s(l1), 1000.0).lut[k]);
             assert!((got - i0).abs() < 1e-3, "{l1:?}: {got} vs {i0}");
         }
+    }
+
+    // A pinned L1 minimum above the target's black (both 4000-nit titles carry
+    // 0.0151 on every frame) keeps the dark end rising below it, not flat at
+    // black (#235).
+    #[test]
+    fn the_dark_end_below_a_pinned_minimum_keeps_its_steps() {
+        let tmin = pq_oetf(10f64.powf(TMIN_LOG));
+        let crush = (0.0151f64 * 4095.0).round() as u16;
+        for target in [96.0, 155.0] {
+            let f = Frame::new(
+                &Scene::from_codes([crush, 760, 3079], [62, 3696], vec![]),
+                target,
+            );
+            let below = (f64::from(crush) / 4095.0 * (LUT_POINTS - 1) as f64) as usize;
+            assert!(
+                f64::from(f.lut[below]) > tmin + 1e-3,
+                "at {target}: {}",
+                f.lut[below]
+            );
+            for w in f.lut[..=below].windows(2) {
+                assert!(w[1] > w[0], "at {target}: flat below the minimum");
+            }
+        }
+        // A scene with nothing dark in it keeps its fitted curve: the floor
+        // stays below the top, rather than taking it to the one to one.
+        let bright = Scene::from_codes([3039, 3075, 3079], [0, 3079], vec![]);
+        let f = Frame::new(&bright, 96.0);
+        let mid = (3060.0 / 4095.0 * (LUT_POINTS - 1) as f64) as usize;
+        assert!(
+            f64::from(f.lut[mid]) < f64::from(f.tmax) - 1e-3,
+            "one to one at {} (tmax {})",
+            f.lut[mid],
+            f.tmax
+        );
     }
 
     // Reversed L1 maps as the same L1 in order.
