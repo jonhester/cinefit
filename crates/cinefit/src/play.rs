@@ -3162,6 +3162,13 @@ mod tests {
             let want = Frame::new(&s, f64::from(target));
             assert_eq!(*super::dm_frame(&mut cache, s, target), want);
         }
+        // A repeat of the last inputs returns the kept table, not a new one:
+        // a mark set on it survives the call.
+        cache.as_mut().expect("cached").2.k1 = -1.0;
+        assert_eq!(
+            super::dm_frame(&mut cache, scene(2950, 2048), 96.0).k1,
+            -1.0
+        );
     }
 
     #[test]
