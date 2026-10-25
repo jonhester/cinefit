@@ -319,6 +319,7 @@ impl Recorder {
             return;
         }
         k.clip
+            .feed()
             .offer_as(index, Duration::from_secs_f64(time.max(0.0)), info, bytes);
         // At once: a few lines a minute, and a look at a pass still running
         // (cinefit pairs) should see them.
