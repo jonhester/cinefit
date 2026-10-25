@@ -621,6 +621,36 @@ fn target<'a, 'p>(
 
 /// The bar detector as `play` runs it: on a worker thread, beside the
 /// upload of the same frame.
+/// The detector's epoch: a new one on each change of input format, each
+/// return of the signal and each change of the input's frame rate (#222),
+/// on which the detector forgets what it learned. Frame rate is not in a
+/// frame's key, so it is followed here from what the card reports.
+#[derive(Default)]
+struct Epochs {
+    n: u32,
+    rate_mhz: Option<u32>,
+}
+
+impl Epochs {
+    /// The epoch now; the first is 1.
+    fn now(&self) -> u32 {
+        self.n + 1
+    }
+
+    fn next(&mut self) {
+        self.n += 1;
+    }
+
+    /// The input's frame rate as the card reports it: a change is a new
+    /// epoch; the first report is not.
+    fn rate(&mut self, mhz: u32) {
+        if self.rate_mhz.is_some_and(|r| r != mhz) {
+            self.next();
+        }
+        self.rate_mhz = Some(mhz);
+    }
+}
+
 struct CropFinder {
     det: Detector,
     /// The `detect.crop` setting.
@@ -2029,7 +2059,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut last_format = start_input;
     // Black is on screen for want of a signal, and since when frames last
     // came. Each return of the signal is a new epoch for the detector.
-    let (mut dark, mut last_frame_at, mut returns) = (start_key.is_none(), Instant::now(), 0u32);
+    let (mut dark, mut last_frame_at) = (start_key.is_none(), Instant::now());
+    // From the startup frame's rate: a change before the loop's first frame
+    // is a change, not the first report.
+    let mut epochs = Epochs::default();
+    if let Some(f) = start_input {
+        epochs.rate(rate_mhz(&f));
+    }
     // The output stopped for want of a signal (`output.idle_off`, #144), and
     // since when; when it last came on again, which starts the wait over (the
     // menu wakes it with no source); whether stopping it was refused, not to
@@ -2444,7 +2480,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             if let Some(frame) = taken {
                 let came_back = dark;
                 if dark {
-                    returns += 1;
+                    epochs.next();
                     info!("{:.1} s: signal back", run_started.elapsed().as_secs_f64());
                     dark = false;
                     wait_changed = false;
@@ -2567,6 +2603,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
                 if Some(k) != last_key {
                     counts.format_changes += 1;
+                    epochs.next();
                     receiver.nudge();
                     // Capped: a source that flaps would bury everything else.
                     if counts.format_changes <= LOGGED_CHANGES {
@@ -2585,6 +2622,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     held = 0;
                 }
                 let reported = *format.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(f) = reported {
+                    epochs.rate(rate_mhz(&f));
+                }
                 if reported != last_format {
                     if let Some(f) = reported {
                         info!(
@@ -2658,12 +2698,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         let free = (0..BUFFERS)
                             .find(|&b| b != front && b != pending)
                             .expect("three buffers, two in use");
-                        // Every change of input format is a new epoch for the
+                        // Every change of input format or frame rate, and
+                        // each return of the signal, is a new epoch for the
                         // detector, which forgets what it learned.
                         let started = Instant::now();
                         let t = run_started.elapsed().as_secs_f64();
                         let frame_info = *frame.info();
-                        let epoch = counts.format_changes as u32 + returns + 1;
+                        let epoch = epochs.now();
                         let (found, prepared) = detect_and_upload(
                             &pl,
                             &mut finder,
@@ -2909,6 +2950,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 "{:.1} s: could not follow the source: {e}",
                                 now.as_secs_f64()
                             );
+                            // Refused after going dark: the output is off,
+                            // not on the old signal. Stopped, nothing flips
+                            // onto it, and the next want lights it as from
+                            // off, as a wake does (#212).
+                            if asleep.is_none() && out.stopped() {
+                                asleep = Some(Instant::now());
+                                warn!(
+                                    "{:.1} s: the output is dark after the refused switch: stopped until it can be lit",
+                                    now.as_secs_f64()
+                                );
+                            }
                         }
                     }
                 }
@@ -3424,11 +3476,10 @@ mod tests {
         assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
     }
 
-    #[test]
-    fn a_tunnel_frame_is_cropped_as_its_bars_say() {
-        // A 2.40 picture in a 1080p tunnel frame: full-range luma, bars at 0
-        // and chroma at neutral 2048, packed as HDMI packs 12-bit 4:2:2.
-        let (w, h, bar) = (1920u32, 1080u32, 140u32);
+    /// A 1080p tunnel frame with `bar` black rows top and bottom and a
+    /// textured picture between, packed as HDMI packs 12-bit 4:2:2.
+    fn tunnel_with_bars(bar: u32) -> (FrameInfo, Vec<u8>) {
+        let (w, h) = (1920u32, 1080u32);
         let row_bytes = w as usize * 4;
         let mut bytes = vec![0u8; row_bytes * h as usize];
         for y in 0..h {
@@ -3453,7 +3504,11 @@ mod tests {
             pixel_format: PixelFormat::Rgb10,
             ..v210(2, 2, |_, _| 64).0
         };
-        let mut finder = CropFinder {
+        (info, bytes)
+    }
+
+    fn finder() -> CropFinder {
+        CropFinder {
             det: Detector::default(),
             on: true,
             crops: 0,
@@ -3461,7 +3516,16 @@ mod tests {
             thumbs: false,
             tunnel_cuts: Default::default(),
             tunnel_epoch: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn a_tunnel_frame_is_cropped_as_its_bars_say() {
+        // A 2.40 picture in a 1080p tunnel frame: full-range luma, bars at 0
+        // and chroma at neutral 2048, packed as HDMI packs 12-bit 4:2:2.
+        let bar = 140u32;
+        let (info, bytes) = tunnel_with_bars(bar);
+        let mut finder = finder();
         let mut found = None;
         for i in 0..24u32 {
             found = Some(finder.find(&info, Some(&bytes), Kind::Tunnel, f64::from(i) / 24.0, 1));
@@ -3475,6 +3539,38 @@ mod tests {
             "{top}/{bottom}"
         );
         assert!(found.ms.is_some(), "the detector read it");
+    }
+
+    // A change of frame rate alone (the same size and format) is a new epoch:
+    // the detector starts over, so the first frame after it is read as the
+    // full frame, not with the crop the last stream built (#222).
+    #[test]
+    fn a_frame_rate_change_starts_the_detector_over() {
+        let (info, bytes) = tunnel_with_bars(140);
+        let mut finder = finder();
+        let mut epochs = Epochs::default();
+        let rows = |f: &Found| match f.source {
+            geo::Source::Rows { top, bottom } => (top, bottom),
+            ref other => panic!("no rows: {other:?}"),
+        };
+        epochs.rate(23_976);
+        let mut t = 0.0;
+        let mut last = None;
+        for _ in 0..24 {
+            epochs.rate(23_976);
+            last = Some(finder.find(&info, Some(&bytes), Kind::Tunnel, t, epochs.now()));
+            t += 1.0 / 24.0;
+        }
+        let (top, _) = rows(&last.expect("frames"));
+        assert!(top.abs_diff(140) <= 2, "the scope crop first: {top}");
+        let before = epochs.now();
+        epochs.rate(59_940);
+        assert_eq!(epochs.now(), before + 1, "a new epoch");
+        let first = finder.find(&info, Some(&bytes), Kind::Tunnel, t, epochs.now());
+        assert_eq!(rows(&first), (0, 0), "a fresh detector");
+        // The same rate again is not.
+        epochs.rate(59_940);
+        assert_eq!(epochs.now(), before + 1);
     }
 
     #[test]

@@ -248,8 +248,9 @@ pub struct Output {
     /// The blob on the connector now, and one queued for the next flip.
     hdr_blob: Option<u64>,
     pending_hdr_blob: Option<u64>,
-    /// Whether the lit output signals HDR. `None` while nothing is
-    /// committed.
+    /// Whether the lit output signals HDR. `None` while nothing is lit:
+    /// before the first modeset, after [`Self::sleep`], and after a switch
+    /// refused once dark.
     hdr_on_screen: Option<bool>,
     /// Modesets that went through dark first, into or out of HDR, and how
     /// long the last one left the output dark.
@@ -971,6 +972,7 @@ impl Output {
         let hdr_now = self.hdr.is_some();
         let relight = goes_dark_first(self.modeset, self.hdr_on_screen, hdr_now);
         let dark_from = Instant::now();
+        let mut went_dark = false;
         // A test commit first: if another program holds the display, or the
         // new state would be refused, nothing on screen changes (or goes
         // dark) before we find out.
@@ -986,10 +988,10 @@ impl Output {
                     &self.card,
                     AtomicCommitFlags::ALLOW_MODESET,
                     request(&[(crtc, self.props.active, 0)]),
-                )
-            } else {
-                Ok(())
+                )?;
+                went_dark = true;
             }
+            Ok(())
         })
         .and_then(|()| commit(&self.card, AtomicCommitFlags::ALLOW_MODESET, req));
         self.last_dark = None;
@@ -998,6 +1000,12 @@ impl Output {
             self.last_dark = Some(dark_from.elapsed());
         }
         if let Err(e) = result {
+            // Refused after going dark (the test commit passed, the real one
+            // did not): the CRTC is off, as after [`Self::sleep`], and the
+            // next modeset lights it as from off (#212).
+            if went_dark {
+                self.hdr_on_screen = None;
+            }
             self.put_back_overlay(overlay_before);
             for id in [Some(blob), hdr_blob].into_iter().flatten() {
                 let _ = self.card.destroy_property_blob(id);
@@ -1039,6 +1047,13 @@ impl Output {
         // always carries the signalling, not a switch to go dark for.
         self.hdr_on_screen = None;
         Ok(())
+    }
+
+    /// Whether the output is stopped: after [`Self::sleep`], or a switch
+    /// into or out of HDR refused after it went dark. Nothing can be flipped
+    /// onto it; [`Self::modeset`] lights it as from off.
+    pub fn stopped(&self) -> bool {
+        self.modeset && self.hdr_on_screen.is_none()
     }
 
     /// Modesets that took the output dark first, into or out of HDR (see
