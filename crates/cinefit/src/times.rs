@@ -66,15 +66,21 @@ impl Times {
         Some(self.max)
     }
 
-    /// `name: median …, p95 …, max …`, as the run summary prints it.
+    /// `name: median …, p95 …, p99 …, max …`, as the run summary prints it.
+    /// p99 shows a stall a few frames a second make, which p95 hides (#219).
     pub fn line(&self, name: &str) -> String {
-        match (self.quantile(0.5), self.quantile(0.95)) {
-            (Some(median), Some(p95)) => format!(
-                "{name}: median {median:.2} ms, p95 {p95:.2}, max {:.2}\n",
+        match (self.quantile(0.5), self.quantile(0.95), self.quantile(0.99)) {
+            (Some(median), Some(p95), Some(p99)) => format!(
+                "{name}: median {median:.2} ms, p95 {p95:.2}, p99 {p99:.2}, max {:.2}\n",
                 self.max
             ),
             _ => format!("{name}: none\n"),
         }
+    }
+
+    /// How many times were recorded.
+    pub fn count(&self) -> u64 {
+        self.n
     }
 }
 
@@ -147,5 +153,18 @@ mod tests {
         let t = Times::default();
         assert_eq!(t.quantile(0.5), None);
         assert_eq!(t.line("render"), "render: none\n");
+    }
+
+    #[test]
+    fn a_line_has_the_tail() {
+        let mut t = Times::default();
+        for i in 0..1000 {
+            t.push(if i < 989 { 2.0 } else { 9.0 });
+        }
+        assert_eq!(
+            t.line("render"),
+            // A quantile is the top of its 0.01 ms bucket.
+            "render: median 2.01 ms, p95 2.01, p99 9.00, max 9.00\n"
+        );
     }
 }

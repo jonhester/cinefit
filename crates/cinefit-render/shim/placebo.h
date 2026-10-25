@@ -161,6 +161,26 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
                       cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
                       const cf_pl_map *map, const float *src_crop);
 
+/* GPU time per pass, from libplacebo's timers (#219): each pass's latest
+ * result in ms and how many results it has had, so a reader takes each
+ * once. Passes in CF_PL_PASS_* order; a pass that has not run reads 0. */
+enum {
+    CF_PL_PASS_UPLOAD,
+    CF_PL_PASS_UNPACK,
+    CF_PL_PASS_DECODE,
+    CF_PL_PASS_MAP,
+    CF_PL_PASS_OUTPUT,
+    CF_PL_PASSES
+};
+typedef struct {
+    double ms[CF_PL_PASSES];
+    uint64_t count[CF_PL_PASSES];
+} cf_pl_gpu_times;
+
+/* Timing on (1 if the GPU has timers) or off (nothing attached, no cost). */
+int cf_pl_gpu_timing(cf_pl *pl, int on);
+void cf_pl_get_gpu_times(cf_pl *pl, cf_pl_gpu_times *out);
+
 /* Points in a cf_pl_dm intensity table. */
 #define CF_PL_DM_LUT 1025
 

@@ -29,6 +29,17 @@ const _: () = assert!(size_of::<Dovi>() == 84);
 const _: () = assert!(offset_of!(Dovi, offset) == 36);
 const _: () = assert!(offset_of!(Dovi, linear) == 48);
 
+/// `cf_pl_gpu_times`: GPU time per pass (`CF_PL_PASS_*` order).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuTimes {
+    pub ms: [f64; 5],
+    pub count: [u64; 5],
+}
+
+const _: () = assert!(size_of::<GpuTimes>() == 80);
+const _: () = assert!(offset_of!(GpuTimes, count) == 40);
+
 /// `cf_pl_dm`.
 #[repr(C)]
 pub struct Dm {
@@ -118,6 +129,8 @@ unsafe extern "C" {
         err_len: usize,
     ) -> *mut Handle;
     pub fn cf_pl_destroy(pl: *mut Handle);
+    pub fn cf_pl_gpu_timing(pl: *mut Handle, on: c_int) -> c_int;
+    pub fn cf_pl_get_gpu_times(pl: *mut Handle, out: *mut GpuTimes);
     pub fn cf_pl_get_info(pl: *mut Handle, out: *mut Info);
     pub fn cf_pl_render_rgba8(
         pl: *mut Handle,

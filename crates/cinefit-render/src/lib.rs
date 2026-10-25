@@ -323,6 +323,26 @@ impl Placebo {
             .ok_or(Error::Render)
     }
 
+    /// Turns GPU timing per pass on or off (#219): `true` if on and the GPU
+    /// has timers. Off, nothing is attached to any pass.
+    pub fn set_gpu_timing(&self, on: bool) -> bool {
+        // SAFETY: the handle is live; the shim owns the timers it makes.
+        unsafe { ffi::cf_pl_gpu_timing(self.handle.as_ptr(), c_int::from(on)) != 0 }
+    }
+
+    /// Each pass's latest GPU time and how many it has had, in [`PASSES`]
+    /// order: a result belongs to an earlier run of its pass, a frame or two
+    /// back, and a pass that has not run reads 0.
+    pub fn gpu_times(&self) -> GpuTimes {
+        let mut t = ffi::GpuTimes::default();
+        // SAFETY: the handle is live and `t` is the struct the shim fills.
+        unsafe { ffi::cf_pl_get_gpu_times(self.handle.as_ptr(), &mut t) };
+        GpuTimes {
+            ms: t.ms,
+            count: t.count,
+        }
+    }
+
     /// Refuses a resource another instance made: the SAFETY of every call
     /// that passes one to the shim rests on it being this device's.
     fn owns(&self, made_by: &Placebo) -> Result<(), Error> {
@@ -354,6 +374,24 @@ impl Placebo {
         };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
     }
+}
+
+/// The passes [`Placebo::gpu_times`] times, in its order: the frame's upload,
+/// its unpack on the GPU, the tunnel's decode (Dolby path only), the Dolby
+/// mapping, and the render that scales, converts and writes the output.
+pub const PASSES: [&str; 5] = [
+    "upload",
+    "unpack",
+    "tunnel decode",
+    "Dolby mapping",
+    "output",
+];
+
+/// GPU time per pass: each pass's latest result (ms) and how many it has had.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GpuTimes {
+    pub ms: [f64; 5],
+    pub count: [u64; 5],
 }
 
 /// Captured 4:2:2 YCbCr on the GPU, as planes libplacebo renders from: see

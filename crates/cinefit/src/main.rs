@@ -308,6 +308,11 @@ enum Command {
         /// caught at start and LINEAR used without it.)
         #[arg(long)]
         linear_scanout: bool,
+        /// Time each GPU pass with libplacebo's timers (upload, unpack, the
+        /// tunnel's decode, the Dolby mapping, the output), and report them
+        /// by situation at the end of the run: for one run, measuring.
+        #[arg(long)]
+        gpu_timers: bool,
     },
     /// Show what the remote's and keyboards' buttons mean to cinefit, as
     /// they are pressed. Takes the keyboards from anything else while it
@@ -431,6 +436,7 @@ fn main() -> ExitCode {
             pstate,
             dry_run,
             linear_scanout,
+            gpu_timers,
         } => {
             let file = config.clone().unwrap_or_else(config::default_path);
             load_config(config.as_deref(), &sets).and_then(|config| {
@@ -447,6 +453,7 @@ fn main() -> ExitCode {
                         pstate,
                         dry_run,
                         linear_scanout,
+                        gpu_timers,
                     },
                 ))
             })
@@ -901,6 +908,7 @@ fn play_options(
         pstate: switches.pstate,
         dry_run: switches.dry_run,
         linear_scanout: switches.linear_scanout,
+        gpu_timers: switches.gpu_timers,
     }
 }
 
@@ -909,6 +917,7 @@ struct Switches {
     pstate: bool,
     dry_run: bool,
     linear_scanout: bool,
+    gpu_timers: bool,
 }
 
 #[cfg(target_os = "linux")]
