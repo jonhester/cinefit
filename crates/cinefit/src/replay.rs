@@ -24,8 +24,9 @@
 //! `<save-readings>/NAME/`: a clip is read from disk once however many bar
 //! readers are tried, and the reading is the slow part. `--edge-rows DIR`
 //! keeps the outer rows of every v210 frame, as they are, in
-//! `DIR/<piece>.v210` with an index `DIR/<piece>.csv`: a bar level rule can
-//! then be tried on them without reading the clip again.
+//! `DIR/<piece>.edges.v210` with an index `DIR/<piece>.edges.csv` (named apart
+//! from readings, so the two may share a directory): a bar level rule can then
+//! be tried on them without reading the clip again.
 //!
 //! Clips and anything derived from them are copyrighted footage: they stay on
 //! the machine, outside any repository. A pixel replay is disk- and
@@ -593,11 +594,11 @@ fn piece(
     // up, each as row_bytes of v210.
     let mut edges = match &o.edge_rows {
         Some(d) => {
-            let mut csv = BufWriter::new(File::create(d.join(format!("{name}.csv")))?);
+            let mut csv = BufWriter::new(File::create(d.join(format!("{name}.edges.csv")))?);
             writeln!(csv, "index,time,width,height,row_bytes,offset")?;
             Some((
                 csv,
-                BufWriter::new(File::create(d.join(format!("{name}.v210")))?),
+                BufWriter::new(File::create(d.join(format!("{name}.edges.v210")))?),
                 0u64,
             ))
         }

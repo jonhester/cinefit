@@ -262,7 +262,7 @@ enum Command {
         )]
         bars_variants: Vec<String>,
         /// Also keep the outer 16 rows a side of every v210 frame, raw, in
-        /// DIR/<clip>.v210 with an index DIR/<clip>.csv: for trying bar
+        /// DIR/<clip>.edges.v210 with an index DIR/<clip>.edges.csv: for trying bar
         /// level rules without reading the clip again.
         #[arg(long = "edge-rows", value_name = "DIR", conflicts_with = "readings")]
         edge_rows: Option<PathBuf>,
