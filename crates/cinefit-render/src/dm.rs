@@ -114,6 +114,10 @@ const GRADE_KNEE_NITS: f64 = 1200.0;
 const GRADE_PEAK: f64 = 0.227;
 const GRADE_ROLLOFF: f64 = -0.379;
 const GRADE_SHIFT: f64 = -2.372;
+/// The least spread, PQ, of a scene's L1 and of its curve's ends for the
+/// curve to be fitted (16 of the metadata's 12-bit codes); the mid point
+/// keeps 1e-3 from either end.
+const MIN_SPAN: f64 = 4e-3;
 
 pub fn pq_eotf(e: f64) -> f64 {
     let (m1, m2, c1, c2, c3) = (0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875);
@@ -170,7 +174,12 @@ impl Frame {
         let sop = |u: f64| ((1.0 + ts) * u + to).clamp(0.0, 1.0).powf(1.0 + tp);
         let s2t = ((tmax - tmin) / (smax - smin).max(1e-6)).sqrt().min(1.0);
         let slope = (1.0 / s2t).sqrt();
-        let (crush, clip) = (scene.crush, scene.clip);
+        // L1 as the curve needs it: in range and in order, whatever the
+        // metadata carried.
+        let (crush, clip) = {
+            let (a, b) = (scene.crush.clamp(0.0, 1.0), scene.clip.clamp(0.0, 1.0));
+            (a.min(b), a.max(b))
+        };
         let smid = scene.mid.max(crush + 1e-3).min(clip - 1e-3);
         let key = (smid - crush) / (clip - crush).max(1e-6);
         let shift = kshift * smid * (1.0 - s2t) * (2.0 * key);
@@ -191,13 +200,24 @@ impl Frame {
         let c2 = (-(x2 * y2 - x3 * y3) * y1 + (x1 * y1 - x3 * y3) * y2 - (x1 * y1 - x2 * y2) * y3)
             / temp;
         let c3 = ((x3 - x2) * y1 - (x3 - x1) * y2 + (x2 - x1) * y3) / temp;
+        // A scene with no spread (black, one level, or a top at or below the
+        // target's black) has no three distinct points to fit, and its bounds
+        // can cross: it passes one to one within the target's range instead
+        // (#193).
+        let fitted = clip - crush >= MIN_SPAN
+            && hi - lo >= MIN_SPAN
+            && [c1, c2, c3].iter().all(|c| c.is_finite());
         let curve = |i0: f64| {
-            let u = ((i0 - smin) / (smax - smin).max(1e-6)).clamp(0.0, 1.0);
-            let x = (smin + u * (smax - smin)).clamp(crush, clip).powf(n);
-            let mut i = ((c1 + c2 * x) / (1.0 + c3 * x))
-                .max(0.0)
-                .powf(r)
-                .clamp(lo, hi);
+            let mut i = if fitted {
+                let u = ((i0 - smin) / (smax - smin).max(1e-6)).clamp(0.0, 1.0);
+                let x = (smin + u * (smax - smin)).clamp(crush, clip).powf(n);
+                ((c1 + c2 * x) / (1.0 + c3 * x))
+                    .max(0.0)
+                    .powf(r)
+                    .clamp(lo, hi)
+            } else {
+                i0.clamp(tmin, tmax)
+            };
             // Below the scene's minimum, a straight line down to the
             // target's black.
             if i0 < crush {
@@ -406,6 +426,56 @@ mod tests {
         let s = Scene::from_codes([62, 1500, 3079], [62, 3079], vec![]);
         let t = trim_at(&s, 0.5);
         assert_eq!(t, Trim::neutral(0.5));
+    }
+
+    // L1 the metadata can carry but no grade makes: black, one level, a top
+    // below the target's black, a top below the minimum, codes past 12 bits.
+    // Each must give a finite, rising table inside the target (#193).
+    #[test]
+    fn degenerate_l1_maps_without_panic() {
+        let cases: [[u16; 3]; 9] = [
+            [0, 0, 0],
+            [0, 0, 1],
+            [62, 62, 62],
+            [2000, 2000, 2000],
+            [100, 101, 103],
+            [3000, 1000, 500],
+            [1500, 1500, 1499],
+            [0, 4095, 0],
+            [65535, 65535, 65535],
+        ];
+        for l1 in cases {
+            for target in [48.0, 96.0, 155.0, 1000.0] {
+                let f = Frame::new(&Scene::from_codes(l1, [62, 3696], vec![]), target);
+                let (tmin, tmax) = (pq_oetf(10f64.powf(TMIN_LOG)), f64::from(f.tmax));
+                for w in f.lut.windows(2) {
+                    let (a, b) = (f64::from(w[0]), f64::from(w[1]));
+                    assert!(a.is_finite() && b.is_finite(), "{l1:?} at {target}");
+                    assert!(b >= a - 1e-6, "{l1:?} at {target}: {a} then {b}");
+                    assert!(a >= tmin - 1e-6 && b <= tmax + 1e-6, "{l1:?} at {target}");
+                }
+            }
+        }
+    }
+
+    // Black stays black, and a scene of one level inside the target passes
+    // one to one.
+    #[test]
+    fn a_scene_without_spread_passes_one_to_one() {
+        let f = Frame::new(&Scene::from_codes([0, 0, 0], [62, 3696], vec![]), 96.0);
+        let tmin = pq_oetf(10f64.powf(TMIN_LOG));
+        assert!((f64::from(f.lut[0]) - tmin).abs() < 1e-6);
+        let f = Frame::new(
+            &Scene::from_codes([1000, 1000, 1000], [62, 3696], vec![]),
+            1000.0,
+        );
+        let k = (LUT_POINTS - 1) / 4;
+        let i0 = k as f64 / (LUT_POINTS - 1) as f64;
+        assert!(
+            (f64::from(f.lut[k]) - i0).abs() < 1e-3,
+            "{} vs {i0}",
+            f.lut[k]
+        );
     }
 
     mod golden {
