@@ -251,6 +251,21 @@ enum Command {
         /// threshold_new=4; repeatable.
         #[arg(long = "set", value_name = "KEY=VALUE", requires = "readings")]
         sets: Vec<String>,
+        /// Also run a whole detector whose bar reader is set so, on the same
+        /// frames, saving its readings to DIR/NAME/ under --save-readings:
+        /// NAME:KEY=VALUE,...; repeatable. An experiment's switch, not a
+        /// setting.
+        #[arg(
+            long = "bars-variant",
+            value_name = "NAME:KEY=VALUE,...",
+            requires = "save_readings"
+        )]
+        bars_variants: Vec<String>,
+        /// Also keep the outer 16 rows a side of every v210 frame, raw, in
+        /// DIR/<clip>.v210 with an index DIR/<clip>.csv: for trying bar
+        /// level rules without reading the clip again.
+        #[arg(long = "edge-rows", value_name = "DIR", conflicts_with = "readings")]
+        edge_rows: Option<PathBuf>,
     },
     /// Compare the same content recorded twice with `capture --record`, as a
     /// Dolby Vision tunnel and as HDR10: align the recordings, render matched
@@ -365,6 +380,8 @@ fn main() -> ExitCode {
             save_readings,
             readings,
             sets,
+            bars_variants,
+            edge_rows,
         } => replay::run(replay::Options {
             pieces: clips,
             save_readings,
@@ -373,6 +390,8 @@ fn main() -> ExitCode {
             compare,
             log,
             quiet,
+            bars_variants,
+            edge_rows,
         }),
         Command::Compare {
             tunnel,

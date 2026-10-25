@@ -45,6 +45,85 @@ pub struct Params {
     pub fill_floor: f64,
     /// Codes of mean luma excess that count as full strength.
     pub strength_span: f64,
+    /// Rows at 2160 from the frame edge that must agree on the bar level for
+    /// it to be measured rather than nominal black.
+    pub level_rows: u32,
+    /// Codes the level rows' medians may spread: bars dither over 62-66.
+    pub level_tol: u32,
+    /// [measured] The highest level a bar is taken to have. Film bars sit at
+    /// 62-66, but Top Gun: Maverick's featurette "Cleared for Take Off" has
+    /// grey bars, flat at 76, around its film clips; a flat edge brighter than
+    /// this is picture (a sky, a menu's grey panel at 300). At nominal black's
+    /// lit threshold: a bar refused for it would be lit at nominal black too.
+    pub level_max: u32,
+    /// [measured] Rows at 2160 at the frame edge that may be a line of their
+    /// own, outside the bar: Blade Runner 2049's rating card has one flat
+    /// row at 95 on each side, over bar at 64.
+    pub edge_lines: u32,
+}
+
+impl Params {
+    /// The names [`Params::set`] takes: the fields'.
+    pub const KEYS: &[&str] = &[
+        "delta",
+        "delta_c",
+        "chroma_run",
+        "min_lit",
+        "band",
+        "island_max",
+        "island_gap",
+        "ui_density",
+        "edge_rows",
+        "window",
+        "tol_sym",
+        "fill_floor",
+        "strength_span",
+        "level_rows",
+        "level_tol",
+        "level_max",
+        "edge_lines",
+    ];
+
+    /// One parameter by name, for trying a bar reader in replay. Before
+    /// #224 the level was the outermost row's alone, without a ceiling:
+    /// `level_rows=1,edge_lines=0,level_max=1023` reads as that did.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let bad = || format!("{key}: {value} is not a number of the right kind");
+        let int = || value.parse::<u32>().map_err(|_| bad());
+        let real = || {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(bad)
+        };
+        match key {
+            "delta" => self.delta = int()?,
+            "delta_c" => self.delta_c = int()?,
+            "chroma_run" => self.chroma_run = int()?,
+            "min_lit" => self.min_lit = int()?,
+            "band" => self.band = real()?,
+            "island_max" => self.island_max = real()?,
+            "island_gap" => self.island_gap = int()?,
+            "ui_density" => self.ui_density = real()?,
+            "edge_rows" => self.edge_rows = int()?,
+            "window" => self.window = int()?,
+            "tol_sym" => self.tol_sym = int()?,
+            "fill_floor" => self.fill_floor = real()?,
+            "strength_span" => self.strength_span = real()?,
+            "level_rows" => self.level_rows = int()?,
+            "level_tol" => self.level_tol = int()?,
+            "level_max" => self.level_max = int()?,
+            "edge_lines" => self.edge_lines = int()?,
+            _ => {
+                return Err(format!(
+                    "no bar reader parameter {key}; one of {}",
+                    Self::KEYS.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for Params {
@@ -63,6 +142,10 @@ impl Default for Params {
             tol_sym: 2,
             fill_floor: 0.5,
             strength_span: 48.0,
+            level_rows: 8,
+            level_tol: 4,
+            level_max: 80,
+            edge_lines: 2,
         }
     }
 }
@@ -78,6 +161,10 @@ pub struct SideObs {
     pub run: u32,
     /// The bar level used for this side.
     pub level: u32,
+    /// Of the level rows, the share that support `level`: flat, neutral and
+    /// within the level tolerance of it. 1 when every row agrees; `None` from
+    /// readings saved before it existed.
+    pub level_confidence: Option<f64>,
     /// Mean lit fraction of the rows just inside the edge.
     pub coverage: f64,
     /// Mean luma excess there over the strength span, capped at 1.
@@ -171,6 +258,8 @@ struct Buffers {
     flags: Vec<u8>,
     /// The continuation probes' rows of lit flags.
     probes: [Vec<bool>; 3],
+    /// The level rows' medians, for those flat and neutral.
+    levels: Vec<Option<u32>>,
     /// For the counting methods of a format without its own.
     scratch: RowScratch,
 }
@@ -270,6 +359,35 @@ impl Side<'_> {
                 .map(|(x, &l)| u32::from(l) > thr || flags[x / 2] != 0),
         );
         (self.b.flags, self.b.probes[k]) = (flags, out);
+    }
+
+    /// Row `i`'s median, if the row is flat and neutral, i.e. could be bar.
+    /// The 10th, 50th and 90th percentiles by histogram, as a sort would pick.
+    fn row_level(&mut self, i: u32) -> Option<u32> {
+        let (w, p) = (self.w, self.p);
+        let mut hist = [0u32; 1024];
+        for &l in self.luma(i) {
+            hist[usize::from(l.min(1023))] += 1;
+        }
+        let nth = |k: usize| {
+            let mut seen = 0usize;
+            for (c, &n) in hist.iter().enumerate() {
+                seen += n as usize;
+                if seen > k {
+                    return c as u32;
+                }
+            }
+            1023
+        };
+        let (p10, p50, p90) = (nth(w / 10), nth(w / 2), nth(w * 9 / 10));
+        let cmax = self
+            .chroma(i)
+            .iter()
+            .flat_map(|c| c.iter())
+            .map(|&c| u32::from(c).abs_diff(512))
+            .max()
+            .unwrap_or(0);
+        (p90 - p10 <= 2 * p.delta && cmax <= 4 * p.delta_c && p50 >= 32).then_some(p50)
     }
 
     /// Mean luma above the bar level in row `i`, at least 0.
@@ -374,38 +492,54 @@ impl Bars {
         };
         let mut obs = SideObs::default();
 
-        // Bar level: the outermost row's median, if that row is flat and
-        // neutral, i.e. if it is bar at all; otherwise nominal black. The
-        // 10th, 50th and 90th percentiles by histogram, as a sort would pick.
-        {
-            let mut hist = [0u32; 1024];
-            for &l in s.luma(0) {
-                hist[usize::from(l.min(1023))] += 1;
+        // Bar level: the median of the outer rows' medians, if every one of
+        // those rows could be bar and they agree, and the result is dark
+        // enough to be bar; otherwise nominal black. One row decides nothing,
+        // and a flat edge is not bar for being flat: Blade Runner 2049's menus
+        // have a grey panel at 300 there, which is UI. A line of its own at
+        // the very edge, flat and neutral, with agreeing bar behind it, is
+        // passed over, rows and scan both: as content it would read as UI at
+        // row 0 and hold the picture uncropped.
+        let n = scaled(p.level_rows, h).min(band);
+        let lines = if p.edge_lines == 0 {
+            0
+        } else {
+            scaled(p.edge_lines, h).min(n / 2)
+        };
+        let mut levels = std::mem::take(&mut s.b.levels);
+        levels.clear();
+        levels.extend((0..n).map(|i| s.row_level(i)));
+        let mut skip = 0;
+        for k in 0..=lines as usize {
+            if levels[..k].iter().any(Option::is_none) {
+                break;
             }
-            let nth = |k: usize| {
-                let mut seen = 0usize;
-                for (c, &n) in hist.iter().enumerate() {
-                    seen += n as usize;
-                    if seen > k {
-                        return c as u32;
-                    }
-                }
-                1023
-            };
-            let (p10, p50, p90) = (nth(w / 10), nth(w / 2), nth(w * 9 / 10));
-            let cmax = s
-                .chroma(0)
+            let (lo, hi) = levels[k..]
                 .iter()
-                .flat_map(|c| c.iter())
-                .map(|&c| u32::from(c).abs_diff(512))
-                .max()
-                .unwrap_or(0);
-            s.level = if p90 - p10 <= 2 * p.delta && cmax <= 4 * p.delta_c && p50 >= 32 {
-                p50
-            } else {
-                64
-            };
+                .fold((u32::MAX, 0), |(lo, hi), l| match l {
+                    Some(l) => (lo.min(*l), hi.max(*l)),
+                    None => (0, u32::MAX),
+                });
+            if hi - lo > p.level_tol {
+                continue;
+            }
+            // All measured and within the tolerance: the middle one. Sorting
+            // the rows in place changes nothing below, which only counts them.
+            levels[k..].sort_unstable();
+            let level = levels[k + (n as usize - k) / 2].unwrap_or(64);
+            if level <= p.level_max {
+                s.level = level;
+                skip = k as u32;
+            }
+            break;
         }
+        let support = levels
+            .iter()
+            .flatten()
+            .filter(|&&l| l.abs_diff(s.level) <= p.level_tol)
+            .count();
+        obs.level_confidence = Some(support as f64 / f64::from(n));
+        s.b.levels = levels;
         obs.level = s.level;
 
         let island_max = (f64::from(h) * p.island_max) as u32;
@@ -414,7 +548,7 @@ impl Bars {
         // Scan inward. A short lit run followed by black is an island: a dense
         // one is UI (kept as content: it must not be cropped), a sparse one a
         // subtitle (skipped: the crop cuts it, by decision).
-        let (mut r, mut edge) = (0u32, band);
+        let (mut r, mut edge) = (skip, band);
         while r < band {
             if !s.row_lit(r) {
                 r += 1;
@@ -757,6 +891,125 @@ mod tests {
         let o = observe(&mut f);
         assert_eq!(o.class, FrameClass::Letterbox, "{o:?}");
         assert!(o.top.sharpness < 0.5, "{}", o.top.sharpness);
+    }
+
+    #[test]
+    fn every_parameter_is_settable_by_name() {
+        let mut p = Params::default();
+        for k in Params::KEYS {
+            p.set(k, "3").unwrap();
+        }
+        assert_eq!((p.delta, p.band, p.edge_lines), (3, 3.0, 3));
+        assert!(p.set("nonsense", "1").is_err() && p.set("delta", "x").is_err());
+    }
+
+    #[test]
+    fn the_old_level_rule_is_a_setting() {
+        // The outermost row alone, no ceiling: a rating card's line at 95
+        // sets the level, as it did before #224.
+        let pal = Palette::new(W);
+        let line = Row::luma(W, |_| 95);
+        let mut f = Frame::new(&pal, H);
+        f.content(280, 279, &pal.picture, 0);
+        f.set(0, &line);
+        let mut p = Params::default();
+        for (k, v) in [
+            ("level_rows", "1"),
+            ("edge_lines", "0"),
+            ("level_max", "1023"),
+        ] {
+            p.set(k, v).unwrap();
+        }
+        let o = Bars::new(p).observe(&f.pack());
+        assert_eq!((o.top.level, o.top.bar), (95, 280));
+        assert_eq!(o.top.level_confidence, Some(1.0));
+    }
+
+    #[test]
+    fn a_line_at_the_edge_neither_sets_the_level_nor_reads_as_ui() {
+        // Blade Runner 2049's rating card: one flat row at 95 on each side,
+        // bar at 63-66 behind it. Dim picture inside the edge (100, under the
+        // lit threshold the line's level would give) still ends the bar.
+        let pal = Palette::new(W);
+        let line = Row::luma(W, |_| 95);
+        let dim = Row::luma(W, |x| 100 + hash(x, 9, 0) % 4);
+        let mut f = Frame::new(&pal, H);
+        f.fill(0, 280, &pal.bar_noisy);
+        f.fill(H - 279, H, &pal.bar_noisy);
+        f.content(280, 279, &pal.picture, 0);
+        f.fill(280, 300, &dim);
+        f.fill(H - 299, H - 279, &dim);
+        f.set(0, &line);
+        f.set(H - 1, &line);
+        let o = observe(&mut f);
+        assert_eq!(o.class, FrameClass::Letterbox, "{o:?}");
+        assert_eq!((o.top.bar, o.bottom.bar), (280, 279));
+        assert!(!o.top.ui && !o.bottom.ui, "{o:?}");
+        assert!(o.top.level.abs_diff(64) <= 1, "{}", o.top.level);
+        assert_eq!(o.top.level_confidence, Some(0.875));
+    }
+
+    #[test]
+    fn a_menu_panel_over_the_bar_is_content_not_bar() {
+        // Blade Runner 2049's pop-up menu: a flat grey panel at 300 over the
+        // whole bottom bar. The level stays black, so the panel is lit from
+        // the frame edge and nothing there is cropped.
+        let pal = Palette::new(W);
+        let panel = Row::luma(W, |_| 300);
+        let mut f = Frame::new(&pal, H);
+        f.content(280, 279, &pal.picture, 0);
+        f.fill(H - 279, H, &panel);
+        let o = observe(&mut f);
+        assert_eq!(o.bottom.level, 64);
+        assert_eq!(o.bottom.level_confidence, Some(0.0));
+        assert_eq!(o.bottom.bar, 0, "{:?}", o.bottom);
+        assert_eq!((o.top.bar, o.top.level_confidence), (280, Some(1.0)));
+    }
+
+    #[test]
+    fn raised_bars_that_agree_set_the_level() {
+        let pal = Palette::new(W);
+        let raised = Row::luma(W, |x| 69 + hash(x, 11, 0) % 3);
+        let dim = Row::luma(W, |x| 82 + hash(x, 12, 0) % 4);
+        let mut f = Frame::new(&pal, H);
+        f.fill(0, 280, &raised);
+        f.fill(H - 279, H, &raised);
+        f.content(280, 279, &pal.picture, 0);
+        f.fill(280, 300, &dim);
+        let o = observe(&mut f);
+        assert_eq!((o.top.level, o.top.level_confidence), (70, Some(1.0)));
+        // Picture at 82-85 is lit over black but not over the raised level
+        // (86): the edge is where the bright picture starts.
+        assert_eq!((o.top.bar, o.bottom.bar), (300, 279));
+    }
+
+    #[test]
+    fn grey_bars_set_the_level() {
+        // Top Gun: Maverick's featurette: bars flat at 76, a black line at 64
+        // between them and each film clip.
+        let pal = Palette::new(W);
+        let grey = Row::luma(W, |_| 76);
+        let mut f = Frame::new(&pal, H);
+        f.fill(0, 273, &grey);
+        f.fill(H - 273, H, &grey);
+        f.content(275, 275, &pal.picture, 0);
+        let o = observe(&mut f);
+        assert_eq!((o.top.level, o.top.level_confidence), (76, Some(1.0)));
+        assert_eq!((o.top.bar, o.bottom.bar), (275, 275), "{o:?}");
+    }
+
+    #[test]
+    fn a_bright_flat_edge_is_picture_however_flat() {
+        // The cornfield's sky: flat and neutral at 580 across the top of a
+        // full-height shot. It is not a bar level, so the sky is lit picture.
+        let pal = Palette::new(W);
+        let sky = Row::luma(W, |x| 580 + hash(x, 13, 0) % 3);
+        let mut f = Frame::new(&pal, H);
+        f.content(0, 0, &pal.picture, 0);
+        f.fill(0, 300, &sky);
+        let o = observe(&mut f);
+        assert_eq!((o.top.level, o.top.level_confidence), (64, Some(0.0)));
+        assert_eq!(o.top.bar, 0);
     }
 
     #[test]
