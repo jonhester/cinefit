@@ -2482,8 +2482,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // The frame on screen, read back: what the projector is
                 // sent. A mapping of the buffer, so timed and logged once.
                 let read_at = Instant::now();
-                // Only while the panel is open: mapping the output buffer
-                // copies all of it off the GPU, ~13 ms.
+                // Only while the panel is open: mapping the output buffer and
+                // reading its grid takes about 2 ms on the RX 9060 XT (5.5 to
+                // 9.7 ms on the RX 6400), as logged below (#203).
                 let shown = if ui.info_open() {
                     out.read_scanout(scan.frame(front), |px, stride| {
                         scanout_peak(px, stride, scan_fourcc, size)
