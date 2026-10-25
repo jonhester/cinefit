@@ -13,7 +13,7 @@
 #     libvulkan-dev liblcms2-dev
 set -euo pipefail
 
-COMMIT=1dd022687b9ac1dd996855b51433bf770ae76aab  # 2026-10-10, API 375
+COMMIT=1532bf6893f7e6dbe1b1943488180d125a421f6f  # 2026-10-24, API 387
 REPO=https://code.videolan.org/videolan/libplacebo.git
 
 root=$(cd "$(dirname "$0")/.." && pwd)
