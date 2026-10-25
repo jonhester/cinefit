@@ -188,15 +188,17 @@ impl Frame {
         let key = (smid - crush) / (clip - crush).max(1e-6);
         let shift = kshift * smid * (1.0 - s2t) * (2.0 * key);
         let r = rolloff.clamp(0.05, 2.0);
+        let hi = (clip - shift).min(tmax);
         // The low end is held above the target's black by a share of how far
         // the scene's minimum sits above it: on grades whose L1 minimum is a
         // pinned value (both 4000-nit titles, 0.0151 on every frame), the
         // shift alone takes it to black and everything below the minimum
-        // with it, where Dolby keeps the separation (#235).
+        // with it, where Dolby keeps the separation (#235). Never so far up
+        // that it meets the top: a scene with nothing dark in it would lose
+        // its curve.
         let lo = (crush - shift)
             .max(tmin)
-            .max(tmin + DARK_KEEP * (crush - tmin));
-        let hi = (clip - shift).min(tmax);
+            .max((tmin + DARK_KEEP * (crush - tmin)).min(hi - MIN_SPAN));
         let n = slope / r;
         let (x1, x2, x3) = (crush.max(1e-6).powf(n), smid.powf(n), clip.powf(n));
         let (y1, y2, y3) = (
@@ -508,6 +510,17 @@ mod tests {
                 assert!(w[1] > w[0], "at {target}: flat below the minimum");
             }
         }
+        // A scene with nothing dark in it keeps its fitted curve: the floor
+        // stays below the top, rather than taking it to the one to one.
+        let bright = Scene::from_codes([3039, 3075, 3079], [0, 3079], vec![]);
+        let f = Frame::new(&bright, 96.0);
+        let mid = (3060.0 / 4095.0 * (LUT_POINTS - 1) as f64) as usize;
+        assert!(
+            f64::from(f.lut[mid]) < f64::from(f.tmax) - 1e-3,
+            "one to one at {} (tmax {})",
+            f.lut[mid],
+            f.tmax
+        );
     }
 
     // Reversed L1 maps as the same L1 in order.
