@@ -1596,6 +1596,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     info!("mode: {mode}");
     // What the first input is, resolved once (#99).
     let start_content = start.as_ref().map(|s| Content::of(s.0.kind, cfg.lldv));
+    let start_hdr = start.as_ref().and_then(|s| s.1.info().color.hdr);
     let (hdr, mut out_color) = match (&start, start_content) {
         (Some((_, first, _)), Some(content)) => output_in(
             cfg.mode,
@@ -1956,8 +1957,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut finished: Vec<(String, Duration, cinefit_kms::Pacing)> = Vec::new();
     let mut mode_name = mode.to_string();
     let mut latest_want: Option<follow::Want> = None;
-    // The HDR10 metadata carried over frames that come without it (#61).
+    // The HDR10 metadata carried over frames that come without it (#61),
+    // from the first frame on: its block may be the last for a while, and
+    // the output and its tone mapping were chosen from it.
     let mut pq_meta = None;
+    if let Some(content) = start_content {
+        carried_hdr(content, start_hdr, &mut pq_meta);
+    }
     let (mut front, mut pending) = (0usize, 0usize);
     ui.update(&mut out, enc, Instant::now());
     out.flip(buffers[front])?;
