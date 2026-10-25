@@ -2545,18 +2545,25 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             let action = if asleep.is_some() {
                 // Stopped (#144): no flip is in flight and none comes to pace
                 // the loop; the wait for a frame above does. A source that
-                // says what it wants lights the output in that, and so does
-                // the menu, in the waiting mode, so it can be seen.
+                // says what it wants lights the output in that. The waiting
+                // mode lights it otherwise: for the menu, so it can be seen;
+                // for a source nothing can show, so its slate can; and when
+                // the timeout is set to never, as it now says.
                 now = run_started.elapsed();
                 let want = if dark {
                     latest_want = None;
-                    menu.is_open().then(|| follow::Want {
-                        rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
-                        signal: follow::Signal::Sdr,
-                    })
+                    None
                 } else {
                     latest_want.take()
                 };
+                let unshowable =
+                    !dark && matches!(last_key.map(|k| k.kind), Some(Kind::Unsupported(_)));
+                let want = want.or_else(|| {
+                    (menu.is_open() || cfg.idle_off == 0 || unshowable).then(|| follow::Want {
+                        rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
+                        signal: follow::Signal::Sdr,
+                    })
+                });
                 let Some(a) = want.and_then(|w| policy.wake(&w, now)) else {
                     ready = None;
                     continue;
