@@ -13,6 +13,7 @@ use cinefit_render::{
 pub fn run(pl: &Placebo) -> Result<(), Box<dyn Error>> {
     unfilled(pl)?;
     unpack(pl)?;
+    unpack_biased(pl)?;
     render(pl)?;
     unpack_rgb(pl)?;
     render_rgb(pl)
@@ -156,6 +157,46 @@ fn unpack(pl: &Placebo) -> Result<(), Box<dyn Error>> {
     }
     if failed {
         return Err("the GPU's v210 unpack differs from the CPU's".into());
+    }
+    Ok(())
+}
+
+/// The unpack with a chroma bias (low-latency Dolby Vision's, #146): luma
+/// as without, every Cb and Cr raised by the bias as stored, a fraction of a
+/// code rounded to the planes' 16 bits, and the top codes not wrapping.
+fn unpack_biased(pl: &Placebo) -> Result<(), Box<dyn Error>> {
+    let bias = [0.625f32, 0.40];
+    let (w, h) = (1920, 1080);
+    let mut want = noise_planes(&mut Noise(0x2545_F491_4F6C_DD1D), w, h);
+    want.chroma[0] = 1023;
+    want.chroma[1] = 1023;
+    let row_bytes = v210::min_row_bytes(w).next_multiple_of(128);
+    let bytes = v210::pack(&want, row_bytes).ok_or("v210 pack")?;
+    let mut planes = pl.planes(w, h)?;
+    pl.unpack_v210_biased(&mut planes, &bytes, row_bytes, Some(bias))?;
+    let got = planes.download()?;
+    let stored = |code: u16, b: f32| {
+        (f64::from(code) * 64.0 + f64::from(b) * 64.0)
+            .round()
+            .min(65535.0) as u16
+    };
+    let luma_wrong = (want.luma.iter().zip(&got.luma))
+        .filter(|&(&c, &g)| c << 6 != g)
+        .count();
+    let chroma_wrong = (want.chroma.iter().zip(&got.chroma).enumerate())
+        .filter(|&(i, (&c, &g))| stored(c, bias[i % 2]) != g)
+        .count();
+    let offsets = [
+        f64::from(got.chroma[2]) / 64.0 - f64::from(want.chroma[2]),
+        f64::from(got.chroma[3]) / 64.0 - f64::from(want.chroma[3]),
+    ];
+    println!(
+        "v210 unpack {w}x{h} with chroma bias {bias:?}: {luma_wrong} luma and {chroma_wrong} chroma samples \
+         off, Cb and Cr raised by {:.4} and {:.4} of a code",
+        offsets[0], offsets[1]
+    );
+    if luma_wrong + chroma_wrong > 0 {
+        return Err("the v210 unpack's chroma bias is not what was asked".into());
     }
     Ok(())
 }

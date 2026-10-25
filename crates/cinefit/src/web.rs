@@ -14,7 +14,8 @@
 //! `POST /api/set` with `{"key": …, "value": …}`; `/api/logs` and
 //! `/api/logs/<name>` the run logs in `~/cinefit-logs`; `/api/atv` whether
 //! the Apple TV is paired, and `POST /api/atv/pair/start` and
-//! `/api/atv/pair/finish` with `{"pin": …}` to pair it (#115).
+//! `/api/atv/pair/finish` with `{"pin": …}` to pair it (#115); `POST
+//! /api/save` saves the frame on screen (#92).
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -41,6 +42,8 @@ struct Shared {
     changes: Mutex<Vec<(String, String)>>,
     /// An Apple TV pairing begun, waiting for the PIN it shows.
     pairing: Mutex<Option<cinefit_atv::pair::PairSetup>>,
+    /// Save frame presses not yet taken by `play` (#92).
+    saves: Mutex<u32>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -90,6 +93,12 @@ impl Web {
     pub fn take_changes(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *lock(&self.shared.changes))
     }
+
+    /// Whether Save frame was pressed since the last call (#92); presses in
+    /// between count as one.
+    pub fn take_save(&self) -> bool {
+        std::mem::take(&mut *lock(&self.shared.saves)) > 0
+    }
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -121,6 +130,10 @@ fn serve(s: &Shared, mut request: tiny_http::Request) {
             let _ = request.as_reader().take(4096).read_to_string(&mut body);
             let (code, reply) = set(s, &body);
             json_response(code, &reply).boxed()
+        }
+        (Method::Post, "/api/save") => {
+            *lock(&s.saves) += 1;
+            json_response(200, &json!({"ok": true})).boxed()
         }
         (Method::Get, "/api/atv") => json_response(
             200,
@@ -315,6 +328,7 @@ fn place(key: &str) -> (&'static str, &'static str) {
         "avr.denon" => ("Receiver", "Denon AVR (hostname or IP)"),
         "atv.host" => ("Receiver", "Apple TV (hostname or IP)"),
         "atv.input" => ("Receiver", "Apple TV's receiver input"),
+        "player.ub820" => ("Receiver", "Panasonic UB820 (hostname or IP)"),
         _ => ("Other", ""),
     }
 }
