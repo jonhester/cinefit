@@ -59,6 +59,9 @@ pub struct Config {
     /// The output's rate, in hertz, while there is no source to follow:
     /// the rate the sources start in saves a resync when one comes on.
     pub wait_hz: f64,
+    /// Minutes without an input signal before the output stops, so the
+    /// display sees no signal and its own power-off can follow; 0 never.
+    pub idle_off: u16,
     /// Whether YCbCr input labelled SDR BT.2020 is a player's low-latency
     /// Dolby Vision: PQ already mapped by the player to `lldv_nits`.
     pub lldv: bool,
@@ -186,6 +189,10 @@ impl Default for Config {
             peak_nits: 100,
             target_nits: 0,
             wait_hz: 23.976,
+            // Off until judged with the projector: a display that does not
+            // turn itself off gains nothing, and the next source costs a
+            // resync from off either way (#144).
+            idle_off: 0,
             input_device: String::new(),
             lldv: true,
             // Judged at the screen on 2026-10-20/21 with the settings below
@@ -375,6 +382,16 @@ static SETTINGS: &[Setting] = &[
         help: "The output's rate while no source is playing, with black on screen. A source that starts at the same rate (and SDR) comes up without a resync: 23.976 for an Apple TV set to 23.976, 59.94 for a player whose menus are 59.94.",
         get: |c| Value::Float(c.wait_hz),
         set: Set::Float(|c, v| c.wait_hz = v),
+    },
+    Setting {
+        key: "output.idle_off",
+        kind: Kind::Int { min: 0, max: 240 },
+        apply: Apply::Live,
+        help: "Minutes without an input signal before the output stops, so the display sees no signal and \
+               its own power-off or standby timer can run; 0 never stops it. A source coming back lights it \
+               again in the source's mode, a resync as from off.",
+        get: |c| Value::Int(c.idle_off.into()),
+        set: Set::Int(|c, v| c.idle_off = v as u16),
     },
     Setting {
         key: "input.rgb_range",

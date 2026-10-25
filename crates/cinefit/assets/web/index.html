@@ -212,7 +212,7 @@ function build(settings) {
 function update(state) {
   const pill = document.getElementById("pill");
   pill.textContent = state.pill || "…";
-  pill.className = "pill" + (state.pill === "Waiting" ? " attention" : state.pill === "Can't show this" ? " error" : "");
+  pill.className = "pill" + (state.pill === "Waiting" || state.pill === "Output stopped" ? " attention" : state.pill === "Can't show this" ? " error" : "");
   const now = document.getElementById("now"); now.replaceChildren();
   for (const s of state.now || []) {
     const r = el("div", "stat"); r.append(el("div", "label", s.label));

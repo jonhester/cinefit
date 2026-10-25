@@ -304,6 +304,10 @@ fn place(key: &str) -> (&'static str, &'static str) {
         ),
         "output.mode" => ("Output", "HDR10"),
         "output.wait_hz" => ("Output", "Rate while waiting"),
+        "output.idle_off" => (
+            "Output",
+            "Stop the output without a signal, minutes (0: never)",
+        ),
         "tonemap.curve" => ("Output", "Tone curve"),
         "tonemap.peak_detect" => ("Output", "Tone curve follows each scene"),
         "tonemap.contrast_recovery" => ("Output", "Contrast recovery (0: off)"),

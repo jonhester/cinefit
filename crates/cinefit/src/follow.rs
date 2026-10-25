@@ -131,6 +131,16 @@ impl Policy {
         }
     }
 
+    /// After the output slept (#144): a modeset into what the source wants
+    /// now, at once and even into what was committed before, since nothing
+    /// is lit. A refused one is held off as any refused modeset is.
+    pub fn wake(&self, want: &Want, now: Duration) -> Option<Action> {
+        let held_off = self
+            .refused
+            .is_some_and(|(k, at)| k == want.mode_key() && now.saturating_sub(at) < RETRY);
+        (!held_off).then_some(Action::Modeset(*want))
+    }
+
     /// The result of an action as carried out. A refused modeset is held off
     /// for [`RETRY`]; refused metadata is simply tried again next frame.
     pub fn done(&mut self, action: &Action, ok: bool, now: Duration) {
@@ -281,5 +291,27 @@ mod tests {
         assert_eq!(tries.len(), 2, "{tries:?}");
         assert!(tries[1] - tries[0] >= RETRY);
         assert_eq!(p.committed(), want(FILM, hdr(1000.0)));
+    }
+
+    /// #144: waking is a modeset at once, even into the mode committed
+    /// before; a refused wake waits as a refused modeset does.
+    #[test]
+    fn a_wake_modesets_at_once_and_waits_after_a_refusal() {
+        let film = want(FILM, Signal::Sdr);
+        let mut p = Policy::new(film);
+        assert_eq!(p.wake(&film, Duration::ZERO), Some(Action::Modeset(film)));
+        p.done(&Action::Modeset(film), false, Duration::ZERO);
+        assert_eq!(p.wake(&film, Duration::from_secs(1)), None);
+        assert_eq!(
+            p.wake(&film, RETRY),
+            Some(Action::Modeset(film)),
+            "tried again after RETRY"
+        );
+        // Something else is not held off by the refusal.
+        let menu = want(MENU, Signal::Sdr);
+        assert_eq!(
+            p.wake(&menu, Duration::from_secs(1)),
+            Some(Action::Modeset(menu))
+        );
     }
 }
