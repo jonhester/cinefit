@@ -163,8 +163,14 @@ impl Frame {
         let tmax = pq_oetf(tmax_nits);
         let tmin = pq_oetf(10f64.powf(TMIN_LOG));
         let smin = scene.source_min;
+        // L1 as the curve needs it: in range and in order, whatever the
+        // metadata carried.
+        let (crush, clip) = {
+            let (a, b) = (scene.crush.clamp(0.0, 1.0), scene.clip.clamp(0.0, 1.0));
+            (a.min(b), a.max(b))
+        };
         // The curve spans the scene's own top, not the grade's.
-        let smax = scene.clip;
+        let smax = clip;
         let tr = trim_at(scene, tmax);
         let (ts, to, tp) = (
             tr.slope * TRIM_SCALE,
@@ -174,12 +180,6 @@ impl Frame {
         let sop = |u: f64| ((1.0 + ts) * u + to).clamp(0.0, 1.0).powf(1.0 + tp);
         let s2t = ((tmax - tmin) / (smax - smin).max(1e-6)).sqrt().min(1.0);
         let slope = (1.0 / s2t).sqrt();
-        // L1 as the curve needs it: in range and in order, whatever the
-        // metadata carried.
-        let (crush, clip) = {
-            let (a, b) = (scene.crush.clamp(0.0, 1.0), scene.clip.clamp(0.0, 1.0));
-            (a.min(b), a.max(b))
-        };
         let smid = scene.mid.max(crush + 1e-3).min(clip - 1e-3);
         let key = (smid - crush) / (clip - crush).max(1e-6);
         let shift = kshift * smid * (1.0 - s2t) * (2.0 * key);
@@ -219,8 +219,8 @@ impl Frame {
                 i0.clamp(tmin, tmax)
             };
             // Below the scene's minimum, a straight line down to the
-            // target's black.
-            if i0 < crush {
+            // target's black. Not for the one to one: it already ends there.
+            if fitted && i0 < crush {
                 i = tmin + (i - tmin) * (i0.max(0.0) / crush.max(1e-6));
             }
             // A scene below the target is lifted towards it.
@@ -458,24 +458,30 @@ mod tests {
         }
     }
 
-    // Black stays black, and a scene of one level inside the target passes
-    // one to one.
+    // Black stays black, and a scene of one level passes one to one inside
+    // the target, above that level and below it.
     #[test]
     fn a_scene_without_spread_passes_one_to_one() {
-        let f = Frame::new(&Scene::from_codes([0, 0, 0], [62, 3696], vec![]), 96.0);
+        let s = |l1| Scene::from_codes(l1, [62, 3696], vec![]);
+        let f = Frame::new(&s([0, 0, 0]), 96.0);
         let tmin = pq_oetf(10f64.powf(TMIN_LOG));
         assert!((f64::from(f.lut[0]) - tmin).abs() < 1e-6);
-        let f = Frame::new(
-            &Scene::from_codes([1000, 1000, 1000], [62, 3696], vec![]),
-            1000.0,
-        );
         let k = (LUT_POINTS - 1) / 4;
         let i0 = k as f64 / (LUT_POINTS - 1) as f64;
-        assert!(
-            (f64::from(f.lut[k]) - i0).abs() < 1e-3,
-            "{} vs {i0}",
-            f.lut[k]
-        );
+        for l1 in [[1000, 1000, 1000], [2000, 2000, 2000]] {
+            let got = f64::from(Frame::new(&s(l1), 1000.0).lut[k]);
+            assert!((got - i0).abs() < 1e-3, "{l1:?}: {got} vs {i0}");
+        }
+    }
+
+    // Reversed L1 maps as the same L1 in order.
+    #[test]
+    fn reversed_l1_maps_as_ordered() {
+        let s = |l1| Scene::from_codes(l1, [62, 3696], vec![]);
+        for target in [96.0, 155.0] {
+            let reversed = Frame::new(&s([3000, 1000, 500]), target);
+            assert_eq!(reversed, Frame::new(&s([500, 1000, 3000]), target));
+        }
     }
 
     mod golden {
