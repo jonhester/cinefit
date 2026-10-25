@@ -173,14 +173,17 @@ impl<S: Read + Write> WebSocket<S> {
     }
 
     /// Like `read_exact`, but returns `false` on a clean EOF at the start
-    /// instead of an error.
+    /// instead of an error. A read interrupted by a signal is tried again,
+    /// keeping what was read, as `read_exact` does (#232).
     fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> io::Result<bool> {
         let mut filled = 0;
         while filled < buf.len() {
-            match self.stream.read(&mut buf[filled..])? {
-                0 if filled == 0 => return Ok(false),
-                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-                n => filled += n,
+            match self.stream.read(&mut buf[filled..]) {
+                Ok(0) if filled == 0 => return Ok(false),
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(true)
@@ -262,6 +265,45 @@ mod tests {
         let raw = vec![0x01, 0x01, b'a', 0x80, 0x01, b'b'];
         let mut ws = WebSocket::new(Cursor::new(raw));
         assert_eq!(ws.read_text().unwrap().as_deref(), Some("ab"));
+    }
+
+    /// A stream that gives one byte, is interrupted once, then gives the rest.
+    struct Interrupting {
+        inner: Cursor<Vec<u8>>,
+        calls: u32,
+    }
+
+    impl Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            match self.calls {
+                1 => self.inner.read(&mut buf[..1]),
+                2 => Err(io::ErrorKind::Interrupted.into()),
+                _ => self.inner.read(buf),
+            }
+        }
+    }
+
+    impl Write for Interrupting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Interrupted between the header's two bytes, the frame still reads
+    /// whole: the read is tried again, not the connection ended (#232).
+    #[test]
+    fn an_interrupted_read_is_retried() {
+        let mut raw = vec![0x81, 0x03];
+        raw.extend_from_slice(b"abc");
+        let mut ws = WebSocket::new(Interrupting {
+            inner: Cursor::new(raw),
+            calls: 0,
+        });
+        assert_eq!(ws.read_text().unwrap().as_deref(), Some("abc"));
     }
 
     #[test]
