@@ -9,7 +9,12 @@
 //! little as Dolby's output turns it. Measured at 96 nits, brightness error
 //! x720 per frame: 3.8 Top Gun, 4.3 Project Hail Mary (both in the fit), 6.4
 //! A Quiet Place Part II and 4.3 Hitman (the 4000-nit terms fitted on Hitman),
-//! against 9.4, 8.7, 5.0 and 10.8 for BT.2390 with peak detection.
+//! against 9.4, 8.7, 5.0 and 10.8 for BT.2390 with peak detection. The
+//! 4000-nit terms were refitted on Hitman at 96 and 155 together
+//! (2026-10-25): held out, A Quiet Place Part II went from 5.1 to 4.2 at 96
+//! and from 4.8 to 4.1 at 155. Fitted on A Quiet Place Part II instead, they
+//! fail on Hitman, as its L1 is fixed on every frame: a third 4000-nit title
+//! is still owed (#169).
 //!
 //! Every constant is a fitted value; none is a setting. This module is the
 //! reference the GPU pass in the shim is checked against.
@@ -104,11 +109,11 @@ const HUE_S1: f64 = 0.35;
 const EXPAND: f64 = 0.8;
 /// Grades declared above this many nits get the 4000-nit terms; every
 /// 1000-nit grade (1001 in the metadata) stays below it. Fitted on one
-/// 4000-nit title so far (Hitman), held out on another.
+/// 4000-nit title so far (Hitman, at 96 and 155), held out on another.
 const GRADE_KNEE_NITS: f64 = 1200.0;
-const GRADE_PEAK: f64 = 0.065;
-const GRADE_ROLLOFF: f64 = -0.420;
-const GRADE_SHIFT: f64 = -1.490;
+const GRADE_PEAK: f64 = 0.227;
+const GRADE_ROLLOFF: f64 = -0.379;
+const GRADE_SHIFT: f64 = -2.372;
 
 pub fn pq_eotf(e: f64) -> f64 {
     let (m1, m2, c1, c2, c3) = (0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875);
