@@ -2027,7 +2027,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // Black is on screen for want of a signal, and since when frames last
     // came. Each return of the signal is a new epoch for the detector.
     let (mut dark, mut last_frame_at) = (start_key.is_none(), Instant::now());
+    // From the startup frame's rate: a change before the loop's first frame
+    // is a change, not the first report.
     let mut epochs = Epochs::default();
+    if let Some(f) = start_input {
+        epochs.rate(rate_mhz(&f));
+    }
     // The output stopped for want of a signal (`output.idle_off`, #144), and
     // since when; when it last came on again, which starts the wait over (the
     // menu wakes it with no source); whether stopping it was refused, not to
