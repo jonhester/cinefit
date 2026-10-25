@@ -2877,6 +2877,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 "{:.1} s: could not follow the source: {e}",
                                 now.as_secs_f64()
                             );
+                            // Refused after going dark: the output is off,
+                            // not on the old signal. Stopped, nothing flips
+                            // onto it, and the next want lights it as from
+                            // off, as a wake does (#212).
+                            if asleep.is_none() && out.stopped() {
+                                asleep = Some(Instant::now());
+                                warn!(
+                                    "{:.1} s: the output is dark after the refused switch: stopped until it can be lit",
+                                    now.as_secs_f64()
+                                );
+                            }
                         }
                     }
                 }
