@@ -60,6 +60,10 @@ pub struct Params {
     /// own, outside the bar: Blade Runner 2049's rating card has one flat
     /// row at 95 on each side, over bar at 64.
     pub edge_lines: u32,
+    /// [measured] Rows at 2160 of black line that sharpness looks past, inside
+    /// the edge. Top Gun: Maverick's featurette puts two rows at 64 between
+    /// its grey bars (76, ending on a row of ringing) and each film clip.
+    pub black_line: u32,
 }
 
 impl Params {
@@ -82,6 +86,7 @@ impl Params {
         "level_tol",
         "level_max",
         "edge_lines",
+        "black_line",
     ];
 
     /// One parameter by name, for trying a bar reader in replay. Before
@@ -115,6 +120,7 @@ impl Params {
             "level_tol" => self.level_tol = int()?,
             "level_max" => self.level_max = int()?,
             "edge_lines" => self.edge_lines = int()?,
+            "black_line" => self.black_line = int()?,
             _ => {
                 return Err(format!(
                     "no bar reader parameter {key}; one of {}",
@@ -146,6 +152,7 @@ impl Default for Params {
             level_tol: 4,
             level_max: 80,
             edge_lines: 2,
+            black_line: 2,
         }
     }
 }
@@ -607,10 +614,20 @@ impl Bars {
         // Sharpness: a matte edge reaches full level within a row or two, a
         // dark scene ramps up over many. Row edge+1 skips the ringing row; the
         // reference is 12 rows in, deep enough that a ramp is still climbing
-        // where a real edge has long been flat.
-        let deep = s.excess(edge + scaled(12, h));
+        // where a real edge has long been flat. A black line between bar and
+        // picture (rows inside the edge no brighter than the bar, which a ramp
+        // never has) moves both past it, where the picture starts (#258).
+        let line = if p.black_line == 0 {
+            0
+        } else {
+            (1..=scaled(p.black_line, h))
+                .take_while(|&k| s.excess(edge + k) < 1.0)
+                .count() as u32
+        };
+        let start = edge + line + u32::from(line > 0);
+        let deep = s.excess(start + scaled(12, h));
         obs.sharpness = if deep > 1.0 {
-            (s.excess(edge + 1) / deep).min(1.0)
+            (s.excess(start + 1) / deep).min(1.0)
         } else {
             0.0
         };
@@ -996,6 +1013,29 @@ mod tests {
         let o = observe(&mut f);
         assert_eq!((o.top.level, o.top.level_confidence), (76, Some(1.0)));
         assert_eq!((o.top.bar, o.bottom.bar), (275, 275), "{o:?}");
+    }
+
+    #[test]
+    fn a_black_line_inside_the_edge_keeps_it_sharp() {
+        // Top Gun: Maverick's featurette: grey bars at 76, a row of ringing
+        // the scan ends the bar on, two rows of black, then the picture.
+        let pal = Palette::new(W);
+        let grey = Row::luma(W, |_| 76);
+        let ring = Row::luma(W, |x| if x % 16 == 0 { 100 } else { 84 });
+        let mut f = Frame::new(&pal, H);
+        f.content(275, 275, &pal.picture, 0);
+        for (y0, step) in [(0u32, 1i64), (H - 1, -1)] {
+            let at = |k: i64| (i64::from(y0) + step * k) as u32;
+            f.fill(at(0).min(at(271)), at(0).max(at(271)) + 1, &grey);
+            f.set(at(272), &ring);
+            f.set(at(273), &pal.bar);
+            f.set(at(274), &pal.bar);
+        }
+        let o = observe(&mut f);
+        assert_eq!((o.top.bar, o.bottom.bar), (272, 272), "{o:?}");
+        assert!(o.top.sharpness > 0.5, "{}", o.top.sharpness);
+        assert_eq!(o.class, FrameClass::Letterbox, "{o:?}");
+        assert!(o.strength > 0.1, "{}", o.strength);
     }
 
     #[test]
