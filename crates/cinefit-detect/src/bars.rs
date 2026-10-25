@@ -135,18 +135,18 @@ fn scaled(rows_at_2160: u32, h: u32) -> u32 {
     ((u64::from(rows_at_2160) * u64::from(h) / 2160) as u32).max(1)
 }
 
-/// Pair flags kept only inside a run of at least `run` lit pairs, in place;
-/// `start` is scratch.
-fn in_runs(flags: &mut [u8], start: &mut Vec<u8>, run: usize) {
-    let n = flags.len();
-    // start[p]: the window of `run` pairs starting at p is all lit.
-    start.clear();
-    start.extend(
-        (0..n).map(|p| u8::from(p + run <= n && flags[p..p + run].iter().all(|&f| f != 0))),
-    );
-    for p in 0..n {
-        let covered = (0..run).any(|k| p >= k && start[p - k] != 0);
-        flags[p] &= u8::from(covered);
+/// Pair flags kept only inside a run of at least `run` lit pairs, in place:
+/// each run of lit pairs measured once, end to end, rather than a window
+/// tested at every pair. `run` is at least 1.
+fn in_runs(flags: &mut [u8], run: usize) {
+    let mut p = 0;
+    while p < flags.len() {
+        let len = flags[p..].iter().take_while(|&&f| f != 0).count();
+        let keep = u8::from(len >= run);
+        for f in &mut flags[p..p + len] {
+            *f &= keep;
+        }
+        p += len.max(1);
     }
 }
 
@@ -167,9 +167,10 @@ struct Buffers {
     have_chroma: Vec<bool>,
     /// Per band row: lit samples and the quarters they are in.
     lit: Vec<Option<(u32, u8)>>,
-    /// One row's chroma-lit flags per pair, and scratch for the run rule.
+    /// One row's chroma-lit flags per pair.
     flags: Vec<u8>,
-    runs: Vec<u8>,
+    /// The continuation probes' rows of lit flags.
+    probes: [Vec<bool>; 3],
     /// For the counting methods of a format without its own.
     scratch: RowScratch,
 }
@@ -221,9 +222,7 @@ impl Side<'_> {
             .chroma_flags(y, self.p.delta_c, &mut flags, &mut self.b.scratch);
         let run = self.p.chroma_run as usize;
         if run > 1 && flags.contains(&1) {
-            let mut start = std::mem::take(&mut self.b.runs);
-            in_runs(&mut flags, &mut start, run);
-            self.b.runs = start;
+            in_runs(&mut flags, run);
         }
         self.b.flags = flags;
     }
@@ -254,19 +253,23 @@ impl Side<'_> {
         self.lit_count(i).0 >= self.p.min_lit
     }
 
-    /// Every sample's lit flag, by the run rule: for the continuation probes.
-    fn lit_pixels(&mut self, i: u32) -> Vec<bool> {
+    /// Every sample's lit flag, by the run rule, into probe row `k`: for the
+    /// continuation probes.
+    fn lit_pixels(&mut self, i: u32, k: usize) {
         let thr = self.level + self.p.delta;
         self.run_flags(i);
-        let flags = std::mem::take(&mut self.b.flags);
-        let out = self
-            .luma(i)
-            .iter()
-            .enumerate()
-            .map(|(x, &l)| u32::from(l) > thr || flags[x / 2] != 0)
-            .collect();
-        self.b.flags = flags;
-        out
+        let (flags, mut out) = (
+            std::mem::take(&mut self.b.flags),
+            std::mem::take(&mut self.b.probes[k]),
+        );
+        out.clear();
+        out.extend(
+            self.luma(i)
+                .iter()
+                .enumerate()
+                .map(|(x, &l)| u32::from(l) > thr || flags[x / 2] != 0),
+        );
+        (self.b.flags, self.b.probes[k]) = (flags, out);
     }
 
     /// Mean luma above the bar level in row `i`, at least 0.
@@ -502,9 +505,10 @@ impl Bars {
         // across thousands of columns; two adjacent columns are required.
         let step = (h / 540).max(2);
         if edge > 2 * step {
-            let inside = s.lit_pixels((edge + step).min(last));
-            let outside = s.lit_pixels(edge - 1 - step);
-            let farther = s.lit_pixels(edge - 1 - 2 * step);
+            s.lit_pixels((edge + step).min(last), 0);
+            s.lit_pixels(edge - 1 - step, 1);
+            s.lit_pixels(edge - 1 - 2 * step, 2);
+            let [inside, outside, farther] = &s.b.probes;
             let mut prev = false;
             for x in 0..w {
                 let conn = outside[x] && farther[x] && inside[x];
@@ -531,6 +535,43 @@ mod tests {
 
     fn observe(f: &mut Frame<'_>) -> Observation {
         Bars::default().observe(&f.pack())
+    }
+
+    /// The run rule measured run by run is the rule as first written: a
+    /// pair is kept when some window of `run` lit pairs covers it.
+    #[test]
+    fn runs_are_kept_as_the_window_rule_keeps_them() {
+        let window = |flags: &[u8], run: usize| -> Vec<u8> {
+            let n = flags.len();
+            let start: Vec<bool> = (0..n)
+                .map(|p| p + run <= n && flags[p..p + run].iter().all(|&f| f != 0))
+                .collect();
+            (0..n)
+                .map(|p| flags[p] & u8::from((0..run).any(|k| p >= k && start[p - k])))
+                .collect()
+        };
+        let mut x = 7u64;
+        for n in [0usize, 1, 2, 3, 5, 64, 1920] {
+            for density in [1u64, 3, 5, 7, 9] {
+                let flags: Vec<u8> = (0..n)
+                    .map(|_| {
+                        x = x
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        u8::from((x >> 33) % 10 < density)
+                    })
+                    .collect();
+                for run in [2usize, 3, 4, 7] {
+                    let mut got = flags.clone();
+                    in_runs(&mut got, run);
+                    assert_eq!(
+                        got,
+                        window(&flags, run),
+                        "n {n} density {density} run {run}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
