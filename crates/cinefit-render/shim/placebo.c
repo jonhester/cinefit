@@ -43,7 +43,70 @@ struct cf_pl {
     pl_tex dm_mid, dm_lut;
     cf_pl_log_cb log_cb;
     void *log_ctx;
+    /* GPU timing (#219): NULL timers and no callback while off. */
+    bool timing;
+    pl_timer t_upload, t_unpack, t_map;
+    cf_pl_gpu_times times;
+    uint64_t pass_ns;
+    bool pass_timed;
 };
+
+_Static_assert(sizeof(cf_pl_gpu_times) == 80, "cf_pl_gpu_times size");
+_Static_assert(offsetof(cf_pl_gpu_times, count) == 40, "cf_pl_gpu_times.count");
+
+/* A pass's newest result, when there is one: results come in later, so this
+ * is an earlier run of the same pass, a frame or two back. */
+static void take(cf_pl *pl, int pass, pl_timer t) {
+    if (!t) return;
+    uint64_t ns, last = 0;
+    while ((ns = pl_timer_query(pl->vk->gpu, t))) last = ns;
+    if (last) {
+        pl->times.ms[pass] = (double)last / 1e6;
+        pl->times.count[pass]++;
+    }
+}
+
+static void on_pass(void *priv, const struct pl_render_info *info) {
+    struct cf_pl *pl = priv;
+    if (info->pass->num_samples > 0) {
+        pl->pass_ns += info->pass->last;
+        pl->pass_timed = true;
+    }
+}
+
+/* pl_render_image, its passes' GPU time summed into `pass` while timing. */
+static bool render_timed(cf_pl *pl, int pass, const struct pl_frame *image,
+                         const struct pl_frame *target, struct pl_render_params *params) {
+    if (pl->timing) {
+        params->info_callback = on_pass;
+        params->info_priv = pl;
+        pl->pass_ns = 0;
+        pl->pass_timed = false;
+    }
+    bool ok = pl_render_image(pl->renderer, image, target, params);
+    if (ok && pl->timing && pl->pass_timed) {
+        pl->times.ms[pass] = (double)pl->pass_ns / 1e6;
+        pl->times.count[pass]++;
+    }
+    return ok;
+}
+
+int cf_pl_gpu_timing(cf_pl *pl, int on) {
+    pl_gpu gpu = pl->vk->gpu;
+    pl_timer_destroy(gpu, &pl->t_upload);
+    pl_timer_destroy(gpu, &pl->t_unpack);
+    pl_timer_destroy(gpu, &pl->t_map);
+    pl->timing = false;
+    if (!on) return 0;
+    pl->t_upload = pl_timer_create(gpu);
+    pl->t_unpack = pl_timer_create(gpu);
+    pl->t_map = pl_timer_create(gpu);
+    pl->timing = pl->t_upload && pl->t_unpack && pl->t_map;
+    if (!pl->timing) cf_pl_gpu_timing(pl, 0);
+    return pl->timing;
+}
+
+void cf_pl_get_gpu_times(cf_pl *pl, cf_pl_gpu_times *out) { *out = pl->times; }
 
 static void forward_log(void *priv, enum pl_log_level level, const char *msg) {
     struct cf_pl *pl = priv;
@@ -94,6 +157,7 @@ void cf_pl_destroy(cf_pl *pl) {
     if (pl->vk) {
         pl_tex_destroy(pl->vk->gpu, &pl->dm_mid);
         pl_tex_destroy(pl->vk->gpu, &pl->dm_lut);
+        cf_pl_gpu_timing(pl, 0);
     }
     pl_dispatch_destroy(&pl->dispatch);
     pl_renderer_destroy(&pl->renderer);
@@ -378,8 +442,10 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
             .sampleable = true, .host_writable = true)))
         return -1;
     if (!pl_tex_upload(gpu, pl_tex_transfer_params(
-            .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes)))
+            .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes,
+            .timer = pl->t_upload)))
         return -1;
+    take(pl, CF_PL_PASS_UPLOAD, pl->t_upload);
 
     pl_shader sh = pl_dispatch_begin(pl->dispatch);
     bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
@@ -424,8 +490,10 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
+            .timer = pl->t_unpack,
             .dispatch_size = {(groups + V210_LOCAL - 1) / V210_LOCAL, p->h, 1})))
         return -1;
+    take(pl, CF_PL_PASS_UNPACK, pl->t_unpack);
     p->depth = 10;
     p->filled = true;
     return 0;
@@ -568,7 +636,7 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     apply_map(&image, &target, &params, &cmp, &pdp, map);
-    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    if (!render_timed(pl, CF_PL_PASS_OUTPUT, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
 }
@@ -669,8 +737,10 @@ int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *r, const uint8_t *data, size_t row_by
             .sampleable = true, .host_writable = true)))
         return -1;
     if (!pl_tex_upload(gpu, pl_tex_transfer_params(
-            .tex = r->packed, .ptr = (void *)data, .row_pitch = row_bytes)))
+            .tex = r->packed, .ptr = (void *)data, .row_pitch = row_bytes,
+            .timer = pl->t_upload)))
         return -1;
+    take(pl, CF_PL_PASS_UPLOAD, pl->t_upload);
 
     pl_shader sh = pl_dispatch_begin(pl->dispatch);
     bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
@@ -706,9 +776,11 @@ int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *r, const uint8_t *data, size_t row_by
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
+            .timer = pl->t_unpack,
             .dispatch_size = {(r->w + RGB_LOCAL_X - 1) / RGB_LOCAL_X,
                               (r->h + RGB_LOCAL_Y - 1) / RGB_LOCAL_Y, 1})))
         return -1;
+    take(pl, CF_PL_PASS_UNPACK, pl->t_unpack);
     r->depth = format == CF_PL_R210 ? 10 : 8;
     r->filled = true;
     return 0;
@@ -760,7 +832,7 @@ int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
     params.dither_params = NULL;
     // As in cf_pl_render_ycbcr: no tone mapping between identical spaces.
     params.peak_detect_params = NULL;
-    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    if (!render_timed(pl, CF_PL_PASS_OUTPUT, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
 }
@@ -809,8 +881,10 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
             .sampleable = true, .host_writable = true)))
         return -1;
     if (!pl_tex_upload(gpu, pl_tex_transfer_params(
-            .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes)))
+            .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes,
+            .timer = pl->t_upload)))
         return -1;
+    take(pl, CF_PL_PASS_UPLOAD, pl->t_upload);
 
     int pairs = p->w / 2;
     pl_shader sh = pl_dispatch_begin(pl->dispatch);
@@ -852,16 +926,18 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
+            .timer = pl->t_unpack,
             .dispatch_size = {(pairs + RGB_LOCAL_X - 1) / RGB_LOCAL_X,
                               (p->h + RGB_LOCAL_Y - 1) / RGB_LOCAL_Y, 1})))
         return -1;
+    take(pl, CF_PL_PASS_UNPACK, pl->t_unpack);
     p->depth = 12;
     p->filled = true;
     return 0;
 }
 
 /* cf_pl_render_dovi into any texture. */
-static int render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d, pl_tex t,
+static int render_dovi(cf_pl *pl, int pass, cf_pl_planes *src, const cf_pl_dovi *d, pl_tex t,
                        int dst_prim, int dst_trc, const float *place,
                        const cf_pl_map *map, const float *src_crop) {
     if (!src->filled) {
@@ -932,13 +1008,13 @@ static int render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d, pl_tex
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     apply_map(&image, &target, &params, &cmp, &pdp, map);
-    return pl_render_image(pl->renderer, &image, &target, &params) ? 0 : -1;
+    return render_timed(pl, pass, &image, &target, &params) ? 0 : -1;
 }
 
 int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
                       cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
                       const cf_pl_map *map, const float *src_crop) {
-    if (render_dovi(pl, src, d, unwrap_tex(dst), dst_prim, dst_trc, place, map, src_crop))
+    if (render_dovi(pl, CF_PL_PASS_OUTPUT, src, d, unwrap_tex(dst), dst_prim, dst_trc, place, map, src_crop))
         return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
@@ -1066,8 +1142,10 @@ static int dm_pass(cf_pl *pl, pl_tex img, const cf_pl_dm *dm) {
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
+            .timer = pl->t_map,
             .dispatch_size = {(w + DM_LOCAL - 1) / DM_LOCAL, (h + DM_LOCAL - 1) / DM_LOCAL, 1})))
         return -1;
+    take(pl, CF_PL_PASS_MAP, pl->t_map);
     return 0;
 }
 
@@ -1084,7 +1162,8 @@ int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
             .w = src->w, .h = src->h, .format = fmt, .renderable = true, .sampleable = true,
             .storable = true, .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0)))
         return -1;
-    if (render_dovi(pl, src, d, pl->dm_mid, CF_PL_PRIM_BT2020, CF_PL_TRC_PQ, NULL, NULL, NULL))
+    if (render_dovi(pl, CF_PL_PASS_DECODE, src, d, pl->dm_mid, CF_PL_PRIM_BT2020, CF_PL_TRC_PQ, NULL,
+                    NULL, NULL))
         return -1;
     if (dm_pass(pl, pl->dm_mid, dm)) return -1;
 
@@ -1108,7 +1187,7 @@ int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     apply_map(&image, &target, &params, &cmp, &pdp, map);
-    if (!pl_render_image(pl->renderer, &image, &target, &params)) return -1;
+    if (!render_timed(pl, CF_PL_PASS_OUTPUT, &image, &target, &params)) return -1;
     pl_gpu_finish(gpu);
     return 0;
 }

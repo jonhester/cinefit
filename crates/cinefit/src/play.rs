@@ -91,6 +91,8 @@ pub struct Options {
     pub dry_run: bool,
     /// LINEAR scanout buffers, as before #101, for comparing.
     pub linear_scanout: bool,
+    /// GPU time per pass, reported by situation at the end (#219).
+    pub gpu_timers: bool,
 }
 
 /// One scanout buffer and the render target imported from it, together.
@@ -435,19 +437,20 @@ enum Prepared<'a, 'p> {
 /// The tunnel mapping for `scene` at `target` nits, built only when either
 /// changed since the last frame: L1 and the trims change at cuts, tens of
 /// times a film, and a table costs about 0.05 ms to build (#206).
+/// With it, whether it was built just now: a scene change (#219).
 fn dm_frame(
     cache: &mut DmCache,
     scene: cinefit_render::dm::Scene,
     target: f32,
-) -> &cinefit_render::dm::Frame {
-    if !cache
+) -> (&cinefit_render::dm::Frame, bool) {
+    let built = !cache
         .as_ref()
-        .is_some_and(|(s, t, _)| *s == scene && *t == target)
-    {
+        .is_some_and(|(s, t, _)| *s == scene && *t == target);
+    if built {
         let frame = cinefit_render::dm::Frame::new(&scene, f64::from(target));
         *cache = Some((scene, target, frame));
     }
-    &cache.as_ref().expect("just set").2
+    (&cache.as_ref().expect("just set").2, built)
 }
 
 /// Per-stage times, milliseconds.
@@ -460,9 +463,125 @@ struct Stages {
     detect_tunnel: Times,
     detect_v210: Times,
     detect_and_upload: Times,
+    /// GPU time per pass ([`cinefit_render::PASSES`]), with `--gpu-timers`;
+    /// the results already taken, by count.
+    gpu: [Times; 5],
+    gpu_taken: [u64; 5],
+    /// The same, by what was going on (#219), and the flips missed in each.
+    by: [Split; 3],
+}
+
+/// What was going on at a frame: the times of the steady frames, of a
+/// scene change's, and of those drawn with the menu or panel over them, kept
+/// apart so a spike can be put down to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Situation {
+    Steady,
+    /// A new Dolby mapping table, built for the frame (#206).
+    NewTable,
+    Overlay,
+}
+
+impl Situation {
+    const ALL: [Situation; 3] = [Situation::Steady, Situation::NewTable, Situation::Overlay];
+
+    fn of(new_table: bool, overlay: bool) -> Self {
+        if overlay {
+            Situation::Overlay
+        } else if new_table {
+            Situation::NewTable
+        } else {
+            Situation::Steady
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Situation::Steady => "steady",
+            Situation::NewTable => "a new Dolby table (a scene change)",
+            Situation::Overlay => "the menu or info panel open",
+        }
+    }
+}
+
+#[derive(Default)]
+struct Split {
+    frames: u64,
+    missed: u64,
+    unpack: Times,
+    detect_and_upload: Times,
+    render: Times,
+    gpu: [Times; 5],
 }
 
 impl Stages {
+    /// A frame drawn, under what was going on: its stage times (the latest
+    /// pushed, this frame's) and any GPU results new since the last.
+    fn frame_done(&mut self, situation: Situation, gpu: Option<cinefit_render::GpuTimes>) {
+        let s = &mut self.by[situation as usize];
+        s.frames += 1;
+        for (from, to) in [
+            (&self.unpack, &mut s.unpack),
+            (&self.detect_and_upload, &mut s.detect_and_upload),
+            (&self.render, &mut s.render),
+        ] {
+            if let Some(v) = from.last() {
+                to.push(v);
+            }
+        }
+        if let Some(g) = gpu {
+            for i in 0..5 {
+                if g.count[i] > self.gpu_taken[i] {
+                    self.gpu_taken[i] = g.count[i];
+                    self.gpu[i].push(g.ms[i]);
+                    s.gpu[i].push(g.ms[i]);
+                }
+            }
+        }
+    }
+
+    /// The end-of-run lines for the GPU passes and each situation (#219).
+    fn split_lines(&self, gpu: bool) -> Vec<String> {
+        let mut lines = Vec::new();
+        let passes = |times: &[Times; 5], lines: &mut Vec<String>, indent: &str| {
+            for (i, t) in times.iter().enumerate() {
+                if t.count() > 0 {
+                    let name = format!("{indent}GPU {}", cinefit_render::PASSES[i]);
+                    lines.push(t.line(&name).trim_end().to_string());
+                }
+            }
+        };
+        if gpu {
+            passes(&self.gpu, &mut lines, "");
+        }
+        for situation in Situation::ALL {
+            let s = &self.by[situation as usize];
+            if s.frames == 0 {
+                continue;
+            }
+            lines.push(format!(
+                "{}: {} frames, {} flips missed",
+                situation.name(),
+                s.frames,
+                s.missed
+            ));
+            for (name, t) in [
+                ("unpack, with upload", &s.unpack),
+                (
+                    "detection beside the upload, both done",
+                    &s.detect_and_upload,
+                ),
+                ("render, with the wait for the GPU", &s.render),
+            ] {
+                lines.push(t.line(&format!("  {name}")).trim_end().to_string());
+            }
+            if gpu {
+                passes(&s.gpu, &mut lines, "  ");
+            }
+        }
+        lines
+    }
+
     /// The detector's time on a frame, under what it read; nothing where it
     /// did not read one (cropping off, a kind it does not read).
     fn detected(&mut self, ms: Option<f64>, kind: Kind) {
@@ -1526,10 +1645,12 @@ fn draw(
     dm: &mut DmCache,
     dst: &Target<'_, '_>,
     stages: &mut Stages,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     let view = dst.view;
     let out = dst.color;
     let t = Instant::now();
+    // Whether the Dolby mapping built a new table for this frame.
+    let mut new_table = false;
     match frame {
         Prepared::Ycbcr {
             planes: p,
@@ -1583,7 +1704,8 @@ fn draw(
             // metadata, onto the target, then one to one into SDR as the
             // player's low-latency rendering is.
             if let (Transfer::Bt1886, Some(scene)) = (out.transfer, tunnel.dm_scene()) {
-                let frame = dm_frame(dm, scene, dst.mapped_nits);
+                let (frame, built) = dm_frame(dm, scene, dst.mapped_nits);
+                new_table = built;
                 let map = Mapping {
                     src_peak: dst.mapped_nits,
                     dst_peak: dst.mapped_nits,
@@ -1620,7 +1742,7 @@ fn draw(
         }
     }
     stages.render.push(ms(t));
-    Ok(())
+    Ok(new_table)
 }
 
 /// What the SDR output's white stands for with this content: low-latency
@@ -1853,6 +1975,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let holds_clocks = clocks.is_some();
 
     let pl = Placebo::new()?;
+    let gpu_timers = opts.gpu_timers && pl.set_gpu_timing(true);
+    if opts.gpu_timers {
+        info!(
+            "gpu timers: {}",
+            if gpu_timers {
+                "on"
+            } else {
+                "not available on this GPU"
+            }
+        );
+    }
     // The scanout buffers in the layout GBM picks from the plane's list
     // (#101): tiled where the GPU has one, which `cinefit bench` measured
     // 20% faster to render into than LINEAR on the RX 6400 and the same
@@ -2153,6 +2286,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut period = mode.period();
     let mut take_timeout = period.mul_f64(0.8).min(Duration::from_millis(35));
     let mut pacing = cinefit_kms::Pacing::default();
+    // What was going on at the frame ready to show, and at the one flipped.
+    let (mut ready_situation, mut flip_situation) = (Situation::Steady, Situation::Steady);
     // Pacing per output mode: a modeset changes the period it is judged by.
     let mut finished: Vec<(String, Duration, cinefit_kms::Pacing)> = Vec::new();
     let mut mode_name = mode.to_string();
@@ -2849,7 +2984,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         // Rendered into the output as it stands, which libplacebo maps
                         // to, until the policy moves the output.
                         if let Some(prepared) = prepared {
-                            draw(
+                            let new_table = draw(
                                 &pl,
                                 &frame_info,
                                 hdr_meta.as_ref(),
@@ -2858,6 +2993,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 &target(scan.texture(free), out_color, view, &cfg),
                                 &mut stages,
                             )?;
+                            ready_situation =
+                                Situation::of(new_table, menu.is_open() || ui.info_open());
+                            stages.frame_done(ready_situation, gpu_timers.then(|| pl.gpu_times()));
                             ready = Some(free);
                             ui.set_slate(None);
                             if let Some(r) = stages.render.last() {
@@ -2921,7 +3059,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         flip.waited.as_secs_f64() * 1000.0
                     );
                 }
+                let missed = pacing.missed;
                 pacing.on_flip(flip.sequence, flip.at);
+                // Put down to what was going on at the frame it showed.
+                stages.by[flip_situation as usize].missed += pacing.missed - missed;
                 front = pending;
                 // Nothing is in flight now: the moment for a modeset, new
                 // metadata, or stopping.
@@ -3112,6 +3253,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 Some(b) => {
                     counts.shown += 1;
                     pending = b;
+                    flip_situation = ready_situation;
                     window.borrow_mut().flip(Instant::now(), true);
                 }
                 None => {
@@ -3229,6 +3371,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             .line("render, with the wait for the GPU")
             .trim_end()
     );
+    for line in stages.split_lines(gpu_timers) {
+        info!("{line}");
+    }
     looped
 }
 
@@ -3410,6 +3555,14 @@ mod tests {
             )
         };
         let mut cache = None;
+        assert!(
+            super::dm_frame(&mut cache, scene(2950, 2048), 96.0).1,
+            "built"
+        );
+        assert!(
+            !super::dm_frame(&mut cache, scene(2950, 2048), 96.0).1,
+            "kept"
+        );
         for (s, target) in [
             (scene(2950, 2048), 96.0),
             (scene(2950, 2048), 96.0),
@@ -3419,13 +3572,13 @@ mod tests {
             (scene(2950, 2048), 96.0),
         ] {
             let want = Frame::new(&s, f64::from(target));
-            assert_eq!(*super::dm_frame(&mut cache, s, target), want);
+            assert_eq!(*super::dm_frame(&mut cache, s, target).0, want);
         }
         // A repeat of the last inputs returns the kept table, not a new one:
         // a mark set on it survives the call.
         cache.as_mut().expect("cached").2.k1 = -1.0;
         assert_eq!(
-            super::dm_frame(&mut cache, scene(2950, 2048), 96.0).k1,
+            super::dm_frame(&mut cache, scene(2950, 2048), 96.0).0.k1,
             -1.0
         );
     }
@@ -3449,6 +3602,44 @@ mod tests {
     }
 
     use super::*;
+
+    // Frames are put down to what was going on, a GPU result is taken once,
+    // and the summary has a block for each situation seen (#219).
+    #[test]
+    fn times_are_split_by_situation() {
+        assert_eq!(Situation::of(false, false), Situation::Steady);
+        assert_eq!(Situation::of(true, false), Situation::NewTable);
+        assert_eq!(Situation::of(true, true), Situation::Overlay);
+        let mut stages = Stages::default();
+        let gpu = |count: u64, ms: f64| cinefit_render::GpuTimes {
+            ms: [0.0, 0.5, 0.0, 0.0, ms],
+            count: [0, count, 0, 0, count],
+        };
+        stages.render.push(4.0);
+        stages.frame_done(Situation::Steady, Some(gpu(1, 2.0)));
+        // The same result read again is not a second one.
+        stages.frame_done(Situation::Steady, Some(gpu(1, 2.0)));
+        stages.render.push(9.0);
+        stages.frame_done(Situation::NewTable, Some(gpu(2, 6.0)));
+        stages.by[Situation::NewTable as usize].missed += 1;
+        assert_eq!(stages.gpu[4].count(), 2);
+        assert_eq!(stages.by[Situation::Steady as usize].frames, 2);
+        assert_eq!(stages.by[Situation::Steady as usize].gpu[4].count(), 1);
+        let lines = stages.split_lines(true);
+        let text = lines.join("\n");
+        assert!(text.contains("steady: 2 frames, 0 flips missed"), "{text}");
+        assert!(
+            text.contains("a new Dolby table (a scene change): 1 frames, 1 flips missed"),
+            "{text}"
+        );
+        assert!(text.contains("GPU output: median"), "{text}");
+        assert!(!text.contains("menu or info panel"), "{text}");
+        let off = stages.split_lines(false).join("\n");
+        assert!(
+            !off.contains("GPU output") && !off.contains("GPU unpack"),
+            "no timers, no GPU pass lines: {off}"
+        );
+    }
 
     // Detection is timed by what it read, apart from the upload (#220).
     #[test]
