@@ -384,15 +384,33 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
 struct Sources<'p> {
     planes: Option<GpuPlanes<'p>>,
     rgb: Option<GpuRgb<'p>>,
-    /// The last tunnel mapping and the scene and target it was built for.
-    dm: Option<(cinefit_render::dm::Scene, f32, cinefit_render::dm::Frame)>,
+}
+
+/// The last tunnel mapping and the scene and target it was built for (see
+/// [`dm_frame`]).
+type DmCache = Option<(cinefit_render::dm::Scene, f32, cinefit_render::dm::Frame)>;
+
+/// A frame uploaded and ready to draw: what each kind's draw needs, from the
+/// textures in [`Sources`] and the tunnel's conversion.
+enum Prepared<'a, 'p> {
+    /// YCbCr: low-latency Dolby Vision (`lldv`) is PQ under its SDR label.
+    Ycbcr {
+        planes: &'a GpuPlanes<'p>,
+        color: YcbcrColor,
+        lldv: bool,
+    },
+    Rgb(&'a GpuRgb<'p>),
+    Tunnel {
+        planes: &'a GpuPlanes<'p>,
+        tunnel: &'a Tunnel,
+    },
 }
 
 /// The tunnel mapping for `scene` at `target` nits, built only when either
 /// changed since the last frame: L1 and the trims change at cuts, tens of
 /// times a film, and a table costs about 0.05 ms to build (#206).
 fn dm_frame(
-    cache: &mut Option<(cinefit_render::dm::Scene, f32, cinefit_render::dm::Frame)>,
+    cache: &mut DmCache,
     scene: cinefit_render::dm::Scene,
     target: f32,
 ) -> &cinefit_render::dm::Frame {
@@ -1253,22 +1271,22 @@ impl CropFinder {
 /// that follows needs the crop, so it still applies to this same frame:
 /// nothing waits a frame, and the frame costs the longer of the two instead
 /// of their sum. `at` is the frame's time and the detector's epoch. Returns
-/// what the detector found and whether the frame was uploaded.
+/// what the detector found and the frame ready to draw, if it was uploaded.
 #[allow(clippy::too_many_arguments)]
-fn detect_and_upload<'p>(
+fn detect_and_upload<'a, 'p>(
     pl: &'p Placebo,
     finder: &mut CropFinder,
     frame: &Frame,
     kind: Kind,
     lldv: bool,
-    tunnel: Option<&Tunnel>,
-    sources: &mut Sources<'p>,
+    tunnel: Option<&'a Tunnel>,
+    sources: &'a mut Sources<'p>,
     stages: &mut Stages,
     at: (f64, u32),
-) -> Result<(Found, bool), Box<dyn Error>> {
+) -> Result<(Found, Option<Prepared<'a, 'p>>), Box<dyn Error>> {
     let info = *frame.info();
     let Some(pixels) = frame.pixels() else {
-        return Ok((finder.find(&info, None, kind, at.0, at.1), false));
+        return Ok((finder.find(&info, None, kind, at.0, at.1), None));
     };
     let bytes = pixels.bytes();
     std::thread::scope(|s| {
@@ -1291,61 +1309,89 @@ fn detect_and_upload<'p>(
 /// bias that can be told apart from Dolby's mapping, so it is left alone.
 const LLDV_CHROMA_BIAS: [f32; 2] = [0.625, 0.40];
 
+/// A GPU resource with a picture's size.
+trait GpuSize {
+    fn size(&self) -> (usize, usize);
+}
+
+impl GpuSize for GpuPlanes<'_> {
+    fn size(&self) -> (usize, usize) {
+        (self.width(), self.height())
+    }
+}
+
+impl GpuSize for GpuRgb<'_> {
+    fn size(&self) -> (usize, usize) {
+        (self.width(), self.height())
+    }
+}
+
+/// The resource in `slot`, made again (by `make`) when there is none or it
+/// is another size: kept from frame to frame otherwise.
+fn sized<T: GpuSize>(
+    slot: &mut Option<T>,
+    w: usize,
+    h: usize,
+    make: impl FnOnce() -> Result<T, cinefit_render::Error>,
+) -> Result<&mut T, cinefit_render::Error> {
+    if slot.as_ref().is_some_and(|r| r.size() != (w, h)) {
+        *slot = None;
+    }
+    match slot {
+        Some(r) => Ok(r),
+        None => Ok(slot.insert(make()?)),
+    }
+}
+
 /// The first half of a frame: its bytes into the GPU, unpacked into planes
 /// (copy and unpack). Needs nothing from the detector, so it runs while the
-/// detector reads the same bytes on another thread. `false` for what nothing
-/// renders. `lldv` is the `input.lldv` setting.
+/// detector reads the same bytes on another thread. `None` for what nothing
+/// renders: a format with no path, or a tunnel before its first conversion.
+/// `lldv` is the `input.lldv` setting.
 #[allow(clippy::too_many_arguments)]
-fn upload<'p>(
+fn upload<'a, 'p>(
     pl: &'p Placebo,
     info: &FrameInfo,
     bytes: &[u8],
     kind: Kind,
     lldv: bool,
-    tunnel: Option<&Tunnel>,
-    sources: &mut Sources<'p>,
+    tunnel: Option<&'a Tunnel>,
+    sources: &'a mut Sources<'p>,
     stages: &mut Stages,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<Option<Prepared<'a, 'p>>, Box<dyn Error>> {
     let (w, h) = (info.width as usize, info.height as usize);
     let t = Instant::now();
-    match kind {
-        Kind::Ycbcr(_) | Kind::Tunnel => {
-            if kind == Kind::Tunnel && tunnel.is_none() {
-                return Ok(false);
-            }
-            if sources
-                .planes
-                .as_ref()
-                .is_none_or(|p| (p.width(), p.height()) != (w, h))
-            {
-                sources.planes = Some(pl.planes(w, h)?);
-            }
-            let p = sources.planes.as_mut().expect("made above");
-            if kind == Kind::Tunnel {
-                pl.unpack_tunnel(p, bytes, info.row_bytes)?;
-            } else {
-                // The chain's bias on low-latency Dolby Vision only: the
-                // rest has not been measured to carry it.
-                let bias =
-                    matches!(Content::of(kind, lldv), Content::Lldv(_)).then_some(LLDV_CHROMA_BIAS);
-                pl.unpack_v210_biased(p, bytes, info.row_bytes, bias)?;
+    let prepared = match kind {
+        Kind::Tunnel => {
+            let Some(tunnel) = tunnel else {
+                return Ok(None);
+            };
+            let planes = sized(&mut sources.planes, w, h, || pl.planes(w, h))?;
+            pl.unpack_tunnel(planes, bytes, info.row_bytes)?;
+            Prepared::Tunnel { planes, tunnel }
+        }
+        Kind::Ycbcr(color) => {
+            let lldv = matches!(Content::of(kind, lldv), Content::Lldv(_));
+            let planes = sized(&mut sources.planes, w, h, || pl.planes(w, h))?;
+            // The chain's bias on low-latency Dolby Vision only: the rest
+            // has not been measured to carry it.
+            let bias = lldv.then_some(LLDV_CHROMA_BIAS);
+            pl.unpack_v210_biased(planes, bytes, info.row_bytes, bias)?;
+            Prepared::Ycbcr {
+                planes,
+                color,
+                lldv,
             }
         }
         Kind::Rgb(format) => {
-            if sources
-                .rgb
-                .as_ref()
-                .is_none_or(|r| (r.width(), r.height()) != (w, h))
-            {
-                sources.rgb = Some(pl.rgb(w, h)?);
-            }
-            let r = sources.rgb.as_mut().expect("made above");
-            pl.unpack_rgb(r, bytes, info.row_bytes, format)?;
+            let rgb = sized(&mut sources.rgb, w, h, || pl.rgb(w, h))?;
+            pl.unpack_rgb(rgb, bytes, info.row_bytes, format)?;
+            Prepared::Rgb(rgb)
         }
-        Kind::Unsupported(_) => return Ok(false),
-    }
+        Kind::Unsupported(_) => return Ok(None),
+    };
     stages.unpack.push(ms(t));
-    Ok(true)
+    Ok(Some(prepared))
 }
 
 /// The HDR10 source's peak for tone mapping: MaxCLL, or the mastering
@@ -1364,30 +1410,30 @@ fn pq_peak(hdr: Option<&HdrMetadata>) -> Option<f32> {
 
 /// The second half: the uploaded frame drawn into the target, with the crop
 /// the detector found for this same frame. `hdr` is the HDR10 metadata in
-/// force for it, carried over frames without a block.
-#[allow(clippy::too_many_arguments)]
-fn draw<'p>(
-    pl: &'p Placebo,
+/// force for it, carried over frames without a block; `dm` the last tunnel
+/// mapping, kept between frames.
+fn draw(
+    pl: &Placebo,
     info: &FrameInfo,
     hdr: Option<&HdrMetadata>,
-    content: Content,
-    tunnel: Option<&Tunnel>,
-    sources: &mut Sources<'p>,
+    frame: Prepared<'_, '_>,
+    dm: &mut DmCache,
     dst: &Target<'_, '_>,
     stages: &mut Stages,
 ) -> Result<(), Box<dyn Error>> {
     let view = dst.view;
     let out = dst.color;
     let t = Instant::now();
-    match content {
-        Content::Sdr(color)
-        | Content::Hdr10(color)
-        | Content::Hlg(color)
-        | Content::Lldv(color) => {
+    match frame {
+        Prepared::Ycbcr {
+            planes: p,
+            color,
+            lldv,
+        } => {
             // Low-latency Dolby Vision is PQ under its SDR label, already
             // mapped by the player to its peak.
-            let (color, peak, white) = match content {
-                Content::Lldv(_) => (
+            let (color, peak, white) = match lldv {
+                true => (
                     YcbcrColor {
                         transfer: Transfer::Pq,
                         ..color
@@ -1395,7 +1441,7 @@ fn draw<'p>(
                     Some(dst.lldv_nits),
                     dst.lldv_nits,
                 ),
-                _ => (
+                false => (
                     color,
                     dst.source_peak.or_else(|| {
                         (color.transfer == Transfer::Pq)
@@ -1405,7 +1451,6 @@ fn draw<'p>(
                     dst.mapped_nits,
                 ),
             };
-            let p = sources.planes.as_mut().expect("uploaded");
             // HDR into SDR is tone-mapped; anything else only changes space.
             let map =
                 (color.transfer == Transfer::Pq && out.transfer == Transfer::Bt1886).then(|| {
@@ -1418,31 +1463,21 @@ fn draw<'p>(
                         // Never low-latency Dolby Vision: the player has mapped
                         // it already and it passes one to one, which a measured
                         // peak below white_nits would turn into a mapping.
-                        peak_detect: dst.peak_detect && !matches!(content, Content::Lldv(_)),
+                        peak_detect: dst.peak_detect && !lldv,
                         // Likewise: one to one adds nothing back.
-                        contrast_recovery: if matches!(content, Content::Lldv(_)) {
-                            0.0
-                        } else {
-                            dst.contrast_recovery
-                        },
+                        contrast_recovery: if lldv { 0.0 } else { dst.contrast_recovery },
                         peak_percentile: dst.peak_percentile,
-                        knee_offset: if matches!(content, Content::Lldv(_)) {
-                            0.0
-                        } else {
-                            dst.knee_offset
-                        },
+                        knee_offset: if lldv { 0.0 } else { dst.knee_offset },
                     }
                 });
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
         }
-        Content::Tunnel => {
-            let tunnel = tunnel.expect("uploaded only with one");
-            let p = sources.planes.as_mut().expect("uploaded");
+        Prepared::Tunnel { planes: p, tunnel } => {
             // Into SDR: Dolby's display mapping, modelled, from the frame's own
             // metadata, onto the target, then one to one into SDR as the
             // player's low-latency rendering is.
             if let (Transfer::Bt1886, Some(scene)) = (out.transfer, tunnel.dm_scene()) {
-                let frame = dm_frame(&mut sources.dm, scene, dst.mapped_nits);
+                let frame = dm_frame(dm, scene, dst.mapped_nits);
                 let map = Mapping {
                     src_peak: dst.mapped_nits,
                     dst_peak: dst.mapped_nits,
@@ -1468,8 +1503,7 @@ fn draw<'p>(
                 pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
             }
         }
-        Content::Rgb(_) => {
-            let r = sources.rgb.as_mut().expect("uploaded");
+        Prepared::Rgb(r) => {
             // The card does not report RGB's range: the setting says (#23).
             let color = RgbSourceColor {
                 levels: dst.rgb_range,
@@ -1478,7 +1512,6 @@ fn draw<'p>(
             };
             pl.render_rgb_view(r, color, dst.tex, out, view)?;
         }
-        Content::Unsupported(_) => unreachable!("never uploaded"),
     }
     stages.render.push(ms(t));
     Ok(())
@@ -1789,6 +1822,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // The first picture is rendered before the modeset, so the display's
     // first frame is the source's.
     let mut sources = Sources::default();
+    let mut dm_cache: DmCache = None;
     let mut stages = Stages::default();
 
     // The bar detector reads each YCbCr frame on this thread (about 8 ms at
@@ -1845,7 +1879,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let (first_source, first_place) = match &start {
         Some((key, first, _)) => {
             let first_info = *first.info();
-            let (found, uploaded) = detect_and_upload(
+            let (found, prepared) = detect_and_upload(
                 &pl,
                 &mut finder,
                 first,
@@ -1870,16 +1904,15 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 source,
                 cfg.fill_max_ar.value(),
             );
-            if !uploaded {
+            let Some(prepared) = prepared else {
                 return Err("the first frame could not be rendered".into());
-            }
+            };
             draw(
                 &pl,
                 &first_info,
                 first_info.color.hdr.as_ref(),
-                Content::of(key.kind, cfg.lldv),
-                last_tunnel.as_ref(),
-                &mut sources,
+                prepared,
+                &mut dm_cache,
                 &target(&targets, 0, out_color, view, &cfg),
                 &mut stages,
             )?;
@@ -2682,7 +2715,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         let t = run_started.elapsed().as_secs_f64();
                         let frame_info = *frame.info();
                         let epoch = epochs.now();
-                        let (found, uploaded) = detect_and_upload(
+                        let (found, prepared) = detect_and_upload(
                             &pl,
                             &mut finder,
                             &frame,
@@ -2708,14 +2741,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         );
                         // Rendered into the output as it stands, which libplacebo maps
                         // to, until the policy moves the output.
-                        if uploaded {
+                        if let Some(prepared) = prepared {
                             draw(
                                 &pl,
                                 &frame_info,
                                 hdr_meta.as_ref(),
-                                content,
-                                last_tunnel.as_ref(),
-                                &mut sources,
+                                prepared,
+                                &mut dm_cache,
                                 &target(&targets, free, out_color, view, &cfg),
                                 &mut stages,
                             )?;
