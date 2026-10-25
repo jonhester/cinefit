@@ -455,6 +455,23 @@ fn dm_frame(
 struct Stages {
     unpack: Times,
     render: Times,
+    /// The bar detector, on its own thread beside the upload (#220), by what
+    /// it read; and the two together, which is what the frame waits for.
+    detect_tunnel: Times,
+    detect_v210: Times,
+    detect_and_upload: Times,
+}
+
+impl Stages {
+    /// The detector's time on a frame, under what it read; nothing where it
+    /// did not read one (cropping off, a kind it does not read).
+    fn detected(&mut self, ms: Option<f64>, kind: Kind) {
+        match (ms, kind) {
+            (Some(d), Kind::Tunnel) => self.detect_tunnel.push(d),
+            (Some(d), Kind::Ycbcr(_)) => self.detect_v210.push(d),
+            _ => {}
+        }
+    }
 }
 
 /// Where a frame is rendered: a scanout buffer of the output's size, in the
@@ -1374,16 +1391,20 @@ fn detect_and_upload<'a, 'p>(
         return Ok((finder.find(&info, None, kind, at.0, at.1), None));
     };
     let bytes = pixels.bytes();
-    std::thread::scope(|s| {
+    let t = Instant::now();
+    let (found, uploaded) = std::thread::scope(|s| {
         // A thread a frame: starting one costs tens of microseconds, against
         // the milliseconds the detector takes.
         let worker = s.spawn(|| finder.find(&info, Some(bytes), kind, at.0, at.1));
-        let uploaded = upload(pl, &info, bytes, kind, lldv, tunnel, sources, stages);
+        let uploaded = upload(pl, &info, bytes, kind, lldv, tunnel, &mut *sources, stages);
         let found = worker
             .join()
             .unwrap_or_else(|e| std::panic::resume_unwind(e));
-        Ok((found, uploaded?))
-    })
+        (found, uploaded)
+    });
+    stages.detect_and_upload.push(ms(t));
+    stages.detected(found.ms, kind);
+    Ok((found, uploaded?))
 }
 
 /// The capture chain's chroma bias on low-latency Dolby Vision, in 10-bit
@@ -3181,6 +3202,26 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         info!("{name}: {}", pacing.summary(*period).trim_end());
     }
     info!("{}", stages.unpack.line("unpack, with upload").trim_end());
+    // Beside the upload, on its own thread: the longer of the two is what
+    // the frame waits for (#220).
+    info!(
+        "{}",
+        stages
+            .detect_tunnel
+            .line("bar detection, tunnel")
+            .trim_end()
+    );
+    info!(
+        "{}",
+        stages.detect_v210.line("bar detection, v210").trim_end()
+    );
+    info!(
+        "{}",
+        stages
+            .detect_and_upload
+            .line("detection beside the upload, both done")
+            .trim_end()
+    );
     info!(
         "{}",
         stages
@@ -3408,6 +3449,30 @@ mod tests {
     }
 
     use super::*;
+
+    // Detection is timed by what it read, apart from the upload (#220).
+    #[test]
+    fn detection_is_timed_by_kind() {
+        let mut stages = Stages::default();
+        let v210 = Kind::Ycbcr(YcbcrColor {
+            matrix: Matrix::Bt2020Nc,
+            primaries: Primaries::Bt2020,
+            transfer: Transfer::Pq,
+        });
+        stages.detected(Some(9.0), Kind::Tunnel);
+        stages.detected(Some(6.0), v210);
+        stages.detected(None, Kind::Tunnel);
+        stages.detected(Some(1.0), Kind::Rgb(rgb::Format::R210));
+        assert_eq!(stages.detect_tunnel.last(), Some(9.0));
+        assert_eq!(stages.detect_v210.last(), Some(6.0));
+        assert_eq!(
+            stages.detect_tunnel.quantile(0.5),
+            Some(9.0),
+            "one tunnel time"
+        );
+        assert!(stages.detect_and_upload.last().is_none());
+        assert!(stages.unpack.last().is_none());
+    }
 
     // The dataset's background work does not hold up the play loop: a slow
     // job is handed over at once, jobs run in order (a panic in one does not
