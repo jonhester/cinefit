@@ -2360,6 +2360,16 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 "dolby_vision_bytes": info.dolby_vision_bytes,
                             },
                             "hdr10": info.color.hdr.as_ref().map(snapshot::hdr),
+                            // A frame without its own block is signalled
+                            // with the last one carried over (#61): that,
+                            // or null where nothing is carried.
+                            "hdr10_carried": pq_meta
+                                .as_ref()
+                                .filter(|_| {
+                                    matches!(content, Content::Hdr10(_))
+                                        && info.color.hdr.is_none()
+                                })
+                                .map(snapshot::hdr),
                             // What low-latency Dolby Vision is taken to be,
                             // and what HDR10 and the tunnel are mapped into.
                             "lldv": {
