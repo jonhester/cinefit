@@ -40,7 +40,7 @@ struct cf_pl {
     pl_dispatch dispatch;
     /* Dolby's display mapping: the tunnel in BT.2020 PQ, the mapped picture,
      * and the frame's intensity table. Sized on first use. */
-    pl_tex dm_mid, dm_out, dm_lut;
+    pl_tex dm_mid, dm_lut;
     cf_pl_log_cb log_cb;
     void *log_ctx;
 };
@@ -93,7 +93,6 @@ void cf_pl_destroy(cf_pl *pl) {
     if (!pl) return;
     if (pl->vk) {
         pl_tex_destroy(pl->vk->gpu, &pl->dm_mid);
-        pl_tex_destroy(pl->vk->gpu, &pl->dm_out);
         pl_tex_destroy(pl->vk->gpu, &pl->dm_lut);
     }
     pl_dispatch_destroy(&pl->dispatch);
@@ -970,7 +969,7 @@ static const char DM_HEADER[] =
 static const char DM_BODY[] =
     "ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n"
     "if (id.x < cf_w && id.y < cf_h) {\n"
-    "    vec3 lms = cf_pq_oetf(cf_rgb_lms * cf_pq_eotf(texelFetch(cf_mid, id, 0).rgb));\n"
+    "    vec3 lms = cf_pq_oetf(cf_rgb_lms * cf_pq_eotf(imageLoad(cf_img, id).rgb));\n"
     "    vec3 x = cf_lms_ictcp * lms;\n"
     "    float i0 = x.x, ct = x.y, cp = x.z;\n"
     "    float t = clamp(i0, 0.0, 1.0) * float(cf_n);\n"
@@ -998,13 +997,15 @@ static const char DM_BODY[] =
     "        o.yz = vec2(2.0 * (oc * cos(ang) - op * sin(ang)), oc * sin(ang) + op * cos(ang));\n"
     "    }\n"
     "    vec3 rgb = inverse(cf_rgb_lms) * cf_pq_eotf(inverse(cf_lms_ictcp) * o);\n"
-    "    imageStore(cf_out, id, vec4(cf_pq_oetf(rgb), 1.0));\n"
+    "    imageStore(cf_img, id, vec4(cf_pq_oetf(rgb), 1.0));\n"
     "}\n";
 
 #define DM_LOCAL 16
 
 /* Maps `in` (sampleable, BT.2020 PQ) into `out` (storable, the same size). */
-static int dm_pass(cf_pl *pl, pl_tex in, pl_tex out, const cf_pl_dm *dm) {
+// In place: each invocation reads its own pixel and writes it back, so the
+// frame needs no second full-size texture (#205).
+static int dm_pass(cf_pl *pl, pl_tex img, const cf_pl_dm *dm) {
     pl_gpu gpu = pl->vk->gpu;
     pl_fmt f_lut = pl_find_named_fmt(gpu, "r32f");
     if (!f_lut) {
@@ -1017,7 +1018,7 @@ static int dm_pass(cf_pl *pl, pl_tex in, pl_tex out, const cf_pl_dm *dm) {
         return -1;
     if (!pl_tex_upload(gpu, pl_tex_transfer_params(.tex = pl->dm_lut, .ptr = (void *)dm->lut)))
         return -1;
-    int w = in->params.w, h = in->params.h;
+    int w = img->params.w, h = img->params.h;
     float cmp_b[2] = {dm->hue_cmp[4], dm->hue_cmp[5]};
     pl_shader sh = pl_dispatch_begin(pl->dispatch);
     bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
@@ -1030,22 +1031,18 @@ static int dm_pass(cf_pl *pl, pl_tex in, pl_tex out, const cf_pl_dm *dm) {
         .compute_group_size = {DM_LOCAL, DM_LOCAL},
         .descriptors = (struct pl_shader_desc[]) {
             {
-                .desc = { .name = "cf_mid", .type = PL_DESC_SAMPLED_TEX },
-                .binding = { .object = in, .sample_mode = PL_TEX_SAMPLE_NEAREST },
-            },
-            {
                 .desc = { .name = "cf_lut", .type = PL_DESC_SAMPLED_TEX },
                 // Interpolated by the shader, as the reference does, not by
                 // the sampler.
                 .binding = { .object = pl->dm_lut, .sample_mode = PL_TEX_SAMPLE_NEAREST },
             },
             {
-                .desc = { .name = "cf_out", .type = PL_DESC_STORAGE_IMG,
-                          .access = PL_DESC_ACCESS_WRITEONLY },
-                .binding.object = out,
+                .desc = { .name = "cf_img", .type = PL_DESC_STORAGE_IMG,
+                          .access = PL_DESC_ACCESS_READWRITE },
+                .binding.object = img,
             },
         },
-        .num_descriptors = 3,
+        .num_descriptors = 2,
         .variables = (struct pl_shader_var[]) {
             { .var = pl_var_int("cf_w"),        .data = &w },
             { .var = pl_var_int("cf_h"),        .data = &h },
@@ -1082,20 +1079,18 @@ int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     if (!fmt) return -1;
     // The whole frame at its own size: the bars are cropped and the picture
     // placed by the last step, as for every other source.
+    // Decoded, then mapped in place, then placed: one full-size texture.
     if (!pl_tex_recreate(gpu, &pl->dm_mid, pl_tex_params(
             .w = src->w, .h = src->h, .format = fmt, .renderable = true, .sampleable = true,
-            .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0)))
-        return -1;
-    if (!pl_tex_recreate(gpu, &pl->dm_out, pl_tex_params(
-            .w = src->w, .h = src->h, .format = fmt, .storable = true, .sampleable = true)))
+            .storable = true, .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0)))
         return -1;
     if (render_dovi(pl, src, d, pl->dm_mid, CF_PL_PRIM_BT2020, CF_PL_TRC_PQ, NULL, NULL, NULL))
         return -1;
-    if (dm_pass(pl, pl->dm_mid, pl->dm_out, dm)) return -1;
+    if (dm_pass(pl, pl->dm_mid, dm)) return -1;
 
     struct pl_frame image = {
         .num_planes = 1,
-        .planes = {{ .texture = pl->dm_out, .components = 3, .component_mapping = {0, 1, 2} }},
+        .planes = {{ .texture = pl->dm_mid, .components = 3, .component_mapping = {0, 1, 2} }},
         .repr = pl_color_repr_rgb,
         .color = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ },
     };
@@ -1123,17 +1118,15 @@ int cf_pl_dm_rgba16(cf_pl *pl, int w, int h, const uint16_t *in, const cf_pl_dm 
     pl_gpu gpu = pl->vk->gpu;
     pl_fmt fmt = storable_fmt(pl, "rgba16");
     if (!fmt) return -1;
-    pl_tex t_in = pl_tex_create(gpu, pl_tex_params(
-        .w = w, .h = h, .format = fmt, .sampleable = true, .initial_data = in));
-    pl_tex t_out = pl_tex_create(gpu, pl_tex_params(
-        .w = w, .h = h, .format = fmt, .storable = true, .host_readable = true));
+    pl_tex t = pl_tex_create(gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .storable = true, .host_readable = true,
+        .initial_data = in));
     int rc = -1;
-    if (t_in && t_out && !dm_pass(pl, t_in, t_out, dm) &&
+    if (t && !dm_pass(pl, t, dm) &&
         pl_tex_download(gpu, pl_tex_transfer_params(
-            .tex = t_out, .ptr = out, .row_pitch = (size_t)w * 8)))
+            .tex = t, .ptr = out, .row_pitch = (size_t)w * 8)))
         rc = 0;
     pl_gpu_finish(gpu);
-    pl_tex_destroy(gpu, &t_in);
-    pl_tex_destroy(gpu, &t_out);
+    pl_tex_destroy(gpu, &t);
     return rc;
 }
