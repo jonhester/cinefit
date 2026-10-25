@@ -253,49 +253,84 @@ fn ycbcr_color(info: &FrameInfo) -> YcbcrColor {
     }
 }
 
-/// Decodes the tunnel in an `r210` frame, if it carries one. `None` when no
-/// packet passes its CRC (not a tunnel) or the metadata is unusable.
-fn decode_tunnel(info: &FrameInfo, bytes: &[u8]) -> Option<Option<Tunnel>> {
+/// What an `r210` frame's pixels say about the tunnel.
+///
+/// One per frame, moved straight into `last_tunnel`: boxing the update would
+/// only add an allocation a frame.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+enum TunnelFrame {
+    /// No packet passes its CRC: not a tunnel.
+    Absent,
+    /// A tunnel with nothing usable this frame: no metadata, packets that
+    /// did not fit, or offsets on no known scale. The last good conversion
+    /// still applies.
+    Held,
+    /// A tunnel with a conversion of its own.
+    Update(Tunnel),
+}
+
+/// Decodes the tunnel in an `r210` frame, if it carries one.
+fn decode_tunnel(info: &FrameInfo, bytes: &[u8]) -> TunnelFrame {
     let parity = cinefit_dovi::r210_parity(bytes, info.width as usize, info.row_bytes);
-    let tunnel = match cinefit_dovi::decode(parity) {
+    tunnel_frame(cinefit_dovi::decode(parity))
+}
+
+fn tunnel_frame(decoded: Result<cinefit_dovi::Tunnel, cinefit_dovi::Error>) -> TunnelFrame {
+    let tunnel = match decoded {
         Ok(t) => t,
-        Err(cinefit_dovi::Error::NoPacket { packet: 0 }) => return None,
+        Err(cinefit_dovi::Error::NoPacket { packet: 0 }) => return TunnelFrame::Absent,
         // A tunnel whose packets did not fit: still a tunnel.
-        Err(_) => return Some(None),
+        Err(_) => return TunnelFrame::Held,
     };
-    // No metadata this frame, or offsets on no known scale: a tunnel whose
-    // last good conversion still applies.
-    let m = tunnel.metadata?;
-    Some(m.conversion().map(|c| {
-        Tunnel {
-            color: DoviColor {
-                ycc_to_lms: c.ycc_to_rgb,
-                offset: c.offset,
-                linear: c.rgb_to_lms,
-            },
-            source_min_pq: m.source_min_pq,
-            source_max_pq: m.source_max_pq,
-            scene_max_pq: m.level1.map(|l| l.max_pq),
-            scene_avg_pq: m.level1.map(|l| l.avg_pq),
-            scene_min_pq: m.level1.map(|l| l.min_pq),
-            trims: m
-                .level2
-                .iter()
-                .map(|t| {
-                    cinefit_render::dm::Trim::from_codes(
-                        t.target_max_pq,
-                        [
-                            t.trim_slope,
-                            t.trim_offset,
-                            t.trim_power,
-                            t.trim_chroma_weight,
-                            t.trim_saturation_gain,
-                        ],
-                    )
-                })
-                .collect(),
+    // A packet that passed its CRC is a tunnel, with metadata or without
+    // (#194): without, it is no update, not plain RGB.
+    let Some(m) = tunnel.metadata else {
+        return TunnelFrame::Held;
+    };
+    let Some(c) = m.conversion() else {
+        return TunnelFrame::Held;
+    };
+    TunnelFrame::Update(Tunnel {
+        color: DoviColor {
+            ycc_to_lms: c.ycc_to_rgb,
+            offset: c.offset,
+            linear: c.rgb_to_lms,
+        },
+        source_min_pq: m.source_min_pq,
+        source_max_pq: m.source_max_pq,
+        scene_max_pq: m.level1.map(|l| l.max_pq),
+        scene_avg_pq: m.level1.map(|l| l.avg_pq),
+        scene_min_pq: m.level1.map(|l| l.min_pq),
+        trims: m
+            .level2
+            .iter()
+            .map(|t| {
+                cinefit_render::dm::Trim::from_codes(
+                    t.target_max_pq,
+                    [
+                        t.trim_slope,
+                        t.trim_offset,
+                        t.trim_power,
+                        t.trim_chroma_weight,
+                        t.trim_saturation_gain,
+                    ],
+                )
+            })
+            .collect(),
+    })
+}
+
+/// The kind of an `r210` frame, updating the last good tunnel conversion.
+fn rgb10_kind(t: TunnelFrame, last_tunnel: &mut Option<Tunnel>) -> Kind {
+    match t {
+        TunnelFrame::Absent => Kind::Rgb(rgb::Format::R210),
+        TunnelFrame::Held => Kind::Tunnel,
+        TunnelFrame::Update(t) => {
+            *last_tunnel = Some(t);
+            Kind::Tunnel
         }
-    }))
+    }
 }
 
 /// Classifies a frame, updating the last good tunnel conversion.
@@ -305,16 +340,10 @@ fn classify(frame: &Frame, last_tunnel: &mut Option<Tunnel>) -> Key {
         PixelFormat::V210 => Kind::Ycbcr(ycbcr_color(info)),
         PixelFormat::Argb8 => Kind::Rgb(rgb::Format::Argb8),
         PixelFormat::Rgb10 => {
-            let decoded = frame.pixels().and_then(|p| decode_tunnel(info, p.bytes()));
-            match decoded {
-                Some(t) => {
-                    if let Some(t) = t {
-                        *last_tunnel = Some(t);
-                    }
-                    Kind::Tunnel
-                }
-                None => Kind::Rgb(rgb::Format::R210),
-            }
+            let t = frame
+                .pixels()
+                .map_or(TunnelFrame::Absent, |p| decode_tunnel(info, p.bytes()));
+            rgb10_kind(t, last_tunnel)
         }
         other => Kind::Unsupported(other),
     };
@@ -2971,6 +3000,82 @@ fn hdr_line(h: &HdrMetadata) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn dovi_tunnel(offsets: [u32; 3], l1_max: Option<u16>) -> cinefit_dovi::Tunnel {
+        use cinefit_dovi::{DmMetadata, Header, Level1, packet::PacketType};
+        cinefit_dovi::Tunnel {
+            header: Header {
+                packet_type: PacketType::First,
+                metadata_type: 0,
+                affected_metadata_id: 0,
+                metadata_version: 0,
+                current_metadata_id: 0,
+                no_metadata: l1_max.is_none(),
+                end_of_stream: false,
+            },
+            copies_used: vec![0],
+            metadata: l1_max.map(|max_pq| DmMetadata {
+                scene_refresh: false,
+                ycc_to_rgb: [0; 9],
+                ycc_to_rgb_offset: offsets,
+                rgb_to_lms: [0; 9],
+                signal_bit_depth: 12,
+                signal_color_space: 2,
+                source_min_pq: 62,
+                source_max_pq: 3696,
+                level1: Some(Level1 {
+                    min_pq: 62,
+                    max_pq,
+                    avg_pq: 819,
+                }),
+                level2: Vec::new(),
+                level4: None,
+                level5: None,
+                other: Vec::new(),
+            }),
+        }
+    }
+
+    const UB820: [u32; 3] = [0, 0x0800_0000, 0x0800_0000];
+
+    #[test]
+    fn a_tunnel_frame_is_absent_held_or_an_update() {
+        use super::{TunnelFrame, tunnel_frame};
+        use cinefit_dovi::Error;
+        let absent = tunnel_frame(Err(Error::NoPacket { packet: 0 }));
+        assert!(matches!(absent, TunnelFrame::Absent));
+        // Packets that did not fit, a packet without metadata (#194), and
+        // offsets on no known scale: a tunnel, nothing new.
+        for t in [
+            Err(Error::NoPacket { packet: 1 }),
+            Ok(dovi_tunnel(UB820, None)),
+            Ok(dovi_tunnel([0, 1, 1], Some(3079))),
+        ] {
+            let held = tunnel_frame(t);
+            assert!(matches!(held, TunnelFrame::Held), "{held:?}");
+        }
+        let update = tunnel_frame(Ok(dovi_tunnel(UB820, Some(3079))));
+        assert!(matches!(update, TunnelFrame::Update(ref t) if t.scene_max_pq == Some(3079)));
+    }
+
+    // Metadata, a frame without, metadata: a tunnel throughout, the first
+    // conversion kept over the frame without (#194).
+    #[test]
+    fn a_tunnel_frame_without_metadata_keeps_the_last_conversion() {
+        use super::{Kind, rgb10_kind, tunnel_frame};
+        use cinefit_dovi::Error;
+        let rgb = Kind::Rgb(cinefit_render::rgb::Format::R210);
+        let mut last = None;
+        for (t, kind, max) in [
+            (Ok(dovi_tunnel(UB820, Some(3079))), Kind::Tunnel, 3079),
+            (Ok(dovi_tunnel(UB820, None)), Kind::Tunnel, 3079),
+            (Ok(dovi_tunnel(UB820, Some(3465))), Kind::Tunnel, 3465),
+            (Err(Error::NoPacket { packet: 0 }), rgb, 3465),
+        ] {
+            assert_eq!(rgb10_kind(tunnel_frame(t), &mut last), kind);
+            assert_eq!(last.as_ref().and_then(|t| t.scene_max_pq), Some(max));
+        }
+    }
+
     #[test]
     fn no_display_is_waited_for() {
         use cinefit_kms::Error as Kms;
