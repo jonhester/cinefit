@@ -76,6 +76,38 @@ pub trait Samples {
     }
 }
 
+/// `f`, compiled for AVX2 when the CPU has it. The counting loops are
+/// written for the compiler to vectorise, and AVX2 runs twice the samples of
+/// the baseline's SSE2 to an instruction: a build for any x86-64 (as
+/// `tools/install.sh` makes) counts in half the time on a CPU that has it.
+/// The same source either way, so the same answers.
+///
+/// Pass the closure `#[inline(always)]`: otherwise it is compiled once, for
+/// the baseline, and the AVX2 copy only calls it (measured: no faster).
+#[inline(always)]
+fn wide<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(target_arch = "x86_64")]
+    if avx2() {
+        #[target_feature(enable = "avx2")]
+        fn with_avx2<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+        // SAFETY: `with_avx2` needs only AVX2, which the CPU was just found
+        // to have.
+        return unsafe { with_avx2(f) };
+    }
+    f()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn avx2() -> bool {
+    #[cfg(test)]
+    if tests::PORTABLE.get() {
+        return false;
+    }
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
 /// Rows for the default counting methods, kept between calls so counting
 /// allocates nothing.
 #[derive(Default)]
@@ -202,6 +234,41 @@ impl V210<'_> {
             .0
     }
 
+    /// Whole groups' lit pixels, and those lit by chroma alone. Always
+    /// inlined, as the loops below are, so that [`wide`] compiles them.
+    #[inline(always)]
+    fn groups_lit(row: &[[u8; 16]], thr: u32, dc: u32) -> (u32, u32) {
+        let (mut n, mut co) = (0u32, 0u32);
+        for g in row {
+            let v = words(g);
+            let c = [
+                Self::pair_off(&v, 0, dc),
+                Self::pair_off(&v, 1, dc),
+                Self::pair_off(&v, 2, dc),
+            ];
+            for (i, &(word, slot)) in Y_AT.iter().enumerate() {
+                let yl = u32::from(u32::from(field(v[word], slot)) > thr);
+                n += yl | c[i / 2];
+                co += c[i / 2] & (yl ^ 1);
+            }
+        }
+        (n, co)
+    }
+
+    /// Whole groups' lit pixels, each pair's chroma taken from `flags`,
+    /// three a group.
+    #[inline(always)]
+    fn groups_lit_flags(row: &[[u8; 16]], flags: &[u8], thr: u32) -> u32 {
+        let mut n = 0u32;
+        for (bytes, f) in row.iter().zip(flags.as_chunks::<3>().0) {
+            let v = words(bytes);
+            for (i, &(word, slot)) in Y_AT.iter().enumerate() {
+                n += u32::from(u32::from(field(v[word], slot)) > thr) | u32::from(f[i / 2]);
+            }
+        }
+        n
+    }
+
     /// Group `g`'s pair `k` lit by chroma.
     fn pair_off(v: &[u32; 4], k: usize, dc: u32) -> u32 {
         let (cb, cr) = (CB_AT[k], CR_AT[k]);
@@ -258,51 +325,39 @@ impl Samples for V210<'_> {
     // pixels of a group cut by a quarter's edge go one at a time.
 
     fn count_lit(&self, y: u32, thr: u16, dc: u32, _: &mut RowScratch) -> (u32, u8, u32) {
-        let (row, w, thr) = (self.row(y), self.width as usize, u32::from(thr));
-        let mut chroma_only = 0u32;
-        let mut pixel = |x: usize| {
-            let v = words(&row[x / 6]);
-            let i = x % 6;
-            let yl = u32::from(u32::from(field(v[Y_AT[i].0], Y_AT[i].1)) > thr);
-            let cl = Self::pair_off(&v, i / 2, dc);
-            chroma_only += cl & (yl ^ 1);
-            yl | cl
-        };
-        let groups = |g0: usize, g1: usize| {
-            let (mut n, mut co) = (0u32, 0u32);
-            for g in &row[g0..g1] {
-                let v = words(g);
-                let c = [
-                    Self::pair_off(&v, 0, dc),
-                    Self::pair_off(&v, 1, dc),
-                    Self::pair_off(&v, 2, dc),
-                ];
-                for (i, &(word, slot)) in Y_AT.iter().enumerate() {
-                    let yl = u32::from(u32::from(field(v[word], slot)) > thr);
-                    n += yl | c[i / 2];
-                    co += c[i / 2] & (yl ^ 1);
+        wide(
+            #[inline(always)]
+            || {
+                let (row, w, thr) = (self.row(y), self.width as usize, u32::from(thr));
+                let mut chroma_only = 0u32;
+                let mut pixel = |x: usize| {
+                    let v = words(&row[x / 6]);
+                    let i = x % 6;
+                    let yl = u32::from(u32::from(field(v[Y_AT[i].0], Y_AT[i].1)) > thr);
+                    let cl = Self::pair_off(&v, i / 2, dc);
+                    chroma_only += cl & (yl ^ 1);
+                    yl | cl
+                };
+                let (mut n, mut mask, mut co_groups) = (0u32, 0u8, 0u32);
+                for q in 0..4 {
+                    let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
+                    let (g0, g1) = (x0.div_ceil(6), x1 / 6);
+                    let mut m = 0u32;
+                    if g0 < g1 {
+                        m += (x0..g0 * 6).map(&mut pixel).sum::<u32>();
+                        let (gn, gco) = Self::groups_lit(&row[g0..g1], thr, dc);
+                        m += gn;
+                        co_groups += gco;
+                        m += (g1 * 6..x1).map(&mut pixel).sum::<u32>();
+                    } else {
+                        m += (x0..x1).map(&mut pixel).sum::<u32>();
+                    }
+                    n += m;
+                    mask |= u8::from(m > 0) << q;
                 }
-            }
-            (n, co)
-        };
-        let (mut n, mut mask, mut co_groups) = (0u32, 0u8, 0u32);
-        for q in 0..4 {
-            let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
-            let (g0, g1) = (x0.div_ceil(6), x1 / 6);
-            let mut m = 0u32;
-            if g0 < g1 {
-                m += (x0..g0 * 6).map(&mut pixel).sum::<u32>();
-                let (gn, gco) = groups(g0, g1);
-                m += gn;
-                co_groups += gco;
-                m += (g1 * 6..x1).map(&mut pixel).sum::<u32>();
-            } else {
-                m += (x0..x1).map(&mut pixel).sum::<u32>();
-            }
-            n += m;
-            mask |= u8::from(m > 0) << q;
-        }
-        (n, mask, chroma_only + co_groups)
+                (n, mask, chroma_only + co_groups)
+            },
+        )
     }
 
     fn luma_at(&self, y: u32, xs: &[u32], out: &mut [u16], _: &mut RowScratch) {
@@ -314,50 +369,49 @@ impl Samples for V210<'_> {
     }
 
     fn chroma_flags(&self, y: u32, dc: u32, out: &mut Vec<u8>, _: &mut RowScratch) {
-        let pairs = (self.width as usize).div_ceil(2);
-        out.clear();
-        for g in self.row(y) {
-            let v = words(g);
-            for k in 0..3 {
-                out.push(Self::pair_off(&v, k, dc) as u8);
-            }
-        }
-        out.truncate(pairs);
+        wide(
+            #[inline(always)]
+            || {
+                let pairs = (self.width as usize).div_ceil(2);
+                out.clear();
+                for g in self.row(y) {
+                    let v = words(g);
+                    for k in 0..3 {
+                        out.push(Self::pair_off(&v, k, dc) as u8);
+                    }
+                }
+                out.truncate(pairs);
+            },
+        )
     }
 
     fn count_lit_flags(&self, y: u32, thr: u16, flags: &[u8], _: &mut RowScratch) -> (u32, u8) {
-        let (row, w, thr) = (self.row(y), self.width as usize, u32::from(thr));
-        let pixel = |x: usize| {
-            let (word, slot) = Y_AT[x % 6];
-            u32::from(u32::from(field(words(&row[x / 6])[word], slot)) > thr)
-                | u32::from(flags[x / 2])
-        };
-        let groups = |g0: usize, g1: usize| {
-            let mut n = 0u32;
-            for (g, bytes) in row.iter().enumerate().take(g1).skip(g0) {
-                let v = words(bytes);
-                for (i, &(word, slot)) in Y_AT.iter().enumerate() {
-                    n += u32::from(u32::from(field(v[word], slot)) > thr)
-                        | u32::from(flags[3 * g + i / 2]);
+        wide(
+            #[inline(always)]
+            || {
+                let (row, w, thr) = (self.row(y), self.width as usize, u32::from(thr));
+                let pixel = |x: usize| {
+                    let (word, slot) = Y_AT[x % 6];
+                    u32::from(u32::from(field(words(&row[x / 6])[word], slot)) > thr)
+                        | u32::from(flags[x / 2])
+                };
+                let (mut n, mut mask) = (0u32, 0u8);
+                for q in 0..4 {
+                    let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
+                    let (g0, g1) = (x0.div_ceil(6), x1 / 6);
+                    let m = if g0 < g1 {
+                        (x0..g0 * 6).map(pixel).sum::<u32>()
+                            + Self::groups_lit_flags(&row[g0..g1], &flags[3 * g0..3 * g1], thr)
+                            + (g1 * 6..x1).map(pixel).sum::<u32>()
+                    } else {
+                        (x0..x1).map(pixel).sum()
+                    };
+                    n += m;
+                    mask |= u8::from(m > 0) << q;
                 }
-            }
-            n
-        };
-        let (mut n, mut mask) = (0u32, 0u8);
-        for q in 0..4 {
-            let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
-            let (g0, g1) = (x0.div_ceil(6), x1 / 6);
-            let m = if g0 < g1 {
-                (x0..g0 * 6).map(pixel).sum::<u32>()
-                    + groups(g0, g1)
-                    + (g1 * 6..x1).map(pixel).sum::<u32>()
-            } else {
-                (x0..x1).map(pixel).sum()
-            };
-            n += m;
-            mask |= u8::from(m > 0) << q;
-        }
-        (n, mask)
+                (n, mask)
+            },
+        )
     }
 }
 
@@ -467,6 +521,15 @@ impl TunnelBars<'_> {
             .iter()
             .map(|p| u32::from_be_bytes(*p))
     }
+
+    /// Row `y`'s pixels in pairs, each pair's two words as bytes.
+    fn pairs(&self, y: u32) -> &[[u8; 8]] {
+        let t = &self.0;
+        let start = y as usize * t.row_bytes;
+        t.bytes[start..start + t.width as usize * 4]
+            .as_chunks::<8>()
+            .0
+    }
 }
 
 /// A word's 12-bit luma and chroma, as [`Tunnel`] unpacks them.
@@ -522,30 +585,37 @@ impl Samples for TunnelBars<'_> {
     // rescaled, and each chroma pair tested once for its two pixels.
 
     fn count_lit(&self, y: u32, thr: u16, dc: u32, _: &mut RowScratch) -> (u32, u8, u32) {
-        let (from, (lo, span)) = (luma_from(thr), chroma_window(dc));
-        let words: Vec<u32> = self.words(y).collect();
-        let w = words.len();
-        let (mut n, mut mask, mut chroma_only) = (0u32, 0u8, 0u32);
-        for q in 0..4 {
-            let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
-            let mut m = 0u32;
-            for k in x0 / 2..x1.div_ceil(2) {
-                let (a, b) = (unpack(words[2 * k]), unpack(words[2 * k + 1]));
-                let cl = u32::from(
-                    (a.1 as u32).wrapping_sub(lo) > span || (b.1 as u32).wrapping_sub(lo) > span,
-                );
-                for (x, l) in [(2 * k, a.0), (2 * k + 1, b.0)] {
-                    if (x0..x1).contains(&x) {
-                        let yl = u32::from(l >= from);
-                        m += yl | cl;
-                        chroma_only += cl & (yl ^ 1);
+        wide(
+            #[inline(always)]
+            || {
+                let (t, row) = (Codes::new(thr, dc), self.pairs(y));
+                let w = 2 * row.len();
+                // Each quarter's whole pairs in one loop, with no test of
+                // where a pixel is; a pixel whose pair it shares with the
+                // next quarter, at an odd edge, goes on its own.
+                let pixel = |x: usize| {
+                    let p = &row[x / 2];
+                    let l = t.luma(word(p, x % 2));
+                    (l, t.pair_off(p) & (l ^ 1))
+                };
+                let (mut n, mut mask, mut chroma_only) = (0u32, 0u8, 0u32);
+                for q in 0..4 {
+                    let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
+                    let (mut l, mut co) = t.pairs(&row[whole(x0, x1)]);
+                    for x in edges(x0, x1) {
+                        let (pl, pco) = pixel(x);
+                        l += pl;
+                        co += pco;
                     }
+                    // Lit is lit by luma, or by chroma alone.
+                    let m = l + co;
+                    n += m;
+                    chroma_only += co;
+                    mask |= u8::from(m > 0) << q;
                 }
-            }
-            n += m;
-            mask |= u8::from(m > 0) << q;
-        }
-        (n, mask, chroma_only)
+                (n, mask, chroma_only)
+            },
+        )
     }
 
     fn luma_at(&self, y: u32, xs: &[u32], out: &mut [u16], _: &mut RowScratch) {
@@ -558,37 +628,120 @@ impl Samples for TunnelBars<'_> {
     }
 
     fn chroma_flags(&self, y: u32, dc: u32, out: &mut Vec<u8>, _: &mut RowScratch) {
-        let (lo, span) = chroma_window(dc);
-        let mut words = self.words(y);
-        out.clear();
-        while let (Some(a), Some(b)) = (words.next(), words.next()) {
-            let (a, b) = (unpack(a).1 as u32, unpack(b).1 as u32);
-            out.push(u8::from(
-                a.wrapping_sub(lo) > span || b.wrapping_sub(lo) > span,
-            ));
-        }
+        wide(
+            #[inline(always)]
+            || {
+                let (t, row) = (Codes::new(0, dc), self.pairs(y));
+                out.clear();
+                out.extend(row.iter().map(|p| t.pair_off(p) as u8));
+            },
+        )
     }
 
     fn count_lit_flags(&self, y: u32, thr: u16, flags: &[u8], _: &mut RowScratch) -> (u32, u8) {
-        let from = luma_from(thr);
-        let words: Vec<u32> = self.words(y).collect();
-        let w = words.len();
-        let (mut n, mut mask) = (0u32, 0u8);
-        for q in 0..4 {
-            let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
-            let m: u32 = (x0..x1)
-                .map(|x| u32::from(unpack(words[x]).0 >= from) | u32::from(flags[x / 2]))
-                .sum();
-            n += m;
-            mask |= u8::from(m > 0) << q;
+        wide(
+            #[inline(always)]
+            || {
+                let (t, row) = (Codes::new(thr, 0), self.pairs(y));
+                let w = 2 * row.len();
+                let pixel = |x: usize| t.luma(word(&row[x / 2], x % 2)) | u32::from(flags[x / 2]);
+                let (mut n, mut mask) = (0u32, 0u8);
+                for q in 0..4 {
+                    let (x0, x1) = (q * w / 4, (q + 1) * w / 4);
+                    let k = whole(x0, x1);
+                    let mut m = 0u32;
+                    for (p, &f) in row[k.clone()].iter().zip(&flags[k]) {
+                        let f = u32::from(f);
+                        m += (t.luma(word(p, 0)) | f) + (t.luma(word(p, 1)) | f);
+                    }
+                    m += edges(x0, x1).map(pixel).sum::<u32>();
+                    n += m;
+                    mask |= u8::from(m > 0) << q;
+                }
+                (n, mask)
+            },
+        )
+    }
+}
+
+/// The pairs wholly inside `x0..x1`: none for a quarter of no pixels, as a
+/// quarter of a narrow row can be.
+fn whole(x0: usize, x1: usize) -> std::ops::Range<usize> {
+    x0.div_ceil(2)..(x1 / 2).max(x0.div_ceil(2))
+}
+
+/// The pixels of `x0..x1` outside its whole pairs: `x0` when odd, the last
+/// when `x1` is.
+fn edges(x0: usize, x1: usize) -> impl Iterator<Item = usize> {
+    let first = (x0 < x1 && x0 % 2 == 1).then_some(x0);
+    // Never `x0` twice: with both odd, `x1` is at least `x0 + 2`.
+    let last = (x0 < x1 && x1 % 2 == 1).then(|| x1 - 1);
+    first.into_iter().chain(last)
+}
+
+/// Pixel `i` (0 or 1) of a pair's two big-endian words.
+fn word(p: &[u8; 8], i: usize) -> u32 {
+    u32::from_be_bytes([p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]])
+}
+
+/// One call's thresholds in 12-bit codes: luma lit from `from`, chroma off
+/// outside the window `lo` and `span` wide, as [`chroma_window`] gives it.
+#[derive(Clone, Copy)]
+struct Codes {
+    from: u32,
+    lo: u32,
+    span: u32,
+}
+
+impl Codes {
+    fn new(thr: u16, dc: u32) -> Self {
+        let (lo, span) = chroma_window(dc);
+        Self {
+            from: luma_from(thr) as u32,
+            lo,
+            span,
         }
-        (n, mask)
+    }
+
+    // Each field taken from the word where it lies, as [`unpack`] has them,
+    // in plain u32 arithmetic: no table and no branch, so the compiler can
+    // run a row's pairs several to an instruction.
+
+    fn luma(self, w: u32) -> u32 {
+        u32::from(((w >> 8) & 0xFF0 | (w >> 2) & 0xF) >= self.from)
+    }
+
+    fn off(self, w: u32) -> bool {
+        ((w >> 18) & 0xFF0 | (w >> 6) & 0xF).wrapping_sub(self.lo) > self.span
+    }
+
+    fn pair_off(self, p: &[u8; 8]) -> u32 {
+        u32::from(self.off(word(p, 0)) | self.off(word(p, 1)))
+    }
+
+    /// The pairs' pixels lit by luma, and lit by chroma alone.
+    #[inline(always)]
+    fn pairs(self, row: &[[u8; 8]]) -> (u32, u32) {
+        let (mut l, mut co) = (0u32, 0u32);
+        for p in row {
+            let (la, lb) = (self.luma(word(p, 0)), self.luma(word(p, 1)));
+            l += la + lb;
+            co += self.pair_off(p) * (2 - la - lb);
+        }
+        (l, co)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bars::Bars;
+
+    thread_local! {
+        /// Set: [`wide`] runs its loops as built, without AVX2, so a test
+        /// can check both.
+        pub(super) static PORTABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     /// The tables and the row walk give what unpacking each pixel and
     /// rescaling it gives, on every code and on a frame of noise.
@@ -690,27 +843,123 @@ mod tests {
         }
     }
 
-    /// Rows of random v210 near the thresholds: luma around black, chroma
-    /// around neutral, so every test goes both ways.
-    fn frame(w: u32, h: u32, seed: u64) -> (Vec<u8>, usize) {
-        let row_bytes = (w as usize).div_ceil(6) * 16 + 16;
-        let mut bytes = vec![0u8; row_bytes * h as usize];
-        let mut x = seed;
-        let mut next = |lo: u32, span: u32| {
-            x = x
+    /// A pixel by kind, for the counting tests: each kind lands either side
+    /// of the thresholds they count at, in each format's own codes.
+    #[derive(Clone, Copy)]
+    enum Px {
+        /// Flat bar: black and neutral.
+        Bar,
+        /// Luma around black, chroma around neutral: every test goes both
+        /// ways.
+        Near,
+        /// Lit by luma.
+        Luma,
+        /// Black, lit by chroma alone.
+        Chroma,
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u32) -> u32 {
+            self.0 = self
+                .0
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            lo + ((x >> 33) as u32 % span)
-        };
-        for y in 0..h as usize {
-            for g in 0..(w as usize).div_ceil(6) {
+            (self.0 >> 33) as u32 % n
+        }
+    }
+
+    /// `h` rows of `w` pixels, in each shape the bar scan meets: noise, flat
+    /// bar, runs of every kind (some one pixel long), bar with a lit pixel or
+    /// two beside a quarter's edge, and bar either side of picture. The first
+    /// `top` and last `bottom` rows are bar.
+    fn kinds(w: usize, h: usize, top: usize, bottom: usize, r: &mut Rng) -> Vec<Px> {
+        let mut px = vec![Px::Bar; w * h];
+        for y in top..h.saturating_sub(bottom) {
+            let row = &mut px[y * w..(y + 1) * w];
+            let runs = |row: &mut [Px], kinds: &[Px], r: &mut Rng| {
+                let (mut x, len) = (0, row.len());
+                while x < len {
+                    let k = kinds[r.below(kinds.len() as u32) as usize];
+                    let n = 1 + r.below(12) as usize;
+                    row[x..(x + n).min(len)].fill(k);
+                    x += n;
+                }
+            };
+            match y % 5 {
+                0 => row.fill(Px::Near),
+                1 => {}
+                2 => runs(row, &[Px::Bar, Px::Near, Px::Luma, Px::Chroma], r),
+                3 => {
+                    let edge = (1 + r.below(3) as usize) * w / 4;
+                    let x = (edge + r.below(5) as usize).saturating_sub(2).min(w - 1);
+                    let n = 1 + r.below(2) as usize;
+                    row[x..(x + n).min(w)].fill([Px::Luma, Px::Chroma][r.below(2) as usize]);
+                }
+                _ => runs(&mut row[w / 8..w - w / 8], &[Px::Near, Px::Luma], r),
+            }
+        }
+        px
+    }
+
+    /// Bar rows each with one lit pixel, at and either side of every
+    /// quarter's edge and the row's ends, lit by luma or by chroma alone.
+    fn edge_cases(w: usize) -> Vec<Px> {
+        let mut px = Vec::new();
+        for e in [0, w / 4, w / 2, 3 * w / 4, w - 1] {
+            for x in e.saturating_sub(2)..(e + 3).min(w) {
+                for k in [Px::Luma, Px::Chroma] {
+                    let mut row = vec![Px::Bar; w];
+                    row[x] = k;
+                    px.extend(row);
+                }
+            }
+        }
+        px
+    }
+
+    /// Pixels as a tunnel frame, 12-bit full range.
+    fn tunnel(px: &[Px], w: usize, r: &mut Rng) -> (Vec<u8>, usize) {
+        let row_bytes = 4 * w + 12;
+        let mut bytes = vec![0u8; row_bytes * (px.len() / w)];
+        for (i, &k) in px.iter().enumerate() {
+            let (l, c) = match k {
+                Px::Bar => (r.below(4), 2046 + r.below(5)),
+                Px::Near => (r.below(200), 1950 + r.below(200)),
+                Px::Luma => (600 + r.below(3496), 1950 + r.below(200)),
+                Px::Chroma => (r.below(4), [r.below(1000), 3096 + r.below(1000)][i % 2]),
+            };
+            let (red, g, b) = (c >> 4, l >> 4, (c & 0xF) << 4 | (l & 0xF));
+            let word = red << 22 | g << 12 | b << 2;
+            let o = i / w * row_bytes + 4 * (i % w);
+            bytes[o..o + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        (bytes, row_bytes)
+    }
+
+    /// Pixels as a v210 frame; a last group's pixels past `w` are bar.
+    fn v210(px: &[Px], w: usize, r: &mut Rng) -> (Vec<u8>, usize) {
+        let groups = w.div_ceil(6);
+        let row_bytes = groups * 16 + 16;
+        let mut bytes = vec![0u8; row_bytes * (px.len() / w)];
+        for y in 0..px.len() / w {
+            for g in 0..groups {
                 // Word layout: Cb Y Cr | Y Cb Y | Cr Y Cb | Y Cr Y.
                 let mut words = [0u32; 4];
-                for &(word, slot) in &Y_AT {
-                    words[word] |= next(40, 80) << (10 * slot);
-                }
-                for &(word, slot) in CB_AT.iter().chain(CR_AT.iter()) {
-                    words[word] |= next(470, 85) << (10 * slot);
+                for i in 0..6 {
+                    let x = 6 * g + i;
+                    let k = if x < w { px[y * w + x] } else { Px::Bar };
+                    let (l, c) = match k {
+                        Px::Bar => (64, 511 + r.below(3)),
+                        Px::Near => (40 + r.below(80), 470 + r.below(85)),
+                        Px::Luma => (300 + r.below(640), 470 + r.below(85)),
+                        Px::Chroma => (64, [64 + r.below(236), 700 + r.below(260)][i % 2]),
+                    };
+                    // A pixel carries its pair's Cb when even, its Cr when odd.
+                    let (cw, cs) = [CB_AT, CR_AT][i % 2][i / 2];
+                    words[Y_AT[i].0] |= l << (10 * Y_AT[i].1);
+                    words[cw] |= c << (10 * cs);
                 }
                 for (k, wd) in words.iter().enumerate() {
                     let o = y * row_bytes + g * 16 + 4 * k;
@@ -719,6 +968,50 @@ mod tests {
             }
         }
         (bytes, row_bytes)
+    }
+
+    /// Every counting method of `fast` gives what the defaults give over
+    /// `plain`, on every row, at thresholds either side of the frames' codes,
+    /// with AVX2 and without.
+    fn same_counts(fast: &dyn Samples, plain: &dyn Samples, what: &str) {
+        let (w, h) = (fast.width(), fast.height());
+        let xs: Vec<u32> = (0..w).step_by(7).chain([w - 1]).collect();
+        let (mut s, mut a, mut b) = (RowScratch::default(), Vec::new(), Vec::new());
+        for portable in [false, true] {
+            PORTABLE.set(portable);
+            for y in 0..h {
+                for (thr, dc) in [(64, 16), (80, 16), (100, 30), (63, 0), (70, 4)] {
+                    assert_eq!(
+                        fast.count_lit(y, thr, dc, &mut s),
+                        plain.count_lit(y, thr, dc, &mut s),
+                        "count_lit {what} w {w} y {y} thr {thr} dc {dc} portable {portable}"
+                    );
+                    fast.chroma_flags(y, dc, &mut a, &mut s);
+                    plain.chroma_flags(y, dc, &mut b, &mut s);
+                    assert_eq!(a, b, "chroma_flags {what} w {w} y {y} dc {dc}");
+                    let (mut pa, mut pb) = (vec![0u16; xs.len()], vec![0u16; xs.len()]);
+                    fast.luma_at(y, &xs, &mut pa, &mut s);
+                    plain.luma_at(y, &xs, &mut pb, &mut s);
+                    assert_eq!(pa, pb, "luma_at {what} w {w} y {y}");
+                    // The flags as found, and with runs cut out, as the bar
+                    // scan passes them.
+                    for cut in [false, true] {
+                        let flags: Vec<u8> = a
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &f)| f & u8::from(!cut || i % 3 != 1))
+                            .collect();
+                        assert_eq!(
+                            fast.count_lit_flags(y, thr, &flags, &mut s),
+                            plain.count_lit_flags(y, thr, &flags, &mut s),
+                            "count_lit_flags {what} w {w} y {y} thr {thr} cut {cut} \
+                             portable {portable}"
+                        );
+                    }
+                }
+            }
+        }
+        PORTABLE.set(false);
     }
 
     /// A tunnel frame seen only through the four required methods.
@@ -739,62 +1032,27 @@ mod tests {
         }
     }
 
+    /// Frames to count over: rows of every shape, and the edge cases.
+    fn frames(w: usize, seed: u64) -> impl Iterator<Item = Vec<Px>> {
+        let mut r = Rng(seed);
+        [kinds(w, 20, 0, 0, &mut r), edge_cases(w)].into_iter()
+    }
+
     #[test]
     fn tunnel_bars_count_in_place_exactly_as_the_defaults_do() {
-        // Widths whose quarters end mid-pair (1002, 70) and do not.
-        for (w, seed) in [(3840u32, 1u64), (1920, 2), (1002, 3), (70, 4), (64, 5)] {
-            let h = 6u32;
-            let row_bytes = 4 * w as usize + 12;
-            let mut x = seed;
-            let mut next = |lo: u32, span: u32| {
-                x = x
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                lo + ((x >> 33) as u32 % span)
-            };
-            let mut bytes = vec![0u8; row_bytes * h as usize];
-            for y in 0..h as usize {
-                for px in 0..w as usize {
-                    // Luma around black, chroma around neutral, in 12 bits.
-                    let (l, c) = (next(0, 200), next(1950, 200));
-                    let (r, g, b) = (c >> 4, l >> 4, (c & 0xF) << 4 | (l & 0xF));
-                    let word = r << 22 | g << 12 | b << 2;
-                    let o = y * row_bytes + 4 * px;
-                    bytes[o..o + 4].copy_from_slice(&word.to_be_bytes());
-                }
-            }
-            let fast = TunnelBars(Tunnel::new(&bytes, w, h, row_bytes).expect("fits"));
-            let plain = PlainTunnel(TunnelBars(
-                Tunnel::new(&bytes, w, h, row_bytes).expect("fits"),
-            ));
-            let mut s = RowScratch::default();
-            let (mut a, mut b) = (Vec::new(), Vec::new());
-            for y in 0..h {
-                for (thr, dc) in [(64, 16), (80, 16), (100, 30), (63, 0), (70, 4)] {
-                    assert_eq!(
-                        fast.count_lit(y, thr, dc, &mut s),
-                        plain.count_lit(y, thr, dc, &mut s),
-                        "count_lit w {w} y {y} thr {thr} dc {dc}"
-                    );
-                    fast.chroma_flags(y, dc, &mut a, &mut s);
-                    plain.chroma_flags(y, dc, &mut b, &mut s);
-                    assert_eq!(a, b, "chroma_flags w {w} y {y} dc {dc}");
-                    let xs: Vec<u32> = (0..w).step_by(7).chain([w - 1]).collect();
-                    let (mut pa, mut pb) = (vec![0u16; xs.len()], vec![0u16; xs.len()]);
-                    fast.luma_at(y, &xs, &mut pa, &mut s);
-                    plain.luma_at(y, &xs, &mut pb, &mut s);
-                    assert_eq!(pa, pb, "luma_at w {w} y {y}");
-                    let flags: Vec<u8> = a
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &f)| f & u8::from(i % 3 != 1))
-                        .collect();
-                    assert_eq!(
-                        fast.count_lit_flags(y, thr, &flags, &mut s),
-                        plain.count_lit_flags(y, thr, &flags, &mut s),
-                        "count_lit_flags w {w} y {y} thr {thr}"
-                    );
-                }
+        // Widths whose quarters end mid-pair (1002, 70, 14, 6, 2) and do not.
+        for (w, seed) in [3840, 1920, 1002, 70, 66, 64, 14, 8, 6, 4, 2]
+            .into_iter()
+            .zip(1..)
+        {
+            for px in frames(w, seed) {
+                let (bytes, row_bytes) = tunnel(&px, w, &mut Rng(seed));
+                let (w, h) = (w as u32, (px.len() / w) as u32);
+                let fast = TunnelBars(Tunnel::new(&bytes, w, h, row_bytes).expect("fits"));
+                let plain = PlainTunnel(TunnelBars(
+                    Tunnel::new(&bytes, w, h, row_bytes).expect("fits"),
+                ));
+                same_counts(&fast, &plain, "tunnel");
             }
         }
     }
@@ -802,41 +1060,49 @@ mod tests {
     #[test]
     fn v210_counts_in_place_exactly_as_the_defaults_do() {
         // Widths that cut quarters mid-group, end mid-group, and are odd.
-        for (w, seed) in [(3840, 1), (1920, 2), (1918, 3), (1001, 4), (70, 5), (64, 6)] {
-            let h = 8;
-            let (bytes, row_bytes) = frame(w, h, seed);
-            let fast = V210::new(&bytes, w, h, row_bytes).expect("fits");
-            let plain = Plain(V210::new(&bytes, w, h, row_bytes).expect("fits"));
-            let mut s = RowScratch::default();
-            let (mut a, mut b) = (Vec::new(), Vec::new());
-            for y in 0..h {
-                for (thr, dc) in [(64, 16), (80, 16), (100, 30), (63, 0)] {
+        let widths = [3840, 1920, 1918, 1001, 70, 64, 13, 7, 6, 5, 3, 1];
+        for (w, seed) in widths.into_iter().zip(1..) {
+            for px in frames(w, seed) {
+                let (bytes, row_bytes) = v210(&px, w, &mut Rng(seed));
+                let (w, h) = (w as u32, (px.len() / w) as u32);
+                let fast = V210::new(&bytes, w, h, row_bytes).expect("fits");
+                let plain = Plain(V210::new(&bytes, w, h, row_bytes).expect("fits"));
+                same_counts(&fast, &plain, "v210");
+            }
+        }
+    }
+
+    /// The whole bar reading, run rule and continuation probes included, is
+    /// the same from the in-place methods as from the defaults: frames with
+    /// bars of several heights over rows of every shape.
+    #[test]
+    fn bars_read_the_same_in_place_as_from_the_defaults() {
+        for (w, h, top, bottom) in [
+            (3840, 216, 27, 27),
+            (1920, 120, 0, 0),
+            (1002, 160, 3, 40),
+            (70, 96, 1, 9),
+            (64, 64, 12, 13),
+        ] {
+            let px = kinds(w, h, top, bottom, &mut Rng(w as u64));
+            let read = |fast: &dyn Samples, plain: &dyn Samples, what: &str| {
+                for portable in [false, true] {
+                    PORTABLE.set(portable);
                     assert_eq!(
-                        fast.count_lit(y, thr, dc, &mut s),
-                        plain.count_lit(y, thr, dc, &mut s),
-                        "count_lit w {w} y {y} thr {thr} dc {dc}"
-                    );
-                    fast.chroma_flags(y, dc, &mut a, &mut s);
-                    plain.chroma_flags(y, dc, &mut b, &mut s);
-                    assert_eq!(a, b, "chroma_flags w {w} y {y} dc {dc}");
-                    let xs: Vec<u32> = (0..w).step_by(7).chain([w - 1]).collect();
-                    let (mut pa, mut pb) = (vec![0u16; xs.len()], vec![0u16; xs.len()]);
-                    fast.luma_at(y, &xs, &mut pa, &mut s);
-                    plain.luma_at(y, &xs, &mut pb, &mut s);
-                    assert_eq!(pa, pb, "luma_at w {w} y {y}");
-                    // Flags with runs cut out, as the bar scan passes them.
-                    let flags: Vec<u8> = a
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &f)| f & u8::from(i % 3 != 1))
-                        .collect();
-                    assert_eq!(
-                        fast.count_lit_flags(y, thr, &flags, &mut s),
-                        plain.count_lit_flags(y, thr, &flags, &mut s),
-                        "count_lit_flags w {w} y {y} thr {thr}"
+                        Bars::default().observe(fast),
+                        Bars::default().observe(plain),
+                        "{what} w {w} h {h} bars {top} {bottom} portable {portable}"
                     );
                 }
-            }
+                PORTABLE.set(false);
+            };
+            let (wu, hu) = (w as u32, h as u32);
+            let (bytes, row_bytes) = tunnel(&px, w, &mut Rng(1));
+            let t = || TunnelBars(Tunnel::new(&bytes, wu, hu, row_bytes).expect("fits"));
+            read(&t(), &PlainTunnel(t()), "tunnel");
+            let (bytes, row_bytes) = v210(&px, w, &mut Rng(2));
+            let v = || V210::new(&bytes, wu, hu, row_bytes).expect("fits");
+            read(&v(), &Plain(v()), "v210");
         }
     }
 }
