@@ -2548,70 +2548,79 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             ui.picture(b, resync, Instant::now());
                         }
                     }
-                    let free = (0..BUFFERS)
-                        .find(|&b| b != front && b != pending)
-                        .expect("three buffers, two in use");
-                    // Every change of input format is a new epoch for the
-                    // detector, which forgets what it learned.
-                    let started = Instant::now();
-                    let t = run_started.elapsed().as_secs_f64();
-                    let frame_info = *frame.info();
-                    let epoch = counts.format_changes as u32 + returns + 1;
-                    let (found, uploaded) = detect_and_upload(
-                        &pl,
-                        &mut finder,
-                        &frame,
-                        k.kind,
-                        cfg.lldv,
-                        last_tunnel.as_ref(),
-                        &mut sources,
-                        &mut stages,
-                        (t, epoch),
-                    )?;
-                    noted(&found, &frame_info, t);
-                    dataset.set_hdr(frame_info.color.hdr, t);
-                    dataset.record(cfg.record, &found, t, epoch, content);
-                    dataset.keep(&cfg, &found, t, &frame);
-                    let source = found.source;
-                    last_source = source;
-                    let view = view_for(
-                        (k.width, k.height),
-                        size,
-                        win,
-                        source,
-                        cfg.fill_max_ar.value(),
-                    );
-                    // Rendered into the output as it stands, which libplacebo maps
-                    // to, until the policy moves the output.
-                    if uploaded {
-                        draw(
+                    if asleep.is_some() {
+                        // Stopped: nothing goes out, so nothing is uploaded,
+                        // detected or drawn. The GPU's clocks can then rest
+                        // (14.2 W against 14.8 W rendering black, with each
+                        // frame still uploaded). The frame has said what it
+                        // wants above, which is what wakes the output.
+                        ready = None;
+                    } else {
+                        let free = (0..BUFFERS)
+                            .find(|&b| b != front && b != pending)
+                            .expect("three buffers, two in use");
+                        // Every change of input format is a new epoch for the
+                        // detector, which forgets what it learned.
+                        let started = Instant::now();
+                        let t = run_started.elapsed().as_secs_f64();
+                        let frame_info = *frame.info();
+                        let epoch = counts.format_changes as u32 + returns + 1;
+                        let (found, uploaded) = detect_and_upload(
                             &pl,
-                            &frame_info,
-                            content,
+                            &mut finder,
+                            &frame,
+                            k.kind,
+                            cfg.lldv,
                             last_tunnel.as_ref(),
                             &mut sources,
-                            &target(&targets, free, out_color, view, &cfg),
                             &mut stages,
+                            (t, epoch),
                         )?;
-                        ready = Some(free);
-                        ui.set_slate(None);
-                        if let Some(r) = stages.render.last() {
-                            // The frame's whole work, as it ran: detect beside
-                            // the upload, then the draw.
-                            window.borrow_mut().render(Instant::now(), r, ms(started));
+                        noted(&found, &frame_info, t);
+                        dataset.set_hdr(frame_info.color.hdr, t);
+                        dataset.record(cfg.record, &found, t, epoch, content);
+                        dataset.keep(&cfg, &found, t, &frame);
+                        let source = found.source;
+                        last_source = source;
+                        let view = view_for(
+                            (k.width, k.height),
+                            size,
+                            win,
+                            source,
+                            cfg.fill_max_ar.value(),
+                        );
+                        // Rendered into the output as it stands, which libplacebo maps
+                        // to, until the policy moves the output.
+                        if uploaded {
+                            draw(
+                                &pl,
+                                &frame_info,
+                                content,
+                                last_tunnel.as_ref(),
+                                &mut sources,
+                                &target(&targets, free, out_color, view, &cfg),
+                                &mut stages,
+                            )?;
+                            ready = Some(free);
+                            ui.set_slate(None);
+                            if let Some(r) = stages.render.last() {
+                                // The frame's whole work, as it ran: detect beside
+                                // the upload, then the draw.
+                                window.borrow_mut().render(Instant::now(), r, ms(started));
+                            }
+                        } else {
+                            // Nothing renders this format: black, not the last
+                            // picture held over it.
+                            counts.unrendered += 1;
+                            pl.clear_black(&targets[free])?;
+                            ready = Some(free);
+                            ui.set_slate(Some(Slate::CantShow {
+                                detail: match k.kind {
+                                    Kind::Unsupported(f) => cant_show(f),
+                                    other => describe(other),
+                                },
+                            }));
                         }
-                    } else {
-                        // Nothing renders this format: black, not the last
-                        // picture held over it.
-                        counts.unrendered += 1;
-                        pl.clear_black(&targets[free])?;
-                        ready = Some(free);
-                        ui.set_slate(Some(Slate::CantShow {
-                            detail: match k.kind {
-                                Kind::Unsupported(f) => cant_show(f),
-                                other => describe(other),
-                            },
-                        }));
                     }
                 }
             }
