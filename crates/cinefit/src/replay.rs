@@ -19,6 +19,15 @@
 //! whole clip in milliseconds, with `--set KEY=VALUE` to try a policy
 //! parameter. The C++ version's saved readings replay too.
 //!
+//! `--bars-variant NAME:KEY=VALUE,...` runs a whole second detector, its bar
+//! reader set so, on the same decoded frames, saving its readings to
+//! `<save-readings>/NAME/`: a clip is read from disk once however many bar
+//! readers are tried, and the reading is the slow part. `--edge-rows DIR`
+//! keeps the outer rows of every v210 frame, as they are, in
+//! `DIR/<piece>.edges.v210` with an index `DIR/<piece>.edges.csv` (named apart
+//! from readings, so the two may share a directory): a bar level rule can then
+//! be tried on them without reading the clip again.
+//!
 //! Clips and anything derived from them are copyrighted footage: they stay on
 //! the machine, outside any repository. A pixel replay is disk- and
 //! zstd-bound and takes minutes per clip; do not run one beside a recording
@@ -32,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use cinefit_detect::ar_policy::{ArPolicy, Params};
+use cinefit_detect::bars;
 use cinefit_detect::readings::{self, Reading};
 use cinefit_detect::{Crop, Decision, Detector, V210};
 
@@ -53,6 +63,31 @@ pub struct Options {
     pub log: Option<PathBuf>,
     /// Summaries only, no list of crop changes.
     pub quiet: bool,
+    /// Bar readers to run beside the one built in, `NAME:KEY=VALUE,...`.
+    pub bars_variants: Vec<String>,
+    /// Keep each v210 frame's outer [`EDGE_ROWS`] rows a side here.
+    pub edge_rows: Option<PathBuf>,
+}
+
+/// Rows a side `--edge-rows` keeps: twice the bar level's rows at 2160.
+const EDGE_ROWS: usize = 16;
+
+/// A `--bars-variant` spec: its name and the bar reader it sets up.
+fn bars_variant(spec: &str) -> Result<(String, bars::Params), Box<dyn Error>> {
+    let (name, sets) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("--bars-variant {spec}: NAME:KEY=VALUE,..."))?;
+    if name.is_empty() || name.contains(['/', '.']) {
+        return Err(format!("--bars-variant {spec}: the name is a directory name").into());
+    }
+    let mut p = bars::Params::default();
+    for kv in sets.split(',').filter(|kv| !kv.is_empty()) {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("--bars-variant {spec}: KEY=VALUE"))?;
+        p.set(k.trim(), v.trim())?;
+    }
+    Ok((name.to_string(), p))
 }
 
 /// One crop change.
@@ -187,6 +222,24 @@ pub fn run(o: Options) -> Result<(), Box<dyn Error>> {
     if o.readings && o.save_readings.is_some() {
         return Err("--save-readings needs clips, not readings".into());
     }
+    let variants = o
+        .bars_variants
+        .iter()
+        .map(|s| bars_variant(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !variants.is_empty() {
+        let Some(dir) = &o.save_readings else {
+            return Err("--bars-variant needs --save-readings: its readings are the result".into());
+        };
+        for (n, _) in &variants {
+            if variants.iter().filter(|(m, _)| m == n).count() > 1 {
+                return Err(format!("--bars-variant {n} given twice").into());
+            }
+            for d in [Some(dir), o.log.as_ref()].into_iter().flatten() {
+                std::fs::create_dir_all(d.join(n))?;
+            }
+        }
+    }
     let mut params = Params::default();
     for kv in &o.sets {
         let (k, v) = kv
@@ -194,7 +247,10 @@ pub fn run(o: Options) -> Result<(), Box<dyn Error>> {
             .ok_or_else(|| format!("--set {kv}: KEY=VALUE"))?;
         params.set(k.trim(), v.trim())?;
     }
-    for dir in [&o.log, &o.save_readings].into_iter().flatten() {
+    for dir in [&o.log, &o.save_readings, &o.edge_rows]
+        .into_iter()
+        .flatten()
+    {
         std::fs::create_dir_all(dir)?;
     }
     let mut all = Piece::default();
@@ -211,7 +267,7 @@ pub fn run(o: Options) -> Result<(), Box<dyn Error>> {
                 }
             }
         } else {
-            piece(dir, &o)?
+            piece(dir, &o, &variants)?
         };
         all.unfaithful += p.unfaithful;
         all.frames += p.frames;
@@ -281,9 +337,20 @@ struct Run {
 
 impl Run {
     fn new(name: String, o: &Options) -> Result<Self, Box<dyn Error>> {
-        let cpp = match &o.compare {
+        Self::new_in(name.clone(), name, o.compare.as_deref(), o.log.as_deref())
+    }
+
+    /// `name` as reported, `file` as the logs name it, the C++ logs in
+    /// `compare` and this run's own in `log`.
+    fn new_in(
+        name: String,
+        file: String,
+        compare: Option<&Path>,
+        log: Option<&Path>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let cpp = match compare {
             Some(d) => {
-                let path = d.join(format!("{name}.cinefit.csv"));
+                let path = d.join(format!("{file}.cinefit.csv"));
                 if path.exists() {
                     Some(cpp_log(&path)?)
                 } else {
@@ -293,9 +360,9 @@ impl Run {
             }
             None => None,
         };
-        let log = match &o.log {
+        let log = match log {
             Some(d) => {
-                let mut w = BufWriter::new(File::create(d.join(format!("{name}.rust.csv")))?);
+                let mut w = BufWriter::new(File::create(d.join(format!("{file}.rust.csv")))?);
                 writeln!(
                     w,
                     "index,time,class,edge_top,edge_bottom,crop_top,crop_bottom,candidate_top,candidate_bottom,evidence,threshold,reason"
@@ -430,26 +497,114 @@ impl Run {
     }
 }
 
-/// A piece's pixels through the whole detector.
-fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
+/// One detector over a piece's frames: the one built in, or a bar reader
+/// variant beside it.
+struct Lane {
+    det: Detector,
+    run: Run,
+    saved: Option<BufWriter<File>>,
+    /// The policy alone over each reading as written, in step with the
+    /// pixels: a reading that loses what the policy needs (to rounding, say)
+    /// shows here as a frame whose crop differs.
+    lockstep: ArPolicy,
+    unfaithful: u64,
+    detect_ms: Vec<f64>,
+}
+
+impl Lane {
+    fn new(det: Detector, run: Run, readings: Option<PathBuf>) -> Result<Self, Box<dyn Error>> {
+        let saved = match readings {
+            Some(path) => {
+                let mut w = BufWriter::new(File::create(path)?);
+                writeln!(w, "{}", readings::header())?;
+                Some(w)
+            }
+            None => None,
+        };
+        Ok(Self {
+            det,
+            run,
+            saved,
+            lockstep: ArPolicy::default(),
+            unfaithful: 0,
+            detect_ms: Vec::new(),
+        })
+    }
+
+    fn push(
+        &mut self,
+        read: &dyn cinefit_detect::Samples,
+        frame: u64,
+        time: f64,
+        epoch: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let t = Instant::now();
+        let (d, obs, cut) = self.det.push_reading(read, time, epoch);
+        self.detect_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        self.run.step(frame, time, &d)?;
+        if let Some(w) = self.saved.as_mut() {
+            let line = readings::format(&Reading {
+                index: frame,
+                time,
+                epoch,
+                obs,
+                cut,
+            });
+            writeln!(w, "{line}")?;
+            let back = readings::parse(&line).ok_or("a reading that does not read back")?;
+            if self
+                .lockstep
+                .push(&back.obs, back.cut, back.time, back.epoch)
+                .crop
+                != d.crop
+            {
+                self.unfaithful += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A piece's pixels through the whole detector, and through each bar reader
+/// variant's.
+fn piece(
+    dir: &Path,
+    o: &Options,
+    variants: &[(String, bars::Params)],
+) -> Result<Piece, Box<dyn Error>> {
     let name = name_of(dir);
     let index = record::read_index(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut run = Run::new(name.clone(), o)?;
-    let mut saved = match &o.save_readings {
+    let save = o.save_readings.as_deref();
+    let mut lanes = vec![Lane::new(
+        Detector::default(),
+        Run::new(name.clone(), o)?,
+        save.map(|d| d.join(format!("{name}.csv"))),
+    )?];
+    for (v, p) in variants {
+        let log = o.log.as_ref().map(|d| d.join(v));
+        lanes.push(Lane::new(
+            Detector::with_bars(*p),
+            Run::new_in(format!("{name} [{v}]"), name.clone(), None, log.as_deref())?,
+            save.map(|d| d.join(v).join(format!("{name}.csv"))),
+        )?);
+    }
+
+    // The frame number, size and where its rows start, then the rows: the
+    // top EDGE_ROWS from the frame edge down, the bottom from the frame edge
+    // up, each as row_bytes of v210.
+    let mut edges = match &o.edge_rows {
         Some(d) => {
-            let mut w = BufWriter::new(File::create(d.join(format!("{name}.csv")))?);
-            writeln!(w, "{}", readings::header())?;
-            Some(w)
+            let mut csv = BufWriter::new(File::create(d.join(format!("{name}.edges.csv")))?);
+            writeln!(csv, "index,time,width,height,row_bytes,offset")?;
+            Some((
+                csv,
+                BufWriter::new(File::create(d.join(format!("{name}.edges.v210")))?),
+                0u64,
+            ))
         }
         None => None,
     };
-    // The policy alone over each reading as written, in step with the
-    // pixels: a reading that loses what the policy needs (to rounding, say)
-    // shows here as a frame whose crop differs.
-    let mut lockstep = ArPolicy::default();
-
-    let mut det = Detector::default();
-    let (mut skipped, mut detect_ms, mut unfaithful) = (0u64, Vec::new(), 0u64);
+    let mut skipped = 0u64;
     let (mut epoch, mut format) = (1u32, None);
     let started = Instant::now();
     let lost = record::for_each_frame::<Box<dyn Error>>(
@@ -486,34 +641,30 @@ fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
                     return Ok(());
                 }
             };
-            let t = Instant::now();
-            let (d, obs, cut) = det.push_reading(read, f.time, epoch);
-            detect_ms.push(t.elapsed().as_secs_f64() * 1000.0);
-            run.step(f.frame_number, f.time, &d)?;
-            if let Some(w) = saved.as_mut() {
-                let line = readings::format(&Reading {
-                    index: f.frame_number,
-                    time: f.time,
-                    epoch,
-                    obs,
-                    cut,
-                });
-                writeln!(w, "{line}")?;
-                let back = readings::parse(&line).ok_or("a reading that does not read back")?;
-                if lockstep
-                    .push(&back.obs, back.cut, back.time, back.epoch)
-                    .crop
-                    != d.crop
-                {
-                    unfaithful += 1;
+            for lane in &mut lanes {
+                lane.push(read, f.frame_number, f.time, epoch)?;
+            }
+            if let (Some(_), Some((csv, rows, offset))) = (&v, edges.as_mut())
+                && f.height >= 2 * EDGE_ROWS
+            {
+                let rb = f.row_bytes;
+                writeln!(
+                    csv,
+                    "{},{:.6},{},{},{rb},{offset}",
+                    f.frame_number, f.time, f.width, f.height
+                )?;
+                for y in (0..EDGE_ROWS).chain((0..EDGE_ROWS).map(|k| f.height - 1 - k)) {
+                    rows.write_all(&bytes[y * rb..(y + 1) * rb])?;
                 }
+                *offset += (2 * EDGE_ROWS * rb) as u64;
             }
             Ok(())
         },
     )?;
     let wall = started.elapsed().as_secs_f64();
-    if let Some(mut w) = saved {
-        w.flush()?;
+    if let Some((mut csv, mut rows, _)) = edges {
+        csv.flush()?;
+        rows.flush()?;
     }
     let span = (
         index.first().map_or(0.0, |f| f.time),
@@ -528,29 +679,45 @@ fn piece(dir: &Path, o: &Options) -> Result<Piece, Box<dyn Error>> {
     if lost > 0 {
         head += &format!(", the stream cut short {lost} frames before the index ends");
     }
-    let frames = run.p.frames;
-    let mut p = run.finish(det.policy(), span, size, &head, o.quiet)?;
-    p.skipped = skipped;
-    p.unfaithful = unfaithful;
-    let detect_total: f64 = detect_ms.iter().sum::<f64>() / 1000.0;
-    if let Some((m, p95, max)) = spread(&mut detect_ms.clone()) {
-        println!(
-            "  detector: median {m:.2} ms, p95 {p95:.2}, max {max:.2} per frame; reading the clip {:.0} frames/s",
-            frames as f64 / (wall - detect_total).max(1e-9)
-        );
+    let detect_total: f64 = lanes.iter().flat_map(|l| &l.detect_ms).sum::<f64>() / 1000.0;
+    let mut out = Piece::default();
+    for (k, mut lane) in lanes.into_iter().enumerate() {
+        if let Some(mut w) = lane.saved.take() {
+            w.flush()?;
+        }
+        let frames = lane.run.p.frames;
+        let mut p = lane
+            .run
+            .finish(lane.det.policy(), span, size, &head, o.quiet)?;
+        p.skipped = skipped;
+        p.unfaithful = lane.unfaithful;
+        if let Some((m, p95, max)) = spread(&mut lane.detect_ms.clone()) {
+            println!(
+                "  detector: median {m:.2} ms, p95 {p95:.2}, max {max:.2} per frame; reading the clip {:.0} frames/s",
+                frames as f64 / (wall - detect_total).max(1e-9)
+            );
+        }
+        p.detect_ms = lane.detect_ms;
+        if o.save_readings.is_some() {
+            println!(
+                "  readings replay: {} frames differ from the pixel run{}",
+                lane.unfaithful,
+                if lane.unfaithful > 0 {
+                    "  -- NOT FAITHFUL"
+                } else {
+                    ""
+                }
+            );
+        }
+        // The totals are the built-in detector's; a variant counts only if
+        // its readings are not faithful, which fails the run.
+        if k == 0 {
+            out = p;
+        } else {
+            out.unfaithful += p.unfaithful;
+        }
     }
-    p.detect_ms = detect_ms;
-    if o.save_readings.is_some() {
-        println!(
-            "  readings replay: {unfaithful} frames differ from the pixel run{}",
-            if unfaithful > 0 {
-                "  -- NOT FAITHFUL"
-            } else {
-                ""
-            }
-        );
-    }
-    Ok(p)
+    Ok(out)
 }
 
 /// A readings file through the policy alone.

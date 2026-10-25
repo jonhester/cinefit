@@ -9,7 +9,7 @@
 
 use crate::Samples;
 use crate::ar_policy::{ArPolicy, Crop, Decision};
-use crate::bars::{Bars, Observation};
+use crate::bars::{self, Bars, Observation};
 use crate::cuts::Cuts;
 
 #[derive(Default)]
@@ -21,6 +21,14 @@ pub struct Detector {
 }
 
 impl Detector {
+    /// A detector whose bar reader runs with `p`: for trying one in replay.
+    pub fn with_bars(p: bars::Params) -> Self {
+        Self {
+            bars: Bars::new(p),
+            ..Self::default()
+        }
+    }
+
     /// One frame, at `time_s` (presentation time, monotonic). `epoch` is
     /// bumped by the caller on any change of resolution, frame rate or EOTF
     /// and on signal loss; the detector resets whatever it has learned when

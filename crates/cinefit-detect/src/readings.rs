@@ -20,7 +20,7 @@ pub struct Reading {
     pub cut: bool,
 }
 
-const SIDE: [&str; 14] = [
+const SIDE: [&str; 15] = [
     "found",
     "bar",
     "run",
@@ -35,9 +35,12 @@ const SIDE: [&str; 14] = [
     "ui",
     "ui_start",
     "island_start",
+    "level_confidence",
 ];
 /// Readings saved before `island_start` existed.
 const OLD_SIDE: usize = 13;
+/// Readings saved before `level_confidence` existed.
+const PRE_CONFIDENCE: usize = 14;
 const HEAD: usize = 9;
 
 /// The CSV header line.
@@ -54,8 +57,13 @@ pub fn header() -> String {
 }
 
 fn side(out: &mut String, s: &SideObs) {
+    // Not reported is an empty field, not zero.
+    let confidence = s
+        .level_confidence
+        .map(|c| format!("{c:.4}"))
+        .unwrap_or_default();
     out.push_str(&format!(
-        ",{},{},{},{},{:.4},{:.4},{:.4},{:.4},{},{},{},{},{},{}",
+        ",{},{},{},{},{:.4},{:.4},{:.4},{:.4},{},{},{},{},{},{},{}",
         u8::from(s.found),
         s.bar,
         s.run,
@@ -69,7 +77,8 @@ fn side(out: &mut String, s: &SideObs) {
         s.islands,
         u8::from(s.ui),
         s.ui_start,
-        s.island_start
+        s.island_start,
+        confidence
     ));
 }
 
@@ -116,6 +125,7 @@ fn parse_side(f: &[&str], n: usize) -> Option<SideObs> {
         // No position known: past any crop, so the policy never takes such
         // an island for text beyond it (as the C++ version reads them).
         island_start: if n > OLD_SIDE { u(13)? } else { u32::MAX / 2 },
+        level_confidence: if n > PRE_CONFIDENCE { x(14) } else { None },
     })
 }
 
@@ -142,6 +152,7 @@ pub fn parse(line: &str) -> Option<Reading> {
     let f: Vec<&str> = line.trim_end().split(',').collect();
     let n = match f.len() {
         l if l == HEAD + 2 * SIDE.len() => SIDE.len(),
+        l if l == HEAD + 2 * PRE_CONFIDENCE => PRE_CONFIDENCE,
         l if l == HEAD + 2 * OLD_SIDE => OLD_SIDE,
         _ => return None,
     };
@@ -189,6 +200,7 @@ mod tests {
             island_start: 300,
             ui: false,
             ui_start: 0,
+            level_confidence: Some(0.875),
         };
         Reading {
             index: 1234,
@@ -223,6 +235,10 @@ mod tests {
             ..r
         };
         assert_eq!(parse(&format(&weak)), Some(weak));
+        // An unreported confidence stays unreported, not zero.
+        let mut unknown = r;
+        unknown.obs.top.level_confidence = None;
+        assert_eq!(parse(&format(&unknown)), Some(unknown));
     }
 
     #[test]
@@ -273,12 +289,13 @@ mod tests {
 
     #[test]
     fn the_cpp_columns_and_its_older_files_read() {
-        // A line as the C++ version writes it, and one from before
-        // island_start: 13 fields a side.
+        // A line as the C++ version writes it, without a level confidence:
+        // 14 fields a side; and one from before island_start: 13.
         let new = "7,0.291958,1,3840,2160,LETTERBOX,0.6123,,0,1,276,280,64,0.9100,0.6123,1.0400,0.9500,4,0,0,0,0,1080,1,277,281,64,0.9000,0.6200,1.0100,0.9600,4,0,0,0,0,1080";
         let r = parse(new).expect("current columns");
         assert_eq!((r.index, r.obs.top.bar, r.obs.bottom.bar), (7, 276, 277));
         assert_eq!(r.obs.top.island_start, 1080);
+        assert_eq!(r.obs.top.level_confidence, None);
         let old = "7,0.291958,1,3840,2160,EMPTY,0.0000,,1,0,0,0,64,0.0000,0.0000,0.0000,0.0000,0,0,0,0,0,0,0,0,64,0.0000,0.0000,0.0000,0.0000,0,0,0,0,0";
         let r = parse(old).expect("old columns");
         assert!(r.cut && r.obs.class == FrameClass::Empty);
