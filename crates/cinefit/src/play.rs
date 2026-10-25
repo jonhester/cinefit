@@ -1939,6 +1939,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // menu wakes it with no source); whether stopping it was refused, not to
     // be tried again until the signal has come and gone.
     let (mut asleep, mut woke_at, mut sleep_refused) = (None::<Instant>, None::<Instant>, false);
+    // Since when the receiver has said it is in standby (#191). A source can
+    // still come through it (the Denon's HDMI pass-through), but with no sound
+    // nobody watches, so for output.idle_off it counts as no signal.
+    let mut standby_since: Option<Instant> = None;
     let mut next_status = STATUS_EVERY;
     let mut last_source = first_source;
     // Save frame (#92): asked for, and the writer's answers, written off the
@@ -2157,10 +2161,18 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     && let Some(o) = text.sections.iter_mut().find(|s| s.label == "OUT")
                 {
                     o.line = "stopped, for the display to sleep".into();
-                    o.detail = format!(
-                        "no signal for {} min",
-                        last_frame_at.elapsed().as_secs() / 60
-                    );
+                    o.detail = match (dark, standby_since) {
+                        (false, Some(t)) => {
+                            format!(
+                                "the receiver in standby for {} min",
+                                t.elapsed().as_secs() / 60
+                            )
+                        }
+                        _ => format!(
+                            "no signal for {} min",
+                            last_frame_at.elapsed().as_secs() / 60
+                        ),
+                    };
                 }
                 // The receiver's input, first on the IN line's detail.
                 if let Some(s) = &last_seen {
@@ -2298,6 +2310,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         }
                     }));
                 }
+                standby_since = match &seen {
+                    Some(s) if !s.on => standby_since.or_else(|| Some(Instant::now())),
+                    _ => None,
+                };
                 // The receiver to standby: the viewing is over, now.
                 if seen.as_ref().is_some_and(|s| !s.on) && dataset.recorder.is_some() {
                     info!("{t:.1} s: the receiver is off: the viewing ends");
@@ -2606,14 +2622,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // for a source nothing can show, so its slate can; and when
                 // the timeout is set to never, as it now says.
                 now = run_started.elapsed();
-                let want = if dark {
+                // A source through a receiver in standby does not light it:
+                // the receiver coming on does, as its frames then ask.
+                let quiet = dark || standby_since.is_some();
+                let want = if quiet {
                     latest_want = None;
                     None
                 } else {
                     latest_want.take()
                 };
                 let unshowable =
-                    !dark && matches!(last_key.map(|k| k.kind), Some(Kind::Unsupported(_)));
+                    !quiet && matches!(last_key.map(|k| k.kind), Some(Kind::Unsupported(_)));
                 let want = want.or_else(|| {
                     (menu.is_open() || cfg.idle_off == 0 || unshowable).then(|| follow::Want {
                         rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
@@ -2639,15 +2658,21 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // Nothing is in flight now: the moment for a modeset, new
                 // metadata, or stopping.
                 now = run_started.elapsed();
-                if !dark {
+                // Idle since the last frame, or since the receiver went to
+                // standby with a source still coming through it.
+                let idle_since = if dark {
+                    Some(last_frame_at)
+                } else {
+                    standby_since
+                };
+                if idle_since.is_none() {
                     sleep_refused = false;
                 }
                 let idle = Duration::from_secs(60 * u64::from(cfg.idle_off));
-                if dark
-                    && cfg.idle_off > 0
+                if cfg.idle_off > 0
                     && !sleep_refused
                     && !menu.is_open()
-                    && last_frame_at.elapsed() >= idle
+                    && idle_since.is_some_and(|t| t.elapsed() >= idle)
                     && woke_at.is_none_or(|t| t.elapsed() >= idle)
                 {
                     match out.sleep() {
@@ -2655,8 +2680,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             asleep = Some(Instant::now());
                             ready = None;
                             info!(
-                                "{:.1} s: no signal for {} min: output stopped, for the display to sleep",
+                                "{:.1} s: {} for {} min: output stopped, for the display to sleep",
                                 now.as_secs_f64(),
+                                if dark {
+                                    "no signal"
+                                } else {
+                                    "the receiver in standby"
+                                },
                                 cfg.idle_off
                             );
                             continue;

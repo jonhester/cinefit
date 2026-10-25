@@ -387,9 +387,10 @@ static SETTINGS: &[Setting] = &[
         key: "output.idle_off",
         kind: Kind::Int { min: 0, max: 240 },
         apply: Apply::Live,
-        help: "Minutes without an input signal before the output stops, so the display sees no signal and \
-               its own power-off or standby timer can run; 0 never stops it. A source coming back lights it \
-               again in the source's mode, a resync as from off.",
+        help: "Minutes without an input signal, or with the receiver (avr.denon) in standby, before the output \
+               stops, so the display sees no signal and its own power-off or standby timer can run; 0 never \
+               stops it. A source coming back, or the receiver coming on, lights it again in the source's mode, \
+               a resync as from off.",
         get: |c| Value::Int(c.idle_off.into()),
         set: Set::Int(|c, v| c.idle_off = v as u16),
     },
