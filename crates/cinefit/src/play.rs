@@ -384,10 +384,6 @@ fn scanout_peak(px: &[u8], stride: usize, fourcc: u32, size: (u32, u32)) -> Opti
 struct Sources<'p> {
     planes: Option<GpuPlanes<'p>>,
     rgb: Option<GpuRgb<'p>>,
-    /// The HDR10 source's peak, held between frames: the card attaches the
-    /// metadata only to frames it flags, and a peak that came and went would
-    /// make the tone mapping flicker.
-    pq_peak: Option<f32>,
 }
 
 /// Per-stage times, milliseconds.
@@ -1292,11 +1288,28 @@ fn upload<'p>(
     Ok(true)
 }
 
+/// The HDR10 source's peak for tone mapping: MaxCLL, or the mastering
+/// display's peak without it. From the metadata in force for the frame
+/// ([`carried_hdr`]), so it holds across frames without a block (a peak that
+/// came and went would make the tone mapping flicker) and is forgotten with
+/// it, so a new title is not mapped from the last one's peak (#195).
+fn pq_peak(hdr: Option<&HdrMetadata>) -> Option<f32> {
+    let h = hdr?;
+    let p = h
+        .max_cll
+        .filter(|&v| v > 0.0)
+        .or(h.max_mastering.filter(|&v| v > 0.0))?;
+    Some(p as f32)
+}
+
 /// The second half: the uploaded frame drawn into the target, with the crop
-/// the detector found for this same frame.
+/// the detector found for this same frame. `hdr` is the HDR10 metadata in
+/// force for it, carried over frames without a block.
+#[allow(clippy::too_many_arguments)]
 fn draw<'p>(
     pl: &'p Placebo,
     info: &FrameInfo,
+    hdr: Option<&HdrMetadata>,
     content: Content,
     tunnel: Option<&Tunnel>,
     sources: &mut Sources<'p>,
@@ -1322,21 +1335,15 @@ fn draw<'p>(
                     Some(dst.lldv_nits),
                     dst.lldv_nits,
                 ),
-                _ => {
-                    if color.transfer == Transfer::Pq
-                        && let Some(h) = info.color.hdr.as_ref()
-                    {
-                        // MaxCLL, or the mastering display's peak without it.
-                        let p = h
-                            .max_cll
-                            .filter(|&v| v > 0.0)
-                            .or(h.max_mastering.filter(|&v| v > 0.0));
-                        if let Some(p) = p {
-                            sources.pq_peak = Some(p as f32);
-                        }
-                    }
-                    (color, dst.source_peak.or(sources.pq_peak), dst.mapped_nits)
-                }
+                _ => (
+                    color,
+                    dst.source_peak.or_else(|| {
+                        (color.transfer == Transfer::Pq)
+                            .then(|| pq_peak(hdr))
+                            .flatten()
+                    }),
+                    dst.mapped_nits,
+                ),
             };
             let p = sources.planes.as_mut().expect("uploaded");
             // HDR into SDR is tone-mapped; anything else only changes space.
@@ -1808,6 +1815,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             draw(
                 &pl,
                 &first_info,
+                first_info.color.hdr.as_ref(),
                 Content::of(key.kind, cfg.lldv),
                 last_tunnel.as_ref(),
                 &mut sources,
@@ -2624,6 +2632,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             draw(
                                 &pl,
                                 &frame_info,
+                                hdr_meta.as_ref(),
                                 content,
                                 last_tunnel.as_ref(),
                                 &mut sources,
@@ -3136,6 +3145,51 @@ mod tests {
     }
 
     use super::*;
+
+    /// The tone mapping's peak goes with the HDR10 metadata in force: held
+    /// over frames without a block, forgotten when HDR10 ends (#195).
+    #[test]
+    fn the_hdr10_peak_does_not_outlive_its_title() {
+        let meta = |cll: Option<f64>, mastering: Option<f64>| HdrMetadata {
+            red: None,
+            green: None,
+            blue: None,
+            white: None,
+            max_mastering: mastering,
+            min_mastering: Some(0.005),
+            max_cll: cll,
+            max_fall: None,
+        };
+        let ycbcr = |transfer| YcbcrColor {
+            matrix: Matrix::Bt2020Nc,
+            primaries: Primaries::Bt2020,
+            transfer,
+        };
+        let hdr10 = Content::Hdr10(ycbcr(Transfer::Pq));
+        let menu = Content::Sdr(ycbcr(Transfer::Bt1886));
+        let mut kept = None;
+        let peak =
+            |content, frame, kept: &mut _| pq_peak(carried_hdr(content, frame, kept).as_ref());
+        // A 4000-nit grade, with and between its blocks.
+        assert_eq!(
+            peak(hdr10, Some(meta(None, Some(4000.0))), &mut kept),
+            Some(4000.0)
+        );
+        assert_eq!(peak(hdr10, None, &mut kept), Some(4000.0));
+        // MaxCLL first; a zero is no value.
+        assert_eq!(
+            peak(hdr10, Some(meta(Some(1445.0), Some(4000.0))), &mut kept),
+            Some(1445.0)
+        );
+        assert_eq!(
+            peak(hdr10, Some(meta(Some(0.0), Some(4000.0))), &mut kept),
+            Some(4000.0)
+        );
+        // A menu, then a title with neither: the 1000-nit fallback, not 4000.
+        assert_eq!(peak(menu, None, &mut kept), None);
+        assert_eq!(peak(hdr10, None, &mut kept), None);
+        assert_eq!(peak(hdr10, Some(meta(Some(0.0), None)), &mut kept), None);
+    }
 
     /// A session's HDR note keeps an unreported value apart from zero.
     #[test]
