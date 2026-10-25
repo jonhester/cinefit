@@ -2185,7 +2185,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(w) = &web {
                     let pill = match last_key.filter(|_| !dark).map(|k| k.kind) {
-                        None if asleep.is_some() => "Output stopped",
+                        // Stopped with a source still coming through the
+                        // receiver in standby, as well as with no signal.
+                        _ if asleep.is_some() => "Output stopped",
                         None => "Waiting",
                         Some(Kind::Unsupported(_)) => "Can't show this",
                         Some(_) => "Playing",
