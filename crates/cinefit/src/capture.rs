@@ -324,14 +324,14 @@ pub struct Recorder {
     started: Instant,
     stats: Arc<Mutex<Stats>>,
     dump: Option<Dumper>,
-    clip: Option<Arc<crate::record::ClipWriter>>,
+    clip: Option<crate::record::ClipFeed>,
 }
 
 impl Recorder {
     pub fn new(
         stats: Arc<Mutex<Stats>>,
         dump: Option<Dumper>,
-        clip: Option<Arc<crate::record::ClipWriter>>,
+        clip: Option<crate::record::ClipFeed>,
     ) -> Self {
         Self {
             started: Instant::now(),
