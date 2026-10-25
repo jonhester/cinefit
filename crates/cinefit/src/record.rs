@@ -620,10 +620,12 @@ pub fn for_each_frame<E: From<std::io::Error>>(
     mut each: impl FnMut(&ClipFrame, &[u8]) -> Result<(), E>,
 ) -> Result<usize, E> {
     use std::io::Read;
+    let path = frames_path(dir);
     let mut child = Command::new("zstd")
         .arg("-dc")
-        .arg(frames_path(dir))
+        .arg(&path)
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
     let mut out = std::io::BufReader::with_capacity(1 << 24, child.stdout.take().expect("piped"));
     let (mut buf, mut own) = (Vec::new(), Vec::new());
@@ -660,10 +662,47 @@ pub fn for_each_frame<E: From<std::io::Error>>(
         }
         Ok(0)
     })();
+    let Ok(missing) = result else {
+        drop(out);
+        let _ = child.kill();
+        let _ = child.wait();
+        return result;
+    };
+    // Whether the stream decoded cleanly is zstd's to say: a corrupt block
+    // comes out as bytes, wrong ones, before zstd fails on its checksum. So
+    // after a complete read the rest is read too (normally nothing).
+    if missing == 0
+        && let Err(e) = std::io::copy(&mut out, &mut std::io::sink())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e.into());
+    }
     drop(out);
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    let status = child.wait()?;
+    if status.success() {
+        return Ok(missing);
+    }
+    let mut why = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut why);
+    }
+    // A stream that just stops (a recording cut short, as a SIGTERM or a
+    // crash leaves zstd's output) gives what came before the cut intact:
+    // frames missing at the end, as an index ahead of its stream is.
+    // Anything else means the frames read may be wrong.
+    // Matched without the file's name, which zstd puts in its messages and
+    // which could hold those words itself.
+    let diagnostic = why.replace(&path.display().to_string(), "");
+    if missing > 0 && diagnostic.contains("premature end") {
+        return Ok(missing);
+    }
+    Err(std::io::Error::other(format!(
+        "zstd -dc {}: {} ({status})",
+        path.display(),
+        why.trim()
+    ))
+    .into())
 }
 
 #[cfg(test)]
@@ -982,6 +1021,83 @@ pub(crate) mod tests {
         for (i, (n, b)) in got.iter().enumerate() {
             assert_eq!((*n, b), (i as u64, &frames[i]));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A corrupt block, or junk after the stream, is an error: zstd has
+    // delivered bytes it then fails on, so the frames read may be wrong.
+    #[test]
+    fn a_stream_that_does_not_decode_is_an_error() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-bad-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        // Noise, as above, so a byte changed partway lands in a frame.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let frames: Vec<Vec<u8>> = (0..6)
+            .map(|_| {
+                (0..1 << 18)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x as u8
+                    })
+                    .collect()
+            })
+            .collect();
+        for (i, f) in frames.iter().enumerate() {
+            w.offer(Duration::from_millis(42 * i as u64), &info(1 << 17), f);
+        }
+        w.finish().expect("finish");
+        let index = read_index(&dir).expect("index");
+        let zst = dir.join("frames.zst");
+        let clean = std::fs::read(&zst).expect("zst");
+        let read = || for_each_frame::<std::io::Error>(&dir, &index, |_| true, |_, _| Ok(()));
+        assert_eq!(read().expect("clean"), 0);
+
+        let mut bad = clean.clone();
+        let at = bad.len() / 2;
+        bad[at] ^= 0x5A;
+        std::fs::write(&zst, &bad).expect("write");
+        let e = read().expect_err("a corrupt block");
+        assert!(e.to_string().contains("zstd -dc"), "{e}");
+
+        let mut junk = clean;
+        junk.extend_from_slice(b"not a zstd frame");
+        std::fs::write(&zst, &junk).expect("write");
+        let e = read().expect_err("junk after the stream");
+        assert!(e.to_string().contains("zstd -dc"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // zstd names the file in its messages: a missing stream in a directory
+    // whose name holds "premature end" is still an error, not a cut.
+    #[test]
+    fn a_file_error_is_not_read_as_a_cut_from_the_path() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("cinefit premature end test {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        for i in 0..3u8 {
+            w.offer(
+                Duration::from_millis(42 * u64::from(i)),
+                &info(16),
+                &[i; 32],
+            );
+        }
+        w.finish().expect("finish");
+        let index = read_index(&dir).expect("index");
+        std::fs::remove_file(dir.join("frames.zst")).expect("remove");
+        let r = for_each_frame::<std::io::Error>(&dir, &index, |_| true, |_, _| Ok(()));
+        assert!(r.is_err(), "{r:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
