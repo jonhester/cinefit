@@ -14,6 +14,11 @@ const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
 const OP_PONG: u8 = 0xA;
 
+/// The largest message read, its frames together: the hub's whole
+/// configuration is a few hundred KB, and a broken or hostile peer must not
+/// make one frame allocate gigabytes (#231).
+const MAX_MESSAGE: usize = 8 << 20;
+
 pub struct WebSocket<S> {
     stream: S,
     mask_seed: u32,
@@ -122,7 +127,7 @@ impl<S: Read + Write> WebSocket<S> {
         }
         let opcode = first[0] & 0x0f;
         let mut fin = first[0] & 0x80 != 0;
-        let mut payload = self.read_payload(first[1])?;
+        let mut payload = self.read_payload(first[1], MAX_MESSAGE)?;
 
         // Reassemble continuation frames (opcode 0) until FIN.
         while !fin {
@@ -131,7 +136,7 @@ impl<S: Read + Write> WebSocket<S> {
                 return Ok(None);
             }
             fin = hdr[0] & 0x80 != 0;
-            let mut more = self.read_payload(hdr[1])?;
+            let mut more = self.read_payload(hdr[1], MAX_MESSAGE - payload.len())?;
             payload.append(&mut more);
         }
         Ok(Some((opcode, payload)))
@@ -140,21 +145,35 @@ impl<S: Read + Write> WebSocket<S> {
     /// Reads a frame payload given its second header byte. Server frames are
     /// unmasked, so the mask bit is expected clear; if a server ever set it,
     /// the 4 mask bytes would be read and applied.
-    fn read_payload(&mut self, len_byte: u8) -> io::Result<Vec<u8>> {
+    /// `room` is what the message may still take: a length past it is an
+    /// error before anything is allocated (#231).
+    fn read_payload(&mut self, len_byte: u8, room: usize) -> io::Result<Vec<u8>> {
         let masked = len_byte & 0x80 != 0;
         let len = match len_byte & 0x7f {
             126 => {
                 let mut b = [0u8; 2];
                 self.stream.read_exact(&mut b)?;
-                u16::from_be_bytes(b) as usize
+                u64::from(u16::from_be_bytes(b))
             }
             127 => {
                 let mut b = [0u8; 8];
                 self.stream.read_exact(&mut b)?;
-                u64::from_be_bytes(b) as usize
+                u64::from_be_bytes(b)
             }
-            n => n as usize,
+            n => u64::from(n),
         };
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|&l| l <= room)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "a WebSocket frame of {len} bytes: messages are limited to {} MiB",
+                        MAX_MESSAGE >> 20
+                    ),
+                )
+            })?;
         let mask = if masked {
             let mut m = [0u8; 4];
             self.stream.read_exact(&mut m)?;
@@ -265,6 +284,28 @@ mod tests {
         let raw = vec![0x01, 0x01, b'a', 0x80, 0x01, b'b'];
         let mut ws = WebSocket::new(Cursor::new(raw));
         assert_eq!(ws.read_text().unwrap().as_deref(), Some("ab"));
+    }
+
+    /// A frame declaring more than a message may hold is refused before its
+    /// payload is allocated, alone or as the rest of a fragmented message.
+    #[test]
+    fn an_oversized_length_is_refused() {
+        // FIN+text, a 64-bit length of 1 TiB, and nothing after it.
+        let mut raw = vec![0x81, 127];
+        raw.extend_from_slice(&(1u64 << 40).to_be_bytes());
+        let mut ws = WebSocket::new(Cursor::new(raw));
+        let e = ws.read_text().expect_err("too long");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        // Two frames of 5 MiB each: the first fits, the two do not.
+        let five = 5usize << 20;
+        let mut raw = vec![0x01, 127];
+        raw.extend_from_slice(&(five as u64).to_be_bytes());
+        raw.resize(raw.len() + five, b'a');
+        raw.extend_from_slice(&[0x80, 127]);
+        raw.extend_from_slice(&(five as u64).to_be_bytes());
+        let mut ws = WebSocket::new(Cursor::new(raw));
+        let e = ws.read_text().expect_err("too long together");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
     }
 
     /// A stream that gives one byte, is interrupted once, then gives the rest.
