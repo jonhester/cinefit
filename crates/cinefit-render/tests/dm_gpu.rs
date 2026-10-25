@@ -1,7 +1,9 @@
 //! Dolby's display mapping on the GPU against `dm::Frame::apply`, the
 //! reference it was ported from, on a spread of BT.2020 PQ pixels and the
 //! scenes that matter: 1000- and 4000-nit grades, with and without trims, at
-//! 96 and 76 nits. Needs a Vulkan device; skipped, with a note, without one.
+//! 96 and 76 nits. Needs a Vulkan device; skipped, with a note, without one,
+//! unless `CINEFIT_REQUIRE_GPU` is set, as on a machine that has one: there a
+//! device that fails to start fails the test (#209).
 //!
 //!     cargo test -p cinefit-render --test dm_gpu -- --nocapture
 
@@ -91,6 +93,9 @@ fn pixels(n: usize) -> Vec<u16> {
 fn the_gpu_maps_as_the_reference_does() {
     let pl = match Placebo::new() {
         Ok(pl) => pl,
+        Err(e) if std::env::var_os("CINEFIT_REQUIRE_GPU").is_some() => {
+            panic!("no Vulkan device, and CINEFIT_REQUIRE_GPU is set: {e}")
+        }
         Err(e) => {
             eprintln!("skipped: no Vulkan device ({e})");
             return;
@@ -100,15 +105,31 @@ fn the_gpu_maps_as_the_reference_does() {
     let input = pixels(w * h);
     for (name, scene, target) in scenes() {
         let frame = Frame::new(&scene, target);
+        assert!(frame.lut.iter().all(|v| v.is_finite()), "{name}: table");
         let out = pl.dm_rgba16(w, h, &input, &frame).expect("GPU mapping");
         let mut worst = (0.0, String::new());
         for (px_in, px_out) in input.chunks(4).zip(out.chunks(4)) {
             let pq = |c: &[u16]| [0, 1, 2].map(|k| f64::from(c[k]) / 65535.0);
+            // The model's output is checked before the conversion back to
+            // RGB, whose PQ curve takes NaN to 0 (`max`), and the difference
+            // after it: a NaN fails the comparison below and drops out unseen
+            // (#209).
+            let mapped = frame.apply(rgb_to_ictcp(pq(px_in)));
+            assert!(
+                mapped.iter().all(|v| v.is_finite()),
+                "{name}: in {:?}, model {mapped:?}",
+                &px_in[..3]
+            );
             // The reference's output goes through the same 16-bit PQ
             // target, so both are compared after it.
-            let want = ictcp_to_rgb(frame.apply(rgb_to_ictcp(pq(px_in))))
-                .map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() / 65535.0);
+            let want =
+                ictcp_to_rgb(mapped).map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() / 65535.0);
             let d = de(rgb_to_ictcp(want), rgb_to_ictcp(pq(px_out)));
+            assert!(
+                d.is_finite(),
+                "{name}: in {:?}, reference {want:?}",
+                &px_in[..3]
+            );
             if d > worst.0 {
                 worst = (
                     d,

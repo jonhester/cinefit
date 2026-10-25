@@ -80,7 +80,8 @@ cinefit-render --test dumps` unpacks a dump directory in any capture format
 (and renders Dolby Vision tunnel frames with their own metadata),
 and `CINEFIT_V210_STILLS=DIR cargo test -p cinefit-render --test v210_stills`
 a directory of compressed `v210` stills. Each is skipped when its variable is
-unset.
+unset. On a machine with a GPU, run the tests with `CINEFIT_REQUIRE_GPU=1`:
+the GPU mapping test then fails, rather than skips, when Vulkan does not start.
 
 ## Hard rules
 
