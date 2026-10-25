@@ -2315,6 +2315,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // The next title after a break may send its block late: it
                 // must not go out with the last one's values meanwhile (#61).
                 pq_meta = None;
+                // Nor a tunnel with the last title's conversion and mapping:
+                // until its first good packet it goes out black (#213).
+                last_tunnel = None;
                 counts.signal_losses += 1;
                 receiver.nudge();
                 // A break in the input: the viewing so far is judged.
