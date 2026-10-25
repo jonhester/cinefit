@@ -691,7 +691,10 @@ pub fn for_each_frame<E: From<std::io::Error>>(
     // crash leaves zstd's output) gives what came before the cut intact:
     // frames missing at the end, as an index ahead of its stream is.
     // Anything else means the frames read may be wrong.
-    if missing > 0 && why.contains("premature end") {
+    // Matched without the file's name, which zstd puts in its messages and
+    // which could hold those words itself.
+    let diagnostic = why.replace(&path.display().to_string(), "");
+    if missing > 0 && diagnostic.contains("premature end") {
         return Ok(missing);
     }
     Err(std::io::Error::other(format!(
@@ -1068,6 +1071,33 @@ pub(crate) mod tests {
         std::fs::write(&zst, &junk).expect("write");
         let e = read().expect_err("junk after the stream");
         assert!(e.to_string().contains("zstd -dc"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // zstd names the file in its messages: a missing stream in a directory
+    // whose name holds "premature end" is still an error, not a cut.
+    #[test]
+    fn a_file_error_is_not_read_as_a_cut_from_the_path() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("cinefit premature end test {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        for i in 0..3u8 {
+            w.offer(
+                Duration::from_millis(42 * u64::from(i)),
+                &info(16),
+                &[i; 32],
+            );
+        }
+        w.finish().expect("finish");
+        let index = read_index(&dir).expect("index");
+        std::fs::remove_file(dir.join("frames.zst")).expect("remove");
+        let r = for_each_frame::<std::io::Error>(&dir, &index, |_| true, |_, _| Ok(()));
+        assert!(r.is_err(), "{r:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
