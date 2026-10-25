@@ -485,7 +485,8 @@ pub struct ClipFrame {
     /// Stored as planes (`r210p8`, `v210p`).
     pub planes: bool,
     /// The frame's place in the source's stream, from the card's stream
-    /// time: unlike `index`, it skips the frames a recording dropped.
+    /// time: unlike `index`, it skips the frames a recording dropped. When
+    /// any frame of the recording has no usable timing, `index` for all.
     pub frame_number: u64,
     /// Seconds: the source's stream time for a C++ clip, which trimming
     /// keeps, so a trimmed piece's times are the original clip's; the
@@ -506,6 +507,8 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
     }
     let bad = |n: usize| std::io::Error::other(format!("frames.csv line {n} does not parse"));
     let mut frames = Vec::new();
+    // Each frame's stream slot, where the card's timing gives one.
+    let mut slots = Vec::new();
     for (n, line) in text.lines().enumerate().skip(1) {
         let f: Vec<&str> = line.split(',').collect();
         if f.len() < 10 {
@@ -532,14 +535,23 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
             row_bytes: num(8)? as usize,
             pixel_format: format.to_string(),
             planes,
-            frame_number: match (opt(4)?, opt(5)?) {
-                (Some(time), Some(duration)) if duration > 0 => {
-                    time.max(0) as u64 / duration as u64
-                }
-                _ => num(0)?,
-            },
+            frame_number: num(0)?,
             time: f[3].parse().map_err(|_| bad(n + 1))?,
         });
+        slots.push(match (opt(4)?, opt(5)?) {
+            (Some(time), Some(duration)) if time >= 0 && duration > 0 => {
+                Some(time as u64 / duration as u64)
+            }
+            _ => None,
+        });
+    }
+    // Stream slots only when every frame has one: one frame numbered by its
+    // index among slots would move backwards or land on another's slot, and
+    // replay and compare take the numbers as one sequence.
+    if let Some(slots) = slots.into_iter().collect::<Option<Vec<u64>>>() {
+        for (f, s) in frames.iter_mut().zip(slots) {
+            f.frame_number = s;
+        }
     }
     Ok(frames)
 }
@@ -1004,10 +1016,35 @@ pub(crate) mod tests {
         }
         std::fs::write(dir.join("frames.csv"), csv).expect("write");
         let index = read_index(&dir).expect("index");
-        // Reported timing gives the frame number; without it, the index.
+        // One frame without usable timing numbers every frame by its index,
+        // so the numbers stay one sequence.
         let numbers: Vec<u64> = index.iter().map(|f| f.frame_number).collect();
-        assert_eq!(numbers, [2, 11, 12, 0, 14]);
+        assert_eq!(numbers, [10, 11, 12, 13, 14]);
         assert_eq!(index[1].offset, 32);
+        // Timing on every frame gives the stream slots.
+        let mut csv = format!("{CSV_HEADER}\n");
+        for k in 0..3u64 {
+            let item = Item {
+                index: 10 + k,
+                at: Duration::from_millis(42 * k),
+                info: FrameInfo {
+                    stream_time: Some(1001 * (20 + 2 * k as i64)),
+                    duration: Some(1001),
+                    ..info(16)
+                },
+                buf: Vec::new(),
+                len: 32,
+            };
+            csv += &csv_line(&item, 32 * k, None);
+            csv.push('\n');
+        }
+        std::fs::write(dir.join("frames.csv"), csv).expect("write");
+        let numbers: Vec<u64> = read_index(&dir)
+            .expect("index")
+            .iter()
+            .map(|f| f.frame_number)
+            .collect();
+        assert_eq!(numbers, [20, 22, 24]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
