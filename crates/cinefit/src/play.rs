@@ -398,6 +398,54 @@ struct Target<'a, 'p> {
 /// coming on is followed within this.
 const MODE_PROBE_EVERY: Duration = Duration::from_secs(5);
 
+/// The output, waiting for a connected display when there is none yet (#177):
+/// at boot the service can start before the display's connector reads
+/// connected. Exiting and letting the service restart came back by itself,
+/// as for a missing mode (#143), but reopened the capture card and wrote a run
+/// log every time. Logged once, probed again every few seconds. Any other
+/// error, and a dry run, still end the run.
+fn wait_for_display(
+    card: Option<&std::path::Path>,
+    dry_run: bool,
+) -> Result<cinefit_kms::Output, Box<dyn Error>> {
+    let out = retry_no_display(
+        || cinefit_kms::Output::open(card),
+        dry_run,
+        MODE_PROBE_EVERY,
+    )?;
+    Ok(out)
+}
+
+/// `open` again every `every` while it says no display is connected; any
+/// other answer, or the first one in a dry run, is the result.
+fn retry_no_display<T>(
+    mut open: impl FnMut() -> Result<T, cinefit_kms::Error>,
+    dry_run: bool,
+    every: Duration,
+) -> Result<T, cinefit_kms::Error> {
+    let mut waiting_since: Option<Instant> = None;
+    loop {
+        match open() {
+            Err(e @ cinefit_kms::Error::NoDisplay) if !dry_run => {
+                if waiting_since.is_none() {
+                    info!("{e}: waiting for one (probing every {} s)", every.as_secs());
+                    waiting_since = Some(Instant::now());
+                }
+            }
+            result => {
+                if let (Ok(_), Some(t)) = (&result, waiting_since) {
+                    info!(
+                        "display connected after {:.0} s of waiting",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                return result;
+            }
+        }
+        std::thread::sleep(every);
+    }
+}
+
 /// The wanted mode, from the modes the output offers, waiting for it when it
 /// is not there yet (#143): a receiver offers only its own 1080p fallback
 /// while the projector behind it is off. Exiting and letting the service
@@ -1498,7 +1546,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
 
     // The output: the panel at the source's own rate, signalling chosen from
     // the source, in one commit.
-    let mut out = cinefit_kms::Output::open(opts.card.as_deref())?;
+    let mut out = wait_for_display(opts.card.as_deref(), opts.dry_run)?;
     info!("output: {}", out.describe());
     let want = cinefit_kms::ModeRequest {
         width: cfg.width,
@@ -2824,6 +2872,24 @@ fn hdr_line(h: &HdrMetadata) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_display_is_waited_for() {
+        use cinefit_kms::Error as Kms;
+        // Two refusals, then a display: the third answer is the result.
+        let mut answers = vec![Ok(7), Err(Kms::NoDisplay), Err(Kms::NoDisplay)];
+        let got = retry_no_display(|| answers.pop().unwrap(), false, Duration::ZERO);
+        assert_eq!(got.ok(), Some(7));
+        assert!(answers.is_empty());
+        // A dry run does not wait.
+        let mut answers = vec![Ok(7), Err(Kms::NoDisplay)];
+        let got = retry_no_display(|| answers.pop().unwrap(), true, Duration::ZERO);
+        assert!(matches!(got, Err(Kms::NoDisplay)));
+        // Any other error ends it at once.
+        let mut answers = vec![Ok(7), Err(Kms::NoCrtc)];
+        let got = retry_no_display(|| answers.pop().unwrap(), false, Duration::ZERO);
+        assert!(matches!(got, Err(Kms::NoCrtc)));
+    }
+
     use super::*;
 
     /// A session's HDR note keeps an unreported value apart from zero.
