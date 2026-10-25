@@ -438,9 +438,8 @@ pub fn watch(
         "Events-Read-Encryption-Key",
         "Events-Write-Encryption-Key",
     )));
-    std::thread::Builder::new()
-        .name("atv-events".into())
-        .spawn(move || answer_events(events))?;
+    // Ended with this session, however it ends (#229).
+    let _events = EventChannel::start(events)?;
 
     rtsp.request(&mut control, "RECORD", None)?;
 
@@ -728,6 +727,37 @@ fn setup_data(seed: u64) -> plist::Value {
     dict([("streams", plist::Value::Array(vec![stream]))])
 }
 
+/// The event channel's thread, which belongs to its session: dropped, it
+/// shuts the socket (ending the blocking read) and waits for the thread.
+/// Left running, each reconnect while the Apple TV kept the old socket open
+/// left a thread and a socket behind for as long as `play` ran (#229).
+struct EventChannel {
+    stream: TcpStream,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EventChannel {
+    fn start(events: Conn) -> Result<Self, Error> {
+        let stream = events.stream.try_clone()?;
+        let thread = std::thread::Builder::new()
+            .name("atv-events".into())
+            .spawn(move || answer_events(events))?;
+        Ok(Self {
+            stream,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for EventChannel {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// The event channel: every request the Apple TV makes is answered 200,
 /// as pyatv does. Ends when the connection does.
 fn answer_events(mut events: Conn) {
@@ -767,6 +797,27 @@ fn answer_events(mut events: Conn) {
 mod tests {
     use super::*;
     use proto::*;
+
+    // An event channel whose Apple TV never closes the socket still ends
+    // with its session: its thread has exited once the channel is dropped
+    // (#229). Without the shutdown the drop would wait on the read forever.
+    #[test]
+    fn the_event_thread_ends_with_its_session() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        // The Apple TV's side: accepted, held open, never written or closed.
+        let (_held, _) = listener.accept().expect("accept");
+        let channel = EventChannel::start(Conn::new(client)).expect("start");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(channel);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the event thread outlived its session"
+        );
+    }
 
     const TV: &str = "com.apple.TVWatchList";
 

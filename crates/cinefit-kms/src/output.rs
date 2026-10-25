@@ -73,6 +73,10 @@ pub enum Error {
     /// A queued flip did not complete in time: the display or the driver has
     /// stopped answering.
     NoFlip(Duration),
+    /// A mode index past the connector's modes, and how many there are.
+    NoMode(usize, usize),
+    /// A frame index past the frames made, and how many there are.
+    NoFrame(usize, usize),
 }
 
 impl fmt::Display for Error {
@@ -96,6 +100,8 @@ impl fmt::Display for Error {
                 "GBM chose {}, a layout of {n} planes",
                 crate::modifier_name(*m)
             ),
+            Error::NoMode(i, n) => write!(f, "no mode {i}: the connector has {n}"),
+            Error::NoFrame(i, n) => write!(f, "no frame {i}: {n} made"),
             Error::NoFlip(waited) => write!(
                 f,
                 "no page-flip event within {} ms: the display or driver stopped answering",
@@ -178,6 +184,25 @@ type OverlayState = (
 struct Frame {
     buffer: FrameBuffer,
     fb: framebuffer::Handle,
+}
+
+/// The mode at `index`, or an error naming it: an index from another list
+/// (or a stale one) is the caller's mistake, not a reason to panic.
+fn mode_at(modes: &[Mode], index: usize) -> Result<Mode, Error> {
+    modes
+        .get(index)
+        .copied()
+        .ok_or(Error::NoMode(index, modes.len()))
+}
+
+/// The frame at `index`, or an error naming it.
+fn frame_at(frames: &[Frame], index: usize) -> Result<&Frame, Error> {
+    frames.get(index).ok_or(Error::NoFrame(index, frames.len()))
+}
+
+fn frame_at_mut(frames: &mut [Frame], index: usize) -> Result<&mut Frame, Error> {
+    let n = frames.len();
+    frames.get_mut(index).ok_or(Error::NoFrame(index, n))
 }
 
 /// What backs a frame: memory the CPU draws into, or a GBM scanout buffer
@@ -473,7 +498,7 @@ impl Output {
     ///
     /// If the driver cannot allocate or register it.
     pub fn create_frame(&mut self, index: usize) -> Result<usize, Error> {
-        let (w, h) = self.modes[index].size();
+        let (w, h) = mode_at(&self.modes, index)?.size();
         let mut buffer = self
             .card
             .create_dumb_buffer((w.into(), h.into()), DrmFourcc::Xrgb8888, 32)
@@ -588,7 +613,7 @@ impl Output {
     /// If GBM cannot allocate any of them, it chose a layout of several
     /// planes, or the driver will not register it.
     pub fn create_scanout_in(&mut self, index: usize, modifiers: &[u64]) -> Result<usize, Error> {
-        let (w, h) = self.modes[index].size();
+        let (w, h) = mode_at(&self.modes, index)?.size();
         if self.gbm.is_none() {
             // A duplicate of the card's fd: the same open file, so GEM handles
             // GBM creates are valid for this client's framebuffers.
@@ -667,7 +692,7 @@ impl Output {
     /// [`Error::NoOverlay`] without an overlay plane; else if the driver
     /// cannot allocate or register it.
     pub fn create_overlay(&mut self, index: usize) -> Result<usize, Error> {
-        let (w, h) = self.modes[index].size();
+        let (w, h) = mode_at(&self.modes, index)?.size();
         let Some(ov) = self.overlay.as_mut() else {
             return Err(Error::NoOverlay);
         };
@@ -807,7 +832,7 @@ impl Output {
     ///
     /// If the frame is not a GBM scanout buffer, or cannot be exported.
     pub fn export(&self, frame: usize) -> Result<DmaBuf, Error> {
-        let FrameBuffer::Gbm(bo) = &self.frames[frame].buffer else {
+        let FrameBuffer::Gbm(bo) = &frame_at(&self.frames, frame)?.buffer else {
             return Err(Error::NotScanout);
         };
         let fd = bo.fd_for_plane(0).map_err(|_| Error::Io {
@@ -836,7 +861,7 @@ impl Output {
         frame: usize,
         read: impl FnOnce(&[u8], usize) -> T,
     ) -> Result<T, Error> {
-        let FrameBuffer::Gbm(bo) = &self.frames[frame].buffer else {
+        let FrameBuffer::Gbm(bo) = &frame_at(&self.frames, frame)?.buffer else {
             return Err(Error::NotScanout);
         };
         bo.map(0, 0, bo.width(), bo.height(), |m| {
@@ -851,7 +876,7 @@ impl Output {
     ///
     /// If the buffer cannot be mapped.
     pub fn draw(&mut self, frame: usize, draw: impl FnOnce(&mut [u8], usize)) -> Result<(), Error> {
-        let FrameBuffer::Dumb(buffer) = &mut self.frames[frame].buffer else {
+        let FrameBuffer::Dumb(buffer) = &mut frame_at_mut(&mut self.frames, frame)?.buffer else {
             return Err(Error::NotScanout);
         };
         let pitch = drm::buffer::Buffer::pitch(buffer) as usize;
@@ -870,7 +895,10 @@ impl Output {
     /// [`Error::Busy`] if another program holds the display, else the
     /// driver's refusal.
     pub fn modeset(&mut self, index: usize, frame: usize) -> Result<(), Error> {
-        let mode = self.modes[index];
+        let mode = mode_at(&self.modes, index)?;
+        // Both indices before the blob: a bad one returns before anything
+        // needs cleaning up.
+        let fb = frame_at(&self.frames, frame)?.fb;
         let (w, h) = mode.size();
         let blob = blob_id(
             self.card
@@ -890,7 +918,7 @@ impl Output {
             (
                 plane,
                 p.fb_id,
-                u64::from(u32::from(RawResourceHandle::from(self.frames[frame].fb))),
+                u64::from(u32::from(RawResourceHandle::from(fb))),
             ),
             (plane, p.plane_crtc, crtc_id),
         ];
@@ -1148,7 +1176,9 @@ impl Output {
     ///
     /// If the driver refuses the flip.
     pub fn flip(&mut self, frame: usize) -> Result<(), Error> {
-        let fb = u64::from(u32::from(RawResourceHandle::from(self.frames[frame].fb)));
+        let fb = u64::from(u32::from(RawResourceHandle::from(
+            frame_at(&self.frames, frame)?.fb,
+        )));
         let mut set = vec![(self.plane.into(), self.props.fb_id, fb)];
         let overlay_before = self.overlay_state();
         set.extend(self.overlay_props());
@@ -1544,6 +1574,21 @@ mod tests {
             std::io::Error::from_raw_os_error(16).to_string()
         );
         assert!(Error::NoDisplay.source().is_none());
+    }
+
+    // An index past the list is an error that names it, not a panic (#227).
+    #[test]
+    fn a_bad_index_is_an_error() {
+        assert!(matches!(mode_at(&[], 0), Err(Error::NoMode(0, 0))));
+        assert!(matches!(frame_at(&[], 3), Err(Error::NoFrame(3, 0))));
+        assert!(matches!(
+            frame_at_mut(&mut [], 1),
+            Err(Error::NoFrame(1, 0))
+        ));
+        assert_eq!(
+            Error::NoMode(5, 2).to_string(),
+            "no mode 5: the connector has 2"
+        );
     }
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;

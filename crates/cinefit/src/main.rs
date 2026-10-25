@@ -556,13 +556,13 @@ fn capture(
     let stats = Arc::new(Mutex::new(capture::Stats::default()));
     let started = Instant::now();
     let clip = match &record_dir {
-        Some(dir) => Some(Arc::new(record::ClipWriter::create(dir)?)),
+        Some(dir) => Some(record::ClipWriter::create(dir)?),
         None => None,
     };
     let running = device.start_capture(capture::Recorder::new(
         Arc::clone(&stats),
         dumper,
-        clip.clone(),
+        clip.as_ref().map(|c| c.feed().clone()),
     ))?;
     // Ctrl-C ends the run early and still prints the summary; a second one
     // exits at once, in case stopping itself hangs.
@@ -588,12 +588,13 @@ fn capture(
         println!("stopped by Ctrl-C or SIGTERM");
     }
     print!("{}", capture::lock(&stats).summary(ran, failed_restarts));
-    if let Some(clip) = &clip {
+    if let Some(clip) = clip {
+        let dir = clip.dir().to_owned();
         let r = clip.finish()?;
         println!(
             "recorded {} frames to {} ({} dropped: no buffer free)",
             r.written,
-            clip.dir().display(),
+            dir.display(),
             r.dropped
         );
     }

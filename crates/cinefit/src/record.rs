@@ -69,17 +69,28 @@ struct Item {
 }
 
 /// Records frames to a clip directory. Create with [`ClipWriter::create`],
-/// hand frames to [`ClipWriter::offer`] from the capture callback, and close
-/// with [`ClipWriter::finish`].
+/// hand frames in through its [`ClipFeed`] (from the capture callback), and
+/// close with [`ClipWriter::finish`], which takes the writer: a clip is
+/// closed once (#230).
 pub struct ClipWriter {
+    feed: ClipFeed,
+    /// Taken by [`ClipWriter::finish`].
+    thread: Option<JoinHandle<std::io::Result<u64>>>,
+    dir: PathBuf,
+}
+
+/// The way frames go into a clip: cloned for whoever offers them. Once its
+/// writer has finished, what is offered is dropped (and counted).
+#[derive(Clone)]
+pub struct ClipFeed(Arc<Shared>);
+
+struct Shared {
     tx: Mutex<Option<SyncSender<Item>>>,
     free: Arc<Mutex<Vec<Vec<u8>>>>,
     next: AtomicU64,
     /// Buffers made so far: the pool grows to POOL whenever none is free.
     made: AtomicU64,
     dropped: AtomicU64,
-    thread: Mutex<Option<JoinHandle<std::io::Result<u64>>>>,
-    dir: PathBuf,
 }
 
 /// What a finished recording wrote.
@@ -117,29 +128,83 @@ impl ClipWriter {
             std::thread::spawn(move || write_loop(rx, zstd, csv, free))
         };
         Ok(Self {
-            tx: Mutex::new(Some(tx)),
-            free,
-            next: AtomicU64::new(0),
-            made: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            thread: Mutex::new(Some(thread)),
+            feed: ClipFeed(Arc::new(Shared {
+                tx: Mutex::new(Some(tx)),
+                free,
+                next: AtomicU64::new(0),
+                made: AtomicU64::new(0),
+                dropped: AtomicU64::new(0),
+            })),
+            thread: Some(thread),
             dir: dir.to_owned(),
         })
     }
 
+    /// Where frames go in; clone it for each producer.
+    pub fn feed(&self) -> &ClipFeed {
+        &self.feed
+    }
+
+    /// Writes everything queued, closes zstd and reports what was written.
+    ///
+    /// # Errors
+    ///
+    /// If writing failed or zstd did not exit cleanly: the clip is then
+    /// incomplete, and says so rather than looking whole.
+    pub fn finish(mut self) -> std::io::Result<Recorded> {
+        self.close();
+        let thread = self.thread.take().expect("taken only here, once");
+        let written = thread
+            .join()
+            .map_err(|_| std::io::Error::other("the clip writer panicked"))??;
+        let shared = &self.feed.0;
+        Ok(Recorded {
+            written,
+            dropped: shared.dropped.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// No more frames: the writer writes what is queued and closes zstd.
+    fn close(&self) {
+        drop(
+            self.feed
+                .0
+                .tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
+/// A writer dropped without [`ClipWriter::finish`] (an early error) still
+/// closes its clip: a feed kept elsewhere would otherwise hold the channel
+/// open, and the writer thread and zstd would wait for frames forever. Not
+/// waited for here: the thread ends on its own.
+impl Drop for ClipWriter {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl ClipFeed {
     /// Copies one frame for writing. On the capture callback's thread: it
     /// never blocks, and drops the frame (counted) when the pool is in use.
     pub fn offer(&self, at: Duration, info: &FrameInfo, bytes: &[u8]) {
-        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        let index = self.0.next.fetch_add(1, Ordering::Relaxed);
         self.offer_as(index, at, info, bytes);
     }
 
-    /// As [`ClipWriter::offer`], under a frame number of the caller's: the
+    /// As [`ClipFeed::offer`], under a frame number of the caller's: the
     /// dataset keeps a few frames of many, numbered as its readings are
     /// (#91).
     pub fn offer_as(&self, index: u64, at: Duration, info: &FrameInfo, bytes: &[u8]) {
         let mut buf = {
-            let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut free = self.0.free.lock().unwrap_or_else(PoisonError::into_inner);
             match free.pop() {
                 Some(b) => b,
                 // Grow the pool when no buffer is free, up to its size; then a
@@ -147,12 +212,12 @@ impl ClipWriter {
                 // a few seconds apart, a session's first frames each found a
                 // buffer free, the pool stayed at one, and the second of two
                 // frames kept back to back was dropped (2026-10-22, 8 of 3790).
-                None if self.made.load(Ordering::Relaxed) < POOL as u64 => {
-                    self.made.fetch_add(1, Ordering::Relaxed);
+                None if self.0.made.load(Ordering::Relaxed) < POOL as u64 => {
+                    self.0.made.fetch_add(1, Ordering::Relaxed);
                     Vec::new()
                 }
                 None => {
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    self.0.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -166,45 +231,11 @@ impl ClipWriter {
             len: bytes.len(),
             buf,
         };
-        let tx = self.tx.lock().unwrap_or_else(PoisonError::into_inner);
+        let tx = self.0.tx.lock().unwrap_or_else(PoisonError::into_inner);
         let sent = tx.as_ref().is_some_and(|tx| tx.try_send(item).is_ok());
         if !sent {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.0.dropped.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    /// Writes everything queued, closes zstd and reports what was written.
-    ///
-    /// # Errors
-    ///
-    /// If writing failed or zstd did not exit cleanly: the clip is then
-    /// incomplete, and says so rather than looking whole.
-    pub fn finish(&self) -> std::io::Result<Recorded> {
-        drop(
-            self.tx
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take(),
-        );
-        let thread = self
-            .thread
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let written = match thread {
-            Some(t) => t
-                .join()
-                .map_err(|_| std::io::Error::other("the clip writer panicked"))??,
-            None => 0,
-        };
-        Ok(Recorded {
-            written,
-            dropped: self.dropped.load(Ordering::Relaxed),
-        })
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 }
 
@@ -747,7 +778,8 @@ pub(crate) mod tests {
             ..info(16)
         };
         for (i, f) in frames.iter().enumerate() {
-            w.offer(Duration::from_millis(42 * i as u64), &five, f);
+            w.feed()
+                .offer(Duration::from_millis(42 * i as u64), &five, f);
         }
         let r = w.finish().expect("finish");
         assert_eq!((r.written, r.dropped), (5, 0));
@@ -833,10 +865,10 @@ pub(crate) mod tests {
         let mut odd = v210.clone();
         odd[31] |= 0x40;
         let wr = ClipWriter::create(&dir).expect("create");
-        wr.offer(Duration::ZERO, &r210, &tunnel);
-        wr.offer(Duration::ZERO, &r210, &rgb);
-        wr.offer(Duration::ZERO, &info(16), &v210);
-        wr.offer(Duration::ZERO, &info(16), &odd);
+        wr.feed().offer(Duration::ZERO, &r210, &tunnel);
+        wr.feed().offer(Duration::ZERO, &r210, &rgb);
+        wr.feed().offer(Duration::ZERO, &info(16), &v210);
+        wr.feed().offer(Duration::ZERO, &info(16), &odd);
         assert_eq!(wr.finish().expect("finish").written, 4);
 
         let csv = std::fs::read_to_string(dir.join("frames.csv")).expect("csv");
@@ -918,12 +950,12 @@ pub(crate) mod tests {
         // Kept a while apart, as pairing passes keep them: each finds the
         // buffer before it free.
         for _ in 0..20 {
-            w.offer(Duration::ZERO, &i5, &frame);
+            w.feed().offer(Duration::ZERO, &i5, &frame);
             std::thread::sleep(Duration::from_millis(60));
         }
         // Then a cut the frame after a keep, and a few more at once.
         for _ in 0..6 {
-            w.offer(Duration::ZERO, &i5, &frame);
+            w.feed().offer(Duration::ZERO, &i5, &frame);
         }
         let r = w.finish().expect("finish");
         assert_eq!((r.written, r.dropped), (26, 0));
@@ -992,7 +1024,8 @@ pub(crate) mod tests {
             })
             .collect();
         for (i, f) in frames.iter().enumerate() {
-            w.offer(Duration::from_millis(42 * i as u64), &info(1 << 17), f);
+            w.feed()
+                .offer(Duration::from_millis(42 * i as u64), &info(1 << 17), f);
         }
         w.finish().expect("finish");
         // As a SIGTERM to zstd leaves it: the end of the stream missing.
@@ -1050,7 +1083,8 @@ pub(crate) mod tests {
             })
             .collect();
         for (i, f) in frames.iter().enumerate() {
-            w.offer(Duration::from_millis(42 * i as u64), &info(1 << 17), f);
+            w.feed()
+                .offer(Duration::from_millis(42 * i as u64), &info(1 << 17), f);
         }
         w.finish().expect("finish");
         let index = read_index(&dir).expect("index");
@@ -1087,7 +1121,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let w = ClipWriter::create(&dir).expect("create");
         for i in 0..3u8 {
-            w.offer(
+            w.feed().offer(
                 Duration::from_millis(42 * u64::from(i)),
                 &info(16),
                 &[i; 32],
@@ -1098,6 +1132,63 @@ pub(crate) mod tests {
         std::fs::remove_file(dir.join("frames.zst")).expect("remove");
         let r = for_each_frame::<std::io::Error>(&dir, &index, |_| true, |_, _| Ok(()));
         assert!(r.is_err(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The writer is closed once, by value (#230); a feed kept by a producer
+    // past it is harmless: what it offers then is dropped.
+    #[test]
+    fn a_feed_outlives_its_finished_writer() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-feed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        let feed = w.feed().clone();
+        for i in 0..3u8 {
+            feed.offer(
+                Duration::from_millis(42 * u64::from(i)),
+                &info(16),
+                &[i; 32],
+            );
+        }
+        let r = w.finish().expect("finish");
+        assert_eq!((r.written, r.dropped), (3, 0));
+        feed.offer(Duration::from_secs(1), &info(16), &[9; 32]);
+        assert_eq!(read_index(&dir).expect("index").len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A writer dropped without finish, its feed kept: the clip still
+    // closes, the stream complete, rather than zstd waiting on an open
+    // channel for good.
+    #[test]
+    fn a_dropped_writer_closes_its_clip() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cinefit-drop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = ClipWriter::create(&dir).expect("create");
+        let feed = w.feed().clone();
+        feed.offer(Duration::ZERO, &info(16), &[7; 32]);
+        drop(w);
+        let complete = || {
+            Command::new("zstd")
+                .arg("-tq")
+                .arg(dir.join("frames.zst"))
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !complete() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(complete(), "the stream was never finished");
+        drop(feed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

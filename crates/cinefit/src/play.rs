@@ -93,9 +93,32 @@ pub struct Options {
     pub linear_scanout: bool,
 }
 
-/// The scanout buffers, each imported as a render target: the buffers'
-/// indices, the targets, their pixel format and the layout GBM chose.
-type Scanouts<'p> = (Vec<usize>, Vec<cinefit_render::Texture<'p>>, u32, u64);
+/// One scanout buffer and the render target imported from it, together.
+struct Scanout<'p> {
+    /// The buffer, as the output numbers its frames.
+    frame: usize,
+    texture: cinefit_render::Texture<'p>,
+}
+
+/// The scanout buffers, each with its render target, their pixel format
+/// and the layout GBM chose (one for all).
+struct Scanouts<'p> {
+    buffers: Vec<Scanout<'p>>,
+    fourcc: u32,
+    modifier: u64,
+}
+
+impl<'p> Scanouts<'p> {
+    /// Buffer `b`'s frame, for the output.
+    fn frame(&self, b: usize) -> usize {
+        self.buffers[b].frame
+    }
+
+    /// Buffer `b`'s render target.
+    fn texture(&self, b: usize) -> &cinefit_render::Texture<'p> {
+        &self.buffers[b].texture
+    }
+}
 
 /// Why a set of scanout buffers could not be made, and the layout to blame
 /// when there is one.
@@ -162,7 +185,7 @@ fn scanouts<'p>(
         layout: None,
         error: e,
     };
-    let (mut buffers, mut targets) = (Vec::new(), Vec::new());
+    let mut buffers = Vec::new();
     let (mut fourcc, mut modifier) = (0, 0);
     for i in 0..BUFFERS {
         let b = match out.create_scanout_in(index, modifiers) {
@@ -189,8 +212,8 @@ fn scanouts<'p>(
             ));
         }
         (fourcc, modifier) = (d.fourcc, d.modifier);
-        targets.push(
-            pl.import_dmabuf(&cinefit_render::DmaBufTarget {
+        let texture = pl
+            .import_dmabuf(&cinefit_render::DmaBufTarget {
                 fd: d.fd.as_fd(),
                 width: d.width,
                 height: d.height,
@@ -202,11 +225,14 @@ fn scanouts<'p>(
             .map_err(|e| Failed {
                 layout: Some(d.modifier),
                 error: format!("the renderer will not import it: {e}").into(),
-            })?,
-        );
-        buffers.push(b);
+            })?;
+        buffers.push(Scanout { frame: b, texture });
     }
-    Ok((buffers, targets, fourcc, modifier))
+    Ok(Scanouts {
+        buffers,
+        fourcc,
+        modifier,
+    })
 }
 
 /// Hands frames from the SDK's thread to the mailbox.
@@ -596,15 +622,9 @@ fn view_for(
 
 /// What a frame renders into, by the settings as they are now: they can
 /// change mid-run, from the menu.
-fn target<'a, 'p>(
-    targets: &'a [Texture<'p>],
-    b: usize,
-    color: RgbColor,
-    view: View,
-    c: &Config,
-) -> Target<'a, 'p> {
+fn target<'a, 'p>(tex: &'a Texture<'p>, color: RgbColor, view: View, c: &Config) -> Target<'a, 'p> {
     Target {
-        tex: &targets[b],
+        tex,
         color,
         rgb_range: c.rgb_range,
         lldv_nits: f32::from(c.lldv_nits),
@@ -1771,9 +1791,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             // buffer, read back, must come out right. On a GPU where a tiled
             // render failed or scrambled, play would otherwise fail at every
             // restart, or show a scrambled picture.
-            for (&frame, target) in s.0.iter().zip(&s.1) {
-                renders_right(&out, &pl, frame, target).map_err(|e| Failed {
-                    layout: Some(s.3),
+            for b in &s.buffers {
+                renders_right(&out, &pl, b.frame, &b.texture).map_err(|e| Failed {
+                    layout: Some(s.modifier),
                     error: e,
                 })?;
             }
@@ -1807,7 +1827,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             }
         }
     };
-    let (buffers, targets, scan_fourcc, modifier) = made?;
+    let scan = made?;
+    let (scan_fourcc, modifier) = (scan.fourcc, scan.modifier);
     info!(
         "scanout: {} {}{}",
         String::from_utf8_lossy(&scan_fourcc.to_le_bytes()),
@@ -1913,7 +1934,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 first_info.color.hdr.as_ref(),
                 prepared,
                 &mut dm_cache,
-                &target(&targets, 0, out_color, view, &cfg),
+                &target(scan.texture(0), out_color, view, &cfg),
                 &mut stages,
             )?;
             let place = view
@@ -1922,7 +1943,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             (source, place)
         }
         None => {
-            pl.clear_black(&targets[0])?;
+            pl.clear_black(scan.texture(0))?;
             let none = if cfg.crop {
                 geo::Source::Rows { top: 0, bottom: 0 }
             } else {
@@ -1945,8 +1966,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             stages.render.first().unwrap_or(0.0)
         );
         // A signal is not a picture: look at the pixels.
-        let fourcc = out.export(buffers[0])?.fourcc;
-        let report = out.read_scanout(buffers[0], |px, stride| {
+        let fourcc = out.export(scan.frame(0))?.fourcc;
+        let report = out.read_scanout(scan.frame(0), |px, stride| {
             look(px, stride, fourcc, size, first_place)
         })?;
         info!("{report}");
@@ -2017,7 +2038,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     ui.update(&mut out, enc, now);
     out.set_hdr(hdr);
     out.set_sdr_bt2020(true);
-    out.modeset(index, buffers[0])?;
+    out.modeset(index, scan.frame(0))?;
     info!("after modeset: {}", out.hdr_state());
     let mut policy = follow::Policy::new(follow::Want {
         rate_mhz: start_input
@@ -2059,7 +2080,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     }
     let (mut front, mut pending) = (0usize, 0usize);
     ui.update(&mut out, enc, Instant::now());
-    out.flip(buffers[front])?;
+    out.flip(scan.frame(front))?;
     let mut ready: Option<usize> = None;
     let mut counts = Counts::default();
     // The input as last seen, and for how many frames in a row.
@@ -2108,7 +2129,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let levels = {
                     let brightest = window.borrow_mut().brightest(Instant::now());
                     let shown = out
-                        .read_scanout(buffers[front], |px, stride| {
+                        .read_scanout(scan.frame(front), |px, stride| {
                             scanout_peak(px, stride, scan_fourcc, size)
                         })
                         .ok()
@@ -2243,7 +2264,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // Only while the panel is open: mapping the output buffer
                 // copies all of it off the GPU, ~13 ms.
                 let shown = if ui.info_open() {
-                    out.read_scanout(buffers[front], |px, stride| {
+                    out.read_scanout(scan.frame(front), |px, stride| {
                         scanout_peak(px, stride, scan_fourcc, size)
                     })
                     .ok()
@@ -2388,7 +2409,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 let free = (0..BUFFERS)
                     .find(|&b| b != front && b != pending)
                     .expect("three buffers, two in use");
-                pl.clear_black(&targets[free])?;
+                pl.clear_black(scan.texture(free))?;
                 ready = Some(free);
                 dark = true;
                 // The next title after a break may send its block late: it
@@ -2655,7 +2676,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     let free = (0..BUFFERS)
                         .find(|&b| b != front && b != pending)
                         .expect("three buffers, two in use");
-                    pl.clear_black(&targets[free])?;
+                    pl.clear_black(scan.texture(free))?;
                     ready = Some(free);
                     ui.set_slate(Some(Slate::Identifying {
                         detail: format!(
@@ -2748,7 +2769,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 hdr_meta.as_ref(),
                                 prepared,
                                 &mut dm_cache,
-                                &target(&targets, free, out_color, view, &cfg),
+                                &target(scan.texture(free), out_color, view, &cfg),
                                 &mut stages,
                             )?;
                             ready = Some(free);
@@ -2762,7 +2783,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             // Nothing renders this format: black, not the last
                             // picture held over it.
                             counts.unrendered += 1;
-                            pl.clear_black(&targets[free])?;
+                            pl.clear_black(scan.texture(free))?;
                             ready = Some(free);
                             ui.set_slate(Some(Slate::CantShow {
                                 detail: match k.kind {
@@ -2896,12 +2917,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                     .find(|&b| b != front && b != pending)
                                     .expect("three buffers, two in use");
                                 ready = None;
-                                pl.clear_black(&targets[free])
+                                pl.clear_black(scan.texture(free))
                                     .map(|()| free)
                                     .map_err(|e| e.to_string())
                             };
                             show.and_then(|show| {
-                                out.modeset(i, buffers[show])
+                                out.modeset(i, scan.frame(show))
                                     .map(|()| (i, show))
                                     .map_err(|e| crate::chain(&e).to_string())
                             })
@@ -2954,7 +2975,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             // A modeset sends no flip event; queue one so the
                             // vblanks keep coming.
                             ui.update(&mut out, enc, Instant::now());
-                            out.flip(buffers[pending])?;
+                            out.flip(scan.frame(pending))?;
                             continue;
                         }
                         Err(e) => {
@@ -3014,7 +3035,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 }
             }
             ui.update(&mut out, enc, Instant::now());
-            out.flip(buffers[pending])?;
+            out.flip(scan.frame(pending))?;
         }
         Ok(())
     };
