@@ -1134,6 +1134,16 @@ fn make_follower(
 }
 
 impl CropFinder {
+    /// The live `detect.crop` setting. Off, the detector sees no frames, so
+    /// turned back on it starts over (#223): the crop and confidence it had
+    /// belong to whatever was on before, not to what is on now.
+    fn set_on(&mut self, on: bool) {
+        if on && !self.on {
+            self.det = Detector::default();
+        }
+        self.on = on;
+    }
+
     fn find(
         &mut self,
         info: &FrameInfo,
@@ -2159,7 +2169,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // What reads it each frame needs nothing; the rest is told
                 // here.
                 match key {
-                    "detect.crop" => finder.on = cfg.crop,
+                    "detect.crop" => finder.set_on(cfg.crop),
                     "detect.record" => finder.thumbs = cfg.record,
                     "geometry.screen_ar" => {
                         win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
@@ -3507,6 +3517,53 @@ mod tests {
             "{top}/{bottom}"
         );
         assert!(found.ms.is_some(), "the detector read it");
+    }
+
+    // Cropping off on a scope title, a full-frame one after, cropping on
+    // over a black opening: with nothing to read in it, a fresh detector
+    // shows the full frame, where the old one held the scope crop from
+    // before it was turned off (#223). A picture in the bars would undo a
+    // stale crop at once; a dark start would not.
+    #[test]
+    fn turning_cropping_back_on_starts_the_detector_over() {
+        let (scope_info, scope) = tunnel_with_bars(140);
+        let (full_info, full) = tunnel_with_bars(0);
+        let (black_info, black) = tunnel_with_bars(540);
+        let mut finder = finder();
+        let rows = |f: &Found| match f.source {
+            geo::Source::Rows { top, bottom } => (top, bottom),
+            ref other => panic!("no rows: {other:?}"),
+        };
+        let mut t = 0.0;
+        let mut step = |finder: &mut CropFinder, info: &FrameInfo, bytes: &[u8]| {
+            let f = finder.find(info, Some(bytes), Kind::Tunnel, t, 1);
+            t += 1.0 / 24.0;
+            f
+        };
+        let mut last = None;
+        for _ in 0..24 {
+            last = Some(step(&mut finder, &scope_info, &scope));
+        }
+        let (top, _) = rows(&last.expect("frames"));
+        assert!(top.abs_diff(140) <= 2, "the scope crop first: {top}");
+        finder.set_on(false);
+        for _ in 0..24 {
+            assert_eq!(
+                step(&mut finder, &full_info, &full).source,
+                geo::Source::Whole
+            );
+        }
+        finder.set_on(true);
+        for _ in 0..24 {
+            assert_eq!(rows(&step(&mut finder, &black_info, &black)), (0, 0));
+        }
+        // On while on already is not a new start.
+        for _ in 0..24 {
+            step(&mut finder, &scope_info, &scope);
+        }
+        finder.set_on(true);
+        let (top, _) = rows(&step(&mut finder, &scope_info, &scope));
+        assert!(top.abs_diff(140) <= 2, "kept: {top}");
     }
 
     // A change of frame rate alone (the same size and format) is a new epoch:
