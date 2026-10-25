@@ -552,6 +552,8 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
             "" => Ok(None),
             v => v.parse::<i64>().map(Some).map_err(|_| bad(n + 1)),
         };
+        let size = |v: u64| frame_size(v, n + 1);
+        let dims = frame_dims(num(6)?, num(7)?, num(8)?, n + 1)?;
         let (format, planes) = match f[9] {
             R210_PLANES => ("r210", true),
             V210_PLANES => ("v210", true),
@@ -560,10 +562,10 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
         frames.push(ClipFrame {
             index: num(0)?,
             offset: num(1)?,
-            size: num(2)? as usize,
-            width: num(6)? as usize,
-            height: num(7)? as usize,
-            row_bytes: num(8)? as usize,
+            size: size(num(2)?)?,
+            width: dims.0,
+            height: dims.1,
+            row_bytes: dims.2,
             pixel_format: format.to_string(),
             planes,
             frame_number: num(0)?,
@@ -587,6 +589,39 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
     Ok(frames)
 }
 
+/// The largest picture the card delivers, and its bytes at 4 a pixel with
+/// room for padded rows: what an index frame may be (#231). Anything larger
+/// is a corrupt or foreign file, refused before a buffer is sized from it.
+const MAX_WIDTH: u64 = 4096;
+const MAX_HEIGHT: u64 = 2160;
+const MAX_FRAME_BYTES: u64 = MAX_HEIGHT * (MAX_WIDTH * 4 + 1024);
+
+fn too_big(line: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("frames.csv line {line}: a frame larger than any the card delivers"),
+    )
+}
+
+/// An index frame's width, height and row bytes, within what the card
+/// makes: its rows together no larger than its largest frame.
+fn frame_dims(w: u64, h: u64, row: u64, line: usize) -> std::io::Result<(usize, usize, usize)> {
+    let rows = row.checked_mul(h).ok_or_else(|| too_big(line))?;
+    if w > MAX_WIDTH || h > MAX_HEIGHT || rows > MAX_FRAME_BYTES {
+        return Err(too_big(line));
+    }
+    let fit = |v: u64| usize::try_from(v).map_err(|_| too_big(line));
+    Ok((fit(w)?, fit(h)?, fit(row)?))
+}
+
+/// An index frame's stored size, within what the card makes.
+fn frame_size(size: u64, line: usize) -> std::io::Result<usize> {
+    if size > MAX_FRAME_BYTES {
+        return Err(too_big(line));
+    }
+    usize::try_from(size).map_err(|_| too_big(line))
+}
+
 /// A C++ clip's index: `index,offset,sequence,stream_time,rate_scale,
 /// rate_duration,width,height,row_bytes,...`, every frame v210 and
 /// `height * row_bytes` long.
@@ -601,12 +636,16 @@ fn read_cpp_index(text: &str) -> std::io::Result<Vec<ClipFrame>> {
         let num = |i: usize| f[i].parse::<u64>().map_err(|_| bad(n + 1));
         let stream_time = f[3].parse::<i64>().map_err(|_| bad(n + 1))?;
         let (scale, duration) = (num(4)?, num(5)?);
-        let (height, row_bytes) = (num(7)? as usize, num(8)? as usize);
+        let (width, height, row_bytes) = frame_dims(num(6)?, num(7)?, num(8)?, n + 1)?;
+        let size = height
+            .checked_mul(row_bytes)
+            .ok_or_else(|| too_big(n + 1))
+            .and_then(|s| frame_size(s as u64, n + 1))?;
         frames.push(ClipFrame {
             index: num(0)?,
             offset: num(1)?,
-            size: height * row_bytes,
-            width: num(6)? as usize,
+            size,
+            width,
             height,
             row_bytes,
             pixel_format: "v210".into(),
@@ -1189,6 +1228,49 @@ pub(crate) mod tests {
         }
         assert!(complete(), "the stream was never finished");
         drop(feed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Sizes and dimensions from an index are bounded before anything is sized
+    // from them: a frame beyond the card's largest is an error, in our
+    // format and the C++ one (#231).
+    #[test]
+    fn an_index_beyond_the_cards_frames_is_refused() {
+        let dir = std::env::temp_dir().join(format!("cinefit-bound-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let ours = |line: &str| {
+            std::fs::write(dir.join("frames.csv"), format!("{CSV_HEADER}\n{line}\n"))
+                .expect("write");
+            read_index(&dir)
+        };
+        let ok = "0,0,22118400,0.0,1001,1001,3840,2160,10240,v210,,,,,,";
+        assert_eq!(ours(ok).expect("a 2160p v210 frame").len(), 1);
+        for bad in [
+            "0,0,1000000000000,0.0,1001,1001,3840,2160,10240,v210,,,,,,",
+            "0,0,22118400,0.0,1001,1001,99999,2160,10240,v210,,,,,,",
+            "0,0,22118400,0.0,1001,1001,3840,2160,99999999,v210,,,,,,",
+        ] {
+            let e = ours(bad).expect_err(bad);
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{bad}: {e}");
+        }
+        let cpp = |line: &str| {
+            std::fs::write(
+                dir.join("frames.csv"),
+                format!("index,offset,sequence,stream_time,rate_scale,rate_duration,width,height,row_bytes\n{line}\n"),
+            )
+            .expect("write");
+            read_index(&dir)
+        };
+        assert_eq!(
+            cpp("0,0,0,0,24000,1001,3840,2160,10240")
+                .expect("a C++ frame")
+                .len(),
+            1
+        );
+        let e = cpp("0,0,0,0,24000,1001,3840,4000000000,4000000000")
+            .expect_err("overflowing dimensions");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
