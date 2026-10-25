@@ -2795,10 +2795,26 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             // commit.
                             ui.update(&mut out, encoding_for(w.signal), Instant::now());
                             out.set_hdr(hdr);
-                            let show = ready.unwrap_or(front);
-                            out.modeset(i, buffers[show])
-                                .map(|()| (i, show))
-                                .map_err(|e| e.to_string())
+                            // Into or out of HDR what is rendered is encoded
+                            // for the old output: the new signalling lights
+                            // with black, which is black in both (#197). The
+                            // display resyncs on these switches anyway.
+                            let show = if color_for(w.signal) == out_color {
+                                Ok(ready.unwrap_or(front))
+                            } else {
+                                let free = (0..BUFFERS)
+                                    .find(|&b| b != front && b != pending)
+                                    .expect("three buffers, two in use");
+                                ready = None;
+                                pl.clear_black(&targets[free])
+                                    .map(|()| free)
+                                    .map_err(|e| e.to_string())
+                            };
+                            show.and_then(|show| {
+                                out.modeset(i, buffers[show])
+                                    .map(|()| (i, show))
+                                    .map_err(|e| e.to_string())
+                            })
                         }
                     };
                     match result {
