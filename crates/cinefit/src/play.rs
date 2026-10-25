@@ -48,12 +48,15 @@ use log::{info, warn};
 /// one frame is not enough.
 const STABLE_FRAMES: usize = 12;
 /// Frames of 10-bit RGB that does not decode as a Dolby Vision tunnel before
-/// it is taken for plain RGB: two seconds at 24p. The player starts a Dolby
-/// Vision title with RGB frames that carry no tunnel yet, and believing them
-/// on [`STABLE_FRAMES`] cost a modeset to SDR and another back a second later
-/// (2026-10-13, S&M montage). Plain 10-bit RGB is rare from this chain, so
-/// waiting for it costs little.
-const TUNNEL_GRACE: usize = 48;
+/// it is taken for plain RGB: twenty seconds at 24p. The player starts a Dolby
+/// Vision title with RGB frames whose tunnel cannot be read yet, and believing
+/// them on [`STABLE_FRAMES`] cost a modeset to SDR and another back a second
+/// later (2026-10-13, S&M montage). Two seconds was too short: shown as plain
+/// RGB, tunnel bytes are a red screen, and in the rig's logs 16 of 26 starts
+/// took 3.7 to 12.9 s to decode (the other 10 within 0.6 s; all 4K 23.976,
+/// 2026-10-15 to 10-25). Plain 10-bit RGB has not arrived from this chain at
+/// all, so waiting for it costs nothing seen.
+const TUNNEL_GRACE: usize = 480;
 /// How long to wait for stable input before starting without it. A source
 /// that is on settles in well under a second (a tunnel, in two); past this
 /// the display is opened at `output.wait_hz` with black, so it shows neither
