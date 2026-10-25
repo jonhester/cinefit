@@ -167,6 +167,34 @@ pub fn session_dir(root: &Path) -> PathBuf {
     root.join("caught").join(stamp)
 }
 
+/// Claims `dir` for a new session, or `dir-2`, `dir-3`, ... when a session
+/// has it already. Sessions are named to the second, and one can start in
+/// the second the last ended, while that one is still being closed on the
+/// worker (#208): two sessions must never share files.
+fn claim(dir: PathBuf) -> io::Result<PathBuf> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for n in 1..=1000u32 {
+        let candidate = if n == 1 {
+            dir.clone()
+        } else {
+            let mut name = dir.clone().into_os_string();
+            name.push(format!("-{n}"));
+            PathBuf::from(name)
+        };
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{}: a thousand sessions of that name", dir.display()),
+    ))
+}
+
 /// Where sessions go by default: `~/cinefit-clips`.
 pub fn default_root() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join("cinefit-clips"))
@@ -208,7 +236,7 @@ impl Recorder {
     ///
     /// If the directory or its files cannot be created.
     pub fn start(dir: PathBuf) -> io::Result<Self> {
-        fs::create_dir_all(&dir)?;
+        let dir = claim(dir)?;
         let mut readings_file = BufWriter::new(File::create(dir.join("readings.csv"))?);
         writeln!(readings_file, "{}", readings::header())?;
         let mut frames_file = BufWriter::new(File::create(dir.join("frames.csv"))?);
@@ -523,6 +551,28 @@ fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Two sessions given one name (the same second) get directories of
+    // their own: the second is not written over the first.
+    #[test]
+    fn sessions_of_one_name_get_their_own_directories() {
+        let root = std::env::temp_dir().join(format!("cinefit-claim-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let name = root.join("caught").join("20261025-120000");
+        let a = Recorder::start(name.clone()).expect("first");
+        let b = Recorder::start(name.clone()).expect("second");
+        assert_eq!(a.dir(), name.as_path());
+        assert_eq!(
+            b.dir(),
+            root.join("caught").join("20261025-120000-2").as_path()
+        );
+        a.note("first");
+        b.note("second");
+        let read = |d: &Path| fs::read_to_string(d.join("session.txt")).unwrap();
+        assert!(read(a.dir()).contains("first") && !read(a.dir()).contains("second"));
+        drop((a, b));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// The detector's tunnel reader agrees with the renderer's packing,
     /// which the GPU unpack is checked against: the same frame, both ways.
