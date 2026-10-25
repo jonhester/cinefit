@@ -249,7 +249,10 @@ impl Ui {
             match (out.create_overlay(index), out.create_overlay(index)) {
                 (Ok(a), Ok(b)) => Some([a, b]),
                 (Err(e), _) | (_, Err(e)) => {
-                    warn!("osd: no overlay buffers, so no slate or banners: {e}");
+                    warn!(
+                        "osd: no overlay buffers, so no slate or banners: {}",
+                        crate::chain(&e)
+                    );
                     None
                 }
             }
@@ -445,7 +448,10 @@ impl Ui {
                     _ => 0,
                 };
                 if let Err(e) = self.blit(out, buffers[i], i, &p) {
-                    warn!("osd: copying into the overlay failed, so no overlay from now: {e}");
+                    warn!(
+                        "osd: copying into the overlay failed, so no overlay from now: {}",
+                        crate::chain(&e)
+                    );
                     self.buffers = None;
                     out.set_overlay(None);
                     return;

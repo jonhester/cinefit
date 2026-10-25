@@ -46,6 +46,26 @@ mod unpack_check;
 #[cfg(target_os = "linux")]
 mod web;
 
+/// An error and its causes, as one line ("what: cause: its cause"): what a
+/// person reads, where `{e}` would show only the outermost.
+pub(crate) struct Chain<'a>(&'a (dyn std::error::Error + 'a));
+
+pub(crate) fn chain<'a>(e: &'a (dyn std::error::Error + 'a)) -> Chain<'a> {
+    Chain(e)
+}
+
+impl std::fmt::Display for Chain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut cause = self.0.source();
+        while let Some(c) = cause {
+            write!(f, ": {c}")?;
+            cause = c.source();
+        }
+        Ok(())
+    }
+}
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -437,7 +457,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}", chain(&*e));
             ExitCode::FAILURE
         }
     }
@@ -1169,4 +1189,26 @@ fn pattern_rgba(w: usize, h: usize) -> Vec<u8> {
         }
     }
     rgba
+}
+
+#[cfg(test)]
+mod tests {
+    // A KMS error reads as it did before its cause became the source: what
+    // failed, then why (#228).
+    #[test]
+    fn a_chain_reads_as_one_line() {
+        let e = cinefit_kms::Error::Io {
+            what: "allocating a dumb buffer",
+            source: std::io::Error::from_raw_os_error(12),
+        };
+        assert_eq!(
+            super::chain(&e).to_string(),
+            format!(
+                "allocating a dumb buffer: {}",
+                std::io::Error::from_raw_os_error(12)
+            )
+        );
+        let plain: Box<dyn std::error::Error> = "no source".into();
+        assert_eq!(super::chain(&*plain).to_string(), "no source");
+    }
 }

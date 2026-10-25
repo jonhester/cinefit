@@ -82,7 +82,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Io { what, source } => write!(f, "{what}: {source}"),
+            // The cause is the source, for a report to add (cinefit's
+            // `chain`); written here too it would come out twice.
+            Error::Io { what, .. } => f.write_str(what),
             Error::NoDisplay => f.write_str("no DRM device has a connected display"),
             Error::NoCrtc => f.write_str("no CRTC can drive the connector"),
             Error::NoPlane => f.write_str("no primary plane for the CRTC"),
@@ -109,7 +111,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) fn io(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Io { what, source }
@@ -1552,6 +1561,20 @@ fn timing(m: &Mode) -> ModeTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The cause is the source, not repeated in the text (#228).
+    #[test]
+    fn an_io_error_gives_its_cause_as_the_source() {
+        use std::error::Error as _;
+        let e = io("opening the card")(std::io::Error::from_raw_os_error(16));
+        assert_eq!(e.to_string(), "opening the card");
+        let source = e.source().expect("a source");
+        assert_eq!(
+            source.to_string(),
+            std::io::Error::from_raw_os_error(16).to_string()
+        );
+        assert!(Error::NoDisplay.source().is_none());
+    }
 
     // An index past the list is an error that names it, not a panic (#227).
     #[test]

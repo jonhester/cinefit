@@ -126,7 +126,7 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
         let frame = match out.create_scanout_as(index, m) {
             Ok(f) => f,
             Err(e) => {
-                println!("{name:<20} not allocated: {e}");
+                println!("{name:<20} not allocated: {}", crate::chain(&e));
                 continue;
             }
         };
@@ -163,11 +163,12 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
             Err(e) => {
                 unread += 1;
                 println!(
-                    "{name:<20} {:>6.2}ms {:>6.2}ms {:>6.2}ms {:>8}  not read back: {e}",
+                    "{name:<20} {:>6.2}ms {:>6.2}ms {:>6.2}ms {:>8}  not read back: {}",
                     at(0.5),
                     at(0.95),
                     times[times.len() - 1],
-                    buf.stride
+                    buf.stride,
+                    crate::chain(&*e)
                 );
                 continue;
             }
@@ -178,7 +179,7 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
             Ok(()) => "start-up check passes".to_string(),
             Err(e) => {
                 bad += 1;
-                format!("start-up check FAILS: {e}")
+                format!("start-up check FAILS: {}", crate::chain(&*e))
             }
         };
         let compared = match &linear {
@@ -249,7 +250,8 @@ pub fn run(frames: usize, card: Option<&std::path::Path>) -> Result<(), Box<dyn 
                     // play's start-up check must fail on it too.
                     match crate::play::renders_right(&out, &pl, frame, &target) {
                         Err(e) => println!(
-                            "negative control, play's start-up check: fails, as it must ({e})"
+                            "negative control, play's start-up check: fails, as it must ({})",
+                            crate::chain(&*e)
                         ),
                         Ok(()) => {
                             println!(
