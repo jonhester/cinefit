@@ -107,10 +107,7 @@ impl ClipWriter {
         }
         std::fs::write(dir.join("README.txt"), README)?;
         let mut csv = BufWriter::new(File::create(dir.join("frames.csv"))?);
-        writeln!(
-            csv,
-            "index,offset,size,at_seconds,stream_time,duration,width,height,row_bytes,pixel_format,eotf,colorspace,max_cll,max_fall,max_mastering,min_mastering"
-        )?;
+        writeln!(csv, "{CSV_HEADER}")?;
         let zstd = spawn_zstd(&frames)?;
 
         let (tx, rx) = sync_channel::<Item>(POOL);
@@ -437,6 +434,9 @@ fn unpack_r210(
     Ok(())
 }
 
+/// The header of our `frames.csv`, one column per [`csv_line`] field.
+const CSV_HEADER: &str = "index,offset,size,at_seconds,stream_time,duration,width,height,row_bytes,pixel_format,eotf,colorspace,max_cll,max_fall,max_mastering,min_mastering";
+
 /// One CSV line; `stored` is the name and size of a frame stored as planes.
 fn csv_line(item: &Item, offset: u64, stored: Option<(&str, usize)>) -> String {
     let i = &item.info;
@@ -512,6 +512,12 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
             return Err(bad(n + 1));
         }
         let num = |i: usize| f[i].parse::<u64>().map_err(|_| bad(n + 1));
+        // Empty when the card reported none, and signed as the card gives
+        // them: a missing or unusable one is not a reason to lose the clip.
+        let opt = |i: usize| match f[i] {
+            "" => Ok(None),
+            v => v.parse::<i64>().map(Some).map_err(|_| bad(n + 1)),
+        };
         let (format, planes) = match f[9] {
             R210_PLANES => ("r210", true),
             V210_PLANES => ("v210", true),
@@ -526,9 +532,11 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
             row_bytes: num(8)? as usize,
             pixel_format: format.to_string(),
             planes,
-            frame_number: match (num(4)?, num(5)?) {
-                (_, 0) => num(0)?,
-                (time, duration) => time / duration,
+            frame_number: match (opt(4)?, opt(5)?) {
+                (Some(time), Some(duration)) if duration > 0 => {
+                    time.max(0) as u64 / duration as u64
+                }
+                _ => num(0)?,
             },
             time: f[3].parse().map_err(|_| bad(n + 1))?,
         });
@@ -962,6 +970,44 @@ pub(crate) mod tests {
         for (i, (n, b)) in got.iter().enumerate() {
             assert_eq!((*n, b), (i as u64, &frames[i]));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_with_unreported_or_negative_timing_reads_back() {
+        let dir =
+            std::env::temp_dir().join(format!("cinefit-record-timing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let timings = [
+            (Some(2002), Some(1001)),
+            (None, Some(1001)),
+            (Some(3003), None),
+            (Some(-1001), Some(1001)),
+            (Some(4004), Some(0)),
+        ];
+        let mut csv = format!("{CSV_HEADER}\n");
+        for (k, &(stream_time, duration)) in timings.iter().enumerate() {
+            let item = Item {
+                index: 10 + k as u64,
+                at: Duration::from_millis(42 * k as u64),
+                info: FrameInfo {
+                    stream_time,
+                    duration,
+                    ..info(16)
+                },
+                buf: Vec::new(),
+                len: 32,
+            };
+            csv += &csv_line(&item, 32 * k as u64, None);
+            csv.push('\n');
+        }
+        std::fs::write(dir.join("frames.csv"), csv).expect("write");
+        let index = read_index(&dir).expect("index");
+        // Reported timing gives the frame number; without it, the index.
+        let numbers: Vec<u64> = index.iter().map(|f| f.frame_number).collect();
+        assert_eq!(numbers, [2, 11, 12, 0, 14]);
+        assert_eq!(index[1].offset, 32);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
