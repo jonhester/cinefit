@@ -1553,7 +1553,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     let result = play(opts);
     if let Err(e) = &result {
         // main prints it to the terminal.
-        log::error!(target: runlog::FILE_ONLY, "{e}");
+        log::error!(target: runlog::FILE_ONLY, "{}", crate::chain(&**e));
     }
     result
 }
@@ -1789,7 +1789,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         info!(
                             "scanout: {} not usable ({}); asking for another",
                             cinefit_kms::modifier_name(m),
-                            f.error
+                            crate::chain(&*f.error)
                         );
                         mods.retain(|&x| x != m);
                         if mods.iter().all(|&x| x == 0) {
@@ -1799,7 +1799,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     None => {
                         warn!(
                             "scanout: the tiled layouts failed ({}); LINEAR, as before",
-                            f.error
+                            crate::chain(&*f.error)
                         );
                         mods = vec![0];
                     }
@@ -2854,7 +2854,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         }
                         Err(e) => {
                             sleep_refused = true;
-                            warn!("{:.1} s: could not stop the output: {e}", now.as_secs_f64());
+                            warn!(
+                                "{:.1} s: could not stop the output: {}",
+                                now.as_secs_f64(),
+                                crate::chain(&e)
+                            );
                         }
                     }
                 }
@@ -2899,7 +2903,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             show.and_then(|show| {
                                 out.modeset(i, buffers[show])
                                     .map(|()| (i, show))
-                                    .map_err(|e| e.to_string())
+                                    .map_err(|e| crate::chain(&e).to_string())
                             })
                         }
                     };
@@ -3023,7 +3027,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     }
     match out.restore() {
         Ok(restored) => info!("{restored}; now: {}", out.hdr_state()),
-        Err(e) => warn!("could not restore the display: {e}"),
+        Err(e) => warn!("could not restore the display: {}", crate::chain(&e)),
     }
     let failed_restarts = capture.failed_restarts();
     drop(capture);
