@@ -398,6 +398,54 @@ struct Target<'a, 'p> {
 /// coming on is followed within this.
 const MODE_PROBE_EVERY: Duration = Duration::from_secs(5);
 
+/// The output, waiting for a connected display when there is none yet (#177):
+/// at boot the service can start before the display's connector reads
+/// connected. Exiting and letting the service restart came back by itself,
+/// as for a missing mode (#143), but reopened the capture card and wrote a run
+/// log every time. Logged once, probed again every few seconds. Any other
+/// error, and a dry run, still end the run.
+fn wait_for_display(
+    card: Option<&std::path::Path>,
+    dry_run: bool,
+) -> Result<cinefit_kms::Output, Box<dyn Error>> {
+    let out = retry_no_display(
+        || cinefit_kms::Output::open(card),
+        dry_run,
+        MODE_PROBE_EVERY,
+    )?;
+    Ok(out)
+}
+
+/// `open` again every `every` while it says no display is connected; any
+/// other answer, or the first one in a dry run, is the result.
+fn retry_no_display<T>(
+    mut open: impl FnMut() -> Result<T, cinefit_kms::Error>,
+    dry_run: bool,
+    every: Duration,
+) -> Result<T, cinefit_kms::Error> {
+    let mut waiting_since: Option<Instant> = None;
+    loop {
+        match open() {
+            Err(e @ cinefit_kms::Error::NoDisplay) if !dry_run => {
+                if waiting_since.is_none() {
+                    info!("{e}: waiting for one (probing every {} s)", every.as_secs());
+                    waiting_since = Some(Instant::now());
+                }
+            }
+            result => {
+                if let (Ok(_), Some(t)) = (&result, waiting_since) {
+                    info!(
+                        "display connected after {:.0} s of waiting",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                return result;
+            }
+        }
+        std::thread::sleep(every);
+    }
+}
+
 /// The wanted mode, from the modes the output offers, waiting for it when it
 /// is not there yet (#143): a receiver offers only its own 1080p fallback
 /// while the projector behind it is off. Exiting and letting the service
@@ -1498,7 +1546,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
 
     // The output: the panel at the source's own rate, signalling chosen from
     // the source, in one commit.
-    let mut out = cinefit_kms::Output::open(opts.card.as_deref())?;
+    let mut out = wait_for_display(opts.card.as_deref(), opts.dry_run)?;
     info!("output: {}", out.describe());
     let want = cinefit_kms::ModeRequest {
         width: cfg.width,
@@ -1871,6 +1919,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut finished: Vec<(String, Duration, cinefit_kms::Pacing)> = Vec::new();
     let mut mode_name = mode.to_string();
     let mut latest_want: Option<follow::Want> = None;
+    // The HDR10 metadata carried over frames that come without it (#61).
+    let mut pq_meta = None;
     let (mut front, mut pending) = (0usize, 0usize);
     ui.update(&mut out, enc, Instant::now());
     out.flip(buffers[front])?;
@@ -2185,6 +2235,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 pl.clear_black(&targets[free])?;
                 ready = Some(free);
                 dark = true;
+                // The next title after a break may send its block late: it
+                // must not go out with the last one's values meanwhile (#61).
+                pq_meta = None;
                 counts.signal_losses += 1;
                 receiver.nudge();
                 // A break in the input: the viewing so far is judged.
@@ -2324,6 +2377,16 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 "dolby_vision_bytes": info.dolby_vision_bytes,
                             },
                             "hdr10": info.color.hdr.as_ref().map(snapshot::hdr),
+                            // A frame without its own block is signalled
+                            // with the last one carried over (#61): that,
+                            // or null where nothing is carried.
+                            "hdr10_carried": pq_meta
+                                .as_ref()
+                                .filter(|_| {
+                                    matches!(content, Content::Hdr10(_))
+                                        && info.color.hdr.is_none()
+                                })
+                                .map(snapshot::hdr),
                             // What low-latency Dolby Vision is taken to be,
                             // and what HDR10 and the tunnel are mapped into.
                             "lldv": {
@@ -2438,21 +2501,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 } else {
                     // What the output should be for this frame, for the policy after
                     // the next flip. The rate is the input's, as the card reported it.
-                    // A PQ frame without its metadata block is not a change of
-                    // metadata: the card attaches it only to frames it flags, and
-                    // treating its absence as zeros would flap the output.
-                    let pq_without_metadata =
-                        matches!(content, Content::Hdr10(_)) && frame.info().color.hdr.is_none();
+                    // An HDR10 frame without its metadata block carries the last
+                    // one on, so every frame's rate reaches the policy (#61).
+                    let hdr_meta = carried_hdr(content, frame.info().color.hdr, &mut pq_meta);
                     if !matches!(k.kind, Kind::Unsupported(_))
-                        && !pq_without_metadata
                         && let Some(f) = *format.lock().unwrap_or_else(PoisonError::into_inner)
                     {
-                        let (hdr, _) = output_in(
-                            cfg.mode,
-                            content,
-                            frame.info().color.hdr.as_ref(),
-                            last_tunnel.as_ref(),
-                        );
+                        let (hdr, _) =
+                            output_in(cfg.mode, content, hdr_meta.as_ref(), last_tunnel.as_ref());
                         let want = follow::Want {
                             rate_mhz: rate_mhz(&f),
                             signal: signal_of(hdr),
@@ -2915,6 +2971,24 @@ fn hdr_line(h: &HdrMetadata) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_display_is_waited_for() {
+        use cinefit_kms::Error as Kms;
+        // Two refusals, then a display: the third answer is the result.
+        let mut answers = vec![Ok(7), Err(Kms::NoDisplay), Err(Kms::NoDisplay)];
+        let got = retry_no_display(|| answers.pop().unwrap(), false, Duration::ZERO);
+        assert_eq!(got.ok(), Some(7));
+        assert!(answers.is_empty());
+        // A dry run does not wait.
+        let mut answers = vec![Ok(7), Err(Kms::NoDisplay)];
+        let got = retry_no_display(|| answers.pop().unwrap(), true, Duration::ZERO);
+        assert!(matches!(got, Err(Kms::NoDisplay)));
+        // Any other error ends it at once.
+        let mut answers = vec![Ok(7), Err(Kms::NoCrtc)];
+        let got = retry_no_display(|| answers.pop().unwrap(), false, Duration::ZERO);
+        assert!(matches!(got, Err(Kms::NoCrtc)));
+    }
+
     use super::*;
 
     /// A session's HDR note keeps an unreported value apart from zero.

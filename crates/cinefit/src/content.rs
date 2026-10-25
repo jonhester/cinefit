@@ -227,6 +227,28 @@ pub(crate) const SDR_BT2020: RgbColor = RgbColor {
     transfer: Transfer::Bt1886,
 };
 
+/// The HDR10 metadata in force for a frame (#61). The card attaches the
+/// metadata block only to the frames it flags, so an HDR10 frame without one
+/// carries on the last this run of HDR10 frames had: taken as zeros, its
+/// absence flapped the output, and skipping the frame instead left the
+/// policy blind to its rate too. Leaving HDR10 forgets it, so a new title
+/// does not inherit the last one's values. A source that never sends the
+/// block stays at "unknown" (zeros) throughout, which is steady.
+pub(crate) fn carried_hdr(
+    content: Content,
+    frame: Option<HdrMetadata>,
+    kept: &mut Option<HdrMetadata>,
+) -> Option<HdrMetadata> {
+    if !matches!(content, Content::Hdr10(_)) {
+        *kept = None;
+        return frame;
+    }
+    if frame.is_some() {
+        *kept = frame;
+    }
+    *kept
+}
+
 /// The output for an input under the `output.mode` setting. Dolby Vision, as
 /// a tunnel or already mapped by the player, always goes out as SDR BT.2020:
 /// passed through it would be HDR10 with derived metadata, which the display
@@ -657,6 +679,46 @@ mod tests {
             output_in(Passthrough, sdr2020, None, None),
             (None, SDR_BT2020)
         );
+    }
+
+    /// #61: an HDR10 frame without its block carries the last one on, so
+    /// the output's signalling holds while the rate still reaches the
+    /// policy; leaving HDR10 forgets it.
+    #[test]
+    fn hdr10_metadata_carries_over_frames_without_it() {
+        let meta = |cll: f64| HdrMetadata {
+            red: None,
+            green: None,
+            blue: None,
+            white: None,
+            max_mastering: Some(1000.0),
+            min_mastering: Some(0.005),
+            max_cll: Some(cll),
+            max_fall: None,
+        };
+        let pq = content(Transfer::Pq);
+        let mut kept = None;
+        assert_eq!(
+            carried_hdr(pq, Some(meta(304.0)), &mut kept),
+            Some(meta(304.0))
+        );
+        // Without a block: the last one, so the signal sent is the same.
+        let carried = carried_hdr(pq, None, &mut kept);
+        assert_eq!(carried, Some(meta(304.0)));
+        assert_eq!(
+            output_in(OutputMode::Passthrough, pq, carried.as_ref(), None),
+            output_in(OutputMode::Passthrough, pq, Some(&meta(304.0)), None),
+        );
+        // A new block replaces it.
+        assert_eq!(
+            carried_hdr(pq, Some(meta(637.0)), &mut kept),
+            Some(meta(637.0))
+        );
+        // Out of HDR10 and back: the old title's values are not inherited.
+        assert_eq!(carried_hdr(bt709(), None, &mut kept), None);
+        assert_eq!(carried_hdr(pq, None, &mut kept), None);
+        // A source that never sends a block stays unknown, steadily.
+        assert_eq!(carried_hdr(pq, None, &mut kept), None);
     }
 
     #[test]
