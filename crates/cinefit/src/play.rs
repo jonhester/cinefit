@@ -388,6 +388,26 @@ struct Sources<'p> {
     /// metadata only to frames it flags, and a peak that came and went would
     /// make the tone mapping flicker.
     pq_peak: Option<f32>,
+    /// The last tunnel mapping and the scene and target it was built for.
+    dm: Option<(cinefit_render::dm::Scene, f32, cinefit_render::dm::Frame)>,
+}
+
+/// The tunnel mapping for `scene` at `target` nits, built only when either
+/// changed since the last frame: L1 and the trims change at cuts, tens of
+/// times a film, and a table costs about 0.05 ms to build (#206).
+fn dm_frame(
+    cache: &mut Option<(cinefit_render::dm::Scene, f32, cinefit_render::dm::Frame)>,
+    scene: cinefit_render::dm::Scene,
+    target: f32,
+) -> &cinefit_render::dm::Frame {
+    if !cache
+        .as_ref()
+        .is_some_and(|(s, t, _)| *s == scene && *t == target)
+    {
+        let frame = cinefit_render::dm::Frame::new(&scene, f64::from(target));
+        *cache = Some((scene, target, frame));
+    }
+    &cache.as_ref().expect("just set").2
 }
 
 /// Per-stage times, milliseconds.
@@ -1375,7 +1395,7 @@ fn draw<'p>(
             // metadata, onto the target, then one to one into SDR as the
             // player's low-latency rendering is.
             if let (Transfer::Bt1886, Some(scene)) = (out.transfer, tunnel.dm_scene()) {
-                let frame = cinefit_render::dm::Frame::new(&scene, f64::from(dst.mapped_nits));
+                let frame = dm_frame(&mut sources.dm, scene, dst.mapped_nits);
                 let map = Mapping {
                     src_peak: dst.mapped_nits,
                     dst_peak: dst.mapped_nits,
@@ -1385,7 +1405,7 @@ fn draw<'p>(
                     peak_percentile: dst.peak_percentile,
                     knee_offset: 0.0,
                 };
-                pl.render_dovi_dm(p, &tunnel.color, &frame, dst.tex, out, view, &map)?;
+                pl.render_dovi_dm(p, &tunnel.color, frame, dst.tex, out, view, &map)?;
             } else {
                 // No level 1: from the grade's own peak, with peak detection
                 // to follow the scene.
@@ -3114,6 +3134,33 @@ mod tests {
         ] {
             assert_eq!(rgb10_kind(tunnel_frame(t), &mut last), kind);
             assert_eq!(last.as_ref().and_then(|t| t.scene_max_pq), Some(max));
+        }
+    }
+
+    // The cached table is the one Frame::new gives for every frame's scene
+    // and target: kept over repeats, rebuilt when L1, a trim or the target
+    // changes, and when a scene comes back (#206).
+    #[test]
+    fn the_tunnel_mapping_is_rebuilt_on_any_change() {
+        use cinefit_render::dm::{Frame, Scene, Trim};
+        let scene = |max, slope| {
+            Scene::from_codes(
+                [62, 1200, max],
+                [62, 3079],
+                vec![Trim::from_codes(2081, [slope, 2048, 2048, 2048, 2048])],
+            )
+        };
+        let mut cache = None;
+        for (s, target) in [
+            (scene(2950, 2048), 96.0),
+            (scene(2950, 2048), 96.0),
+            (scene(3079, 2048), 96.0),
+            (scene(3079, 2100), 96.0),
+            (scene(3079, 2100), 155.0),
+            (scene(2950, 2048), 96.0),
+        ] {
+            let want = Frame::new(&s, f64::from(target));
+            assert_eq!(*super::dm_frame(&mut cache, s, target), want);
         }
     }
 
