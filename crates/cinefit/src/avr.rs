@@ -5,11 +5,15 @@
 //! Two of its interfaces, as the C++ version measured them (cinefit-cpp
 //! `docs/findings.md`, *Denon control protocol*):
 //!
+//! - the text protocol on port 23, CR-terminated: power and the input
+//!   (`PW?`, `SI?`), polled, and the input names (`SSFUN ?`), read once. It
+//!   allows one session at a time, so it is opened, asked and closed, never
+//!   held;
 //! - the web status, `GET :8080/goform/formMainZone_MainZoneXmlStatusLite.xml`:
-//!   power and the input, polled. It holds no connection;
-//! - the text protocol on port 23, CR-terminated, for the input names
-//!   (`SSFUN ?`), read once: it allows one session at a time, so it is
-//!   opened, asked and closed, never held.
+//!   power and the input, read only when the text protocol does not answer
+//!   (another session holds it). From 2026-10-21 to a reboot on 10-25 the
+//!   AVR-X3700H's web status said NET while the text protocol said BD and the
+//!   player was on screen (#170), so it is not the first choice.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -53,6 +57,21 @@ pub fn parse_status(xml: &str) -> Option<(bool, String)> {
     let power = value("Power")?;
     let input = value("InputFuncSelect")?;
     Some((power.eq_ignore_ascii_case("ON"), input))
+}
+
+/// Power and the input from the text protocol's `PW` and `SI` replies; the
+/// last of each counts. `None` without both.
+pub fn parse_power_input(text: &str) -> Option<(bool, String)> {
+    let mut power = None;
+    let mut input = None;
+    for line in text.split('\r').map(str::trim) {
+        if let Some(p) = line.strip_prefix("PW") {
+            power = Some(p.eq_ignore_ascii_case("ON"));
+        } else if let Some(i) = line.strip_prefix("SI").filter(|i| !i.is_empty()) {
+            input = Some(i.to_string());
+        }
+    }
+    Some((power?, input?))
 }
 
 /// The input names from the text protocol's `SSFUN` replies: code, then the
@@ -186,6 +205,35 @@ fn connect(host: &str, port: u16) -> Option<TcpStream> {
 }
 
 fn status(host: &str) -> Option<(bool, String)> {
+    power_input(host).or_else(|| {
+        // Which one answered shows in the run log, so a wrong input can be
+        // traced to its source.
+        log::debug!("receiver: the text protocol did not answer; reading the web status");
+        web_status(host)
+    })
+}
+
+fn power_input(host: &str) -> Option<(bool, String)> {
+    let mut s = connect(host, 23)?;
+    s.write_all(b"PW?\rSI?\r").ok()?;
+    // Read until both have answered or the receiver goes quiet; it also
+    // sends unrelated status lines (SV, ZM), which are skipped.
+    let mut text = String::new();
+    let mut buf = [0u8; 256];
+    let started = Instant::now();
+    while started.elapsed() < TIMEOUT {
+        if let Some(found) = parse_power_input(&text) {
+            return Some(found);
+        }
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+        }
+    }
+    parse_power_input(&text)
+}
+
+fn web_status(host: &str) -> Option<(bool, String)> {
     let mut s = connect(host, 8080)?;
     write!(
         s,
@@ -231,6 +279,41 @@ mod tests {
         let off = xml.replace("<value>ON</value>", "<value>STANDBY</value>");
         assert_eq!(parse_status(&off), Some((false, "MPLAY".to_string())));
         assert_eq!(parse_status("<html>301 Moved Permanently</html>"), None);
+    }
+
+    #[test]
+    fn the_text_protocol_gives_power_and_input() {
+        // As the AVR-X3700H answered PW? and SI? on 2026-10-25, with
+        // unrelated status lines mixed in.
+        assert_eq!(
+            parse_power_input("PWON\rSIBD\rSVOFF\r"),
+            Some((true, "BD".to_string()))
+        );
+        assert_eq!(
+            parse_power_input("SVOFF\rPWSTANDBY\rZMOFF\rSIMPLAY\r"),
+            Some((false, "MPLAY".to_string()))
+        );
+        // The last of each counts: the input changed while it was asked.
+        assert_eq!(
+            parse_power_input("PWON\rSIBD\rSIMPLAY\r"),
+            Some((true, "MPLAY".to_string()))
+        );
+        // Without both, nothing: the web status is asked instead.
+        assert_eq!(parse_power_input("PWON\rSVOFF\r"), None);
+        assert_eq!(parse_power_input("SIBD\r"), None);
+        assert_eq!(parse_power_input(""), None);
+    }
+
+    /// Against a real receiver: `CINEFIT_DENON=HOST`. Skipped when unset.
+    #[test]
+    fn a_receiver_answers_on_both_interfaces() {
+        let Ok(host) = std::env::var("CINEFIT_DENON") else {
+            return;
+        };
+        let text = power_input(&host).expect("the text protocol answers PW? and SI?");
+        let web = web_status(&host).expect("the web status answers");
+        println!("text protocol {text:?}, web status {web:?}");
+        assert_eq!(text.0, web.0, "power differs between the two");
     }
 
     #[test]

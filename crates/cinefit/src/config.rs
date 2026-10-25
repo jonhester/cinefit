@@ -614,7 +614,7 @@ static SETTINGS: &[Setting] = &[
         key: "avr.denon",
         kind: Kind::Text { max: 253 },
         apply: Apply::Live,
-        help: "The Denon receiver, by hostname or IP address (for example 10.42.1.172): cinefit reads which \
+        help: "The Denon receiver, by hostname or IP address (for example 192.168.1.20): cinefit reads which \
                input is on, by its name on the receiver, and whether the receiver is on, for the info panel, the \
                slate and the detector's dataset. Reads only. Empty: none.",
         get: |c| Value::Name(c.denon.clone()),
