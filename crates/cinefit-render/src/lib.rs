@@ -31,6 +31,9 @@ pub enum Error {
     Render,
     /// The input does not match the size given.
     BadInput,
+    /// A texture, planes or RGB source made by another `Placebo`: its GPU
+    /// objects are not this device's, and libplacebo must not see them.
+    Foreign,
     /// Rendering is Linux only.
     Unsupported,
 }
@@ -41,6 +44,7 @@ impl fmt::Display for Error {
             Error::Create(why) => write!(f, "libplacebo: {why}"),
             Error::Render => f.write_str("libplacebo render failed (see its log)"),
             Error::BadInput => f.write_str("image size does not match its dimensions"),
+            Error::Foreign => f.write_str("a GPU resource from another libplacebo instance"),
             Error::Unsupported => f.write_str("rendering is only supported on Linux"),
         }
     }
@@ -319,6 +323,16 @@ impl Placebo {
             .ok_or(Error::Render)
     }
 
+    /// Refuses a resource another instance made: the SAFETY of every call
+    /// that passes one to the shim rests on it being this device's.
+    fn owns(&self, made_by: &Placebo) -> Result<(), Error> {
+        if std::ptr::eq(self, made_by) {
+            Ok(())
+        } else {
+            Err(Error::Foreign)
+        }
+    }
+
     /// Renders `src` over the whole of `dst` and waits for the GPU to finish,
     /// so `dst` can go to the display. `shift_x` scrolls the source left by
     /// that many pixels, wrapping around; whole pixels keep it exact.
@@ -327,7 +341,9 @@ impl Placebo {
     ///
     /// [`Error::Render`] if libplacebo fails (see its log).
     pub fn render(&self, src: &Texture<'_>, dst: &Texture<'_>, shift_x: f32) -> Result<(), Error> {
-        // SAFETY: both textures belong to this live device.
+        self.owns(src.pl)?;
+        self.owns(dst.pl)?;
+        // SAFETY: both textures belong to this live device (checked above).
         let rc = unsafe {
             ffi::cf_pl_render(
                 self.handle.as_ptr(),
@@ -570,9 +586,10 @@ impl Placebo {
         {
             return Err(Error::BadInput);
         }
+        self.owns(planes.pl)?;
         // SAFETY: `data` holds row_bytes * height bytes, which the shim
-        // uploads; the planes belong to this live device, and `&mut` keeps
-        // anything else from using them meanwhile; the bias is null or two
+        // uploads; the planes belong to this live device (checked above), and
+        // `&mut` keeps anything else from using them meanwhile; the bias is null or two
         // floats, read during the call.
         let rc = unsafe {
             ffi::cf_pl_unpack_v210(
@@ -608,9 +625,10 @@ impl Placebo {
         {
             return Err(Error::BadInput);
         }
+        self.owns(planes.pl)?;
         // SAFETY: `data` holds row_bytes * height bytes, which the shim
-        // uploads; the planes belong to this live device, and `&mut` keeps
-        // anything else from using them meanwhile.
+        // uploads; the planes belong to this live device (checked above), and
+        // `&mut` keeps anything else from using them meanwhile.
         let rc = unsafe {
             ffi::cf_pl_unpack_tunnel(
                 self.handle.as_ptr(),
@@ -661,9 +679,12 @@ impl Placebo {
         let src_crop = Rect::raw(view.src.as_ref());
         let map = map.map(Mapping::raw);
         let raw = dovi_raw(color);
+        self.owns(src.pl)?;
+        self.owns(dst.pl)?;
         // SAFETY: `raw` and `map` (null or not) are structs whose layout the
         // shim shares, and `place` null or four floats, all read during the
-        // call; the planes and the texture belong to this live device.
+        // call; the planes and the texture belong to this live device
+        // (checked above).
         let rc = unsafe {
             ffi::cf_pl_render_dovi(
                 self.handle.as_ptr(),
@@ -705,9 +726,12 @@ impl Placebo {
         let map = map.raw();
         let raw = dovi_raw(color);
         let dm = frame.raw();
+        self.owns(src.pl)?;
+        self.owns(dst.pl)?;
         // SAFETY: `raw`, `dm` and `map` are structs whose layout the shim
         // shares, `place` and `src_crop` null or four floats, all read during
-        // the call; the planes and the texture belong to this live device.
+        // the call; the planes and the texture belong to this live device
+        // (checked above).
         let rc = unsafe {
             ffi::cf_pl_render_dovi_dm(
                 self.handle.as_ptr(),
@@ -802,8 +826,10 @@ impl Placebo {
             Matrix::Bt709 => ffi::MATRIX_BT709,
             Matrix::Bt2020Nc => ffi::MATRIX_BT2020_NC,
         };
-        // SAFETY: the planes and the texture belong to this live device;
-        // `place` is null or four floats and `map` null or a struct whose
+        self.owns(src.pl)?;
+        self.owns(dst.pl)?;
+        // SAFETY: the planes and the texture belong to this live device
+        // (checked above); `place` is null or four floats and `map` null or a struct whose
         // layout the shim shares, both read during the call.
         let rc = unsafe {
             ffi::cf_pl_render_ycbcr(
@@ -872,9 +898,10 @@ impl Placebo {
             rgb::Format::R210 => ffi::R210,
             rgb::Format::Argb8 => ffi::ARGB8,
         };
+        self.owns(rgb.pl)?;
         // SAFETY: `data` holds row_bytes * height bytes, which the shim
-        // uploads; the texture belongs to this live device, and `&mut` keeps
-        // anything else from using it meanwhile.
+        // uploads; the texture belongs to this live device (checked above),
+        // and `&mut` keeps anything else from using it meanwhile.
         let rc = unsafe {
             ffi::cf_pl_unpack_rgb(
                 self.handle.as_ptr(),
@@ -926,8 +953,10 @@ impl Placebo {
             Levels::Full => ffi::LEVELS_FULL,
             Levels::Limited => ffi::LEVELS_LIMITED,
         };
-        // SAFETY: the source and the texture belong to this live device;
-        // `place` is null or four floats, read during the call.
+        self.owns(src.pl)?;
+        self.owns(dst.pl)?;
+        // SAFETY: the source and the texture belong to this live device
+        // (checked above); `place` is null or four floats, read during the call.
         let rc = unsafe {
             ffi::cf_pl_render_rgb(
                 self.handle.as_ptr(),
@@ -951,7 +980,8 @@ impl Placebo {
     ///
     /// [`Error::Render`] if libplacebo fails.
     pub fn clear_black(&self, dst: &Texture<'_>) -> Result<(), Error> {
-        // SAFETY: the texture belongs to this live device.
+        self.owns(dst.pl)?;
+        // SAFETY: the texture belongs to this live device (checked above).
         let rc = unsafe { ffi::cf_pl_clear_black(self.handle.as_ptr(), dst.tex.as_ptr()) };
         if rc == 0 { Ok(()) } else { Err(Error::Render) }
     }
