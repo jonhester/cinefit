@@ -67,6 +67,20 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// A line on how the run is going this often, so a log shows when trouble
 /// started rather than only that it happened.
 const STATUS_EVERY: Duration = Duration::from_secs(60);
+
+/// The shortest frame period the status minute reads the screen back at.
+/// The readback maps the whole buffer off the GPU, about 13 ms on the rig:
+/// with the frame's own upload and render (up to about 11 ms) it fits a
+/// frame of 24, 25 or 30 Hz, and at 60 Hz it cost a flip every status
+/// minute (two misses in two minutes, 2026-10-25, #203).
+const STATUS_READBACK_PERIOD: Duration = Duration::from_millis(30);
+
+/// Whether the status minute reads back what is on screen: at rates where
+/// the readback fits beside the frame's work, or whenever the info panel is
+/// open (it reads back for its own line, and is open on purpose).
+fn status_reads_back(period: Duration, panel_open: bool) -> bool {
+    panel_open || period >= STATUS_READBACK_PERIOD
+}
 /// Input changes logged one by one; past this many, only counted.
 const LOGGED_CHANGES: u64 = 50;
 /// Three buffers: one on screen, one queued, one to render into, so a render
@@ -2214,11 +2228,15 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // through or maps it down, without the panel open.
                 let levels = {
                     let brightest = window.borrow_mut().brightest(Instant::now());
-                    let shown = out
-                        .read_scanout(scan.frame(front), |px, stride| {
-                            scanout_peak(px, stride, scan_fourcc, size)
+                    let read_back = status_reads_back(period, ui.info_open());
+                    let shown = read_back
+                        .then(|| {
+                            out.read_scanout(scan.frame(front), |px, stride| {
+                                scanout_peak(px, stride, scan_fourcc, size)
+                            })
+                            .ok()
+                            .flatten()
                         })
-                        .ok()
                         .flatten();
                     let signal = policy.committed().signal;
                     match (last_key.filter(|_| !dark), brightest) {
@@ -2237,7 +2255,16 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                         white_for(Content::of(k.kind, cfg.lldv), &cfg),
                                     )
                                 })
-                                .map_or_else(|| "-".into(), |n| format!("brightest {n:.0} nits"))
+                                .map_or_else(
+                                    || {
+                                        if read_back {
+                                            "-".into()
+                                        } else {
+                                            "not read back at this rate".into()
+                                        }
+                                    },
+                                    |n| format!("brightest {n:.0} nits"),
+                                )
                         ),
                         _ => String::new(),
                     }
@@ -3449,6 +3476,20 @@ mod tests {
     }
 
     use super::*;
+
+    // The status minute reads the screen back where the readback fits a
+    // frame (24, 25, 30 Hz), not at 50 or 60 Hz, unless the panel asks (#203).
+    #[test]
+    fn the_status_readback_is_kept_off_short_frames() {
+        let at = |hz: f64| Duration::from_secs_f64(1.0 / hz);
+        for hz in [23.976, 24.0, 25.0, 29.97, 30.0] {
+            assert!(status_reads_back(at(hz), false), "{hz} Hz");
+        }
+        for hz in [50.0, 59.94, 60.0] {
+            assert!(!status_reads_back(at(hz), false), "{hz} Hz");
+            assert!(status_reads_back(at(hz), true), "{hz} Hz, panel open");
+        }
+    }
 
     // Detection is timed by what it read, apart from the upload (#220).
     #[test]
