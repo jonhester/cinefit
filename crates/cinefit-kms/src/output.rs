@@ -887,6 +887,9 @@ impl Output {
     /// driver's refusal.
     pub fn modeset(&mut self, index: usize, frame: usize) -> Result<(), Error> {
         let mode = mode_at(&self.modes, index)?;
+        // Both indices before the blob: a bad one returns before anything
+        // needs cleaning up.
+        let fb = frame_at(&self.frames, frame)?.fb;
         let (w, h) = mode.size();
         let blob = blob_id(
             self.card
@@ -906,9 +909,7 @@ impl Output {
             (
                 plane,
                 p.fb_id,
-                u64::from(u32::from(RawResourceHandle::from(
-                    frame_at(&self.frames, frame)?.fb,
-                ))),
+                u64::from(u32::from(RawResourceHandle::from(fb))),
             ),
             (plane, p.plane_crtc, crtc_id),
         ];
