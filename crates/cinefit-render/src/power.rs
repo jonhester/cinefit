@@ -1,11 +1,15 @@
 //! Holds the GPU at amdgpu's "standard" stable power state while alive.
 //!
-//! Under the default clock policy the GPU never ramps up for cinefit's load, a
-//! few milliseconds of work every 41.7, and runs it at about half the speed it
-//! manages back to back. Forcing the level through sysfs needs root and
-//! outlives the process (an experiment's setting was once found still applied
-//! hours later). So this asks for it the way the kernel offers it per process:
-//! a stable pstate on an amdgpu context (`AMDGPU_CTX_OP_SET_STABLE_PSTATE`).
+//! On an RX 6400 the default clock policy never ramped up for cinefit's load,
+//! a few milliseconds of work every 41.7, and ran it at about half the speed
+//! it managed back to back. An RX 9060 XT's own policy beats this hold (a 4K
+//! Dolby Vision tunnel, 2026-10-25: render median 4.1 ms at 25 W, against
+//! 5.3 ms at 48 W held), so `play` asks for it only with `--pstate`.
+//!
+//! Forcing the level through sysfs needs root and outlives the process (an
+//! experiment's setting was once found still applied hours later). So this
+//! asks for it the way the kernel offers it per process: a stable pstate on an
+//! amdgpu context (`AMDGPU_CTX_OP_SET_STABLE_PSTATE`).
 //!
 //! That needs only the render node, no capability, and the kernel undoes it:
 //! freeing the context, including the implicit free when a crashed or killed

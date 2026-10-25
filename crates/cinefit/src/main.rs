@@ -189,10 +189,10 @@ enum Command {
         /// scrolling, instead of drawing with the CPU.
         #[arg(long)]
         gpu: bool,
-        /// With --gpu: leave the GPU's clocks to the driver's default policy
-        /// instead of holding the standard stable power state. For A/B timing.
+        /// With --gpu: hold the GPU at the standard stable power state instead
+        /// of leaving its clocks to the driver. For A/B timing.
         #[arg(long, requires = "gpu")]
-        no_pstate: bool,
+        pstate: bool,
         /// Also show an OSD test card on the overlay plane (slate, banner and
         /// grey steps), encoded for SDR or, with --hdr, PQ. It comes down a
         /// third of the way through and back at two thirds: watch for a resync.
@@ -271,11 +271,13 @@ enum Command {
         /// `cinefit settings` lists them).
         #[arg(long = "set", value_name = "KEY=VALUE")]
         sets: Vec<String>,
-        /// Leave the GPU's clocks to the driver's default policy instead of
-        /// holding the standard stable power state (held while there is a
-        /// signal, and given back after a minute without one).
+        /// Hold the GPU at the standard stable power state instead of leaving
+        /// its clocks to the driver (held while there is a signal, and given
+        /// back after a minute without one). For a GPU whose clocks do not
+        /// rise on their own for a few milliseconds of work a frame, as the
+        /// RX 6400's did not.
         #[arg(long)]
-        no_pstate: bool,
+        pstate: bool,
         /// Stop before the modeset: pre-roll, mode, signalling and the first
         /// render, with the display untouched.
         #[arg(long)]
@@ -380,7 +382,7 @@ fn main() -> ExitCode {
             max_mastering,
             change_max_cll,
             gpu,
-            no_pstate,
+            pstate,
             slate,
         } => {
             let hdr = hdr.then_some(cinefit_kms::HdrStatic {
@@ -396,7 +398,7 @@ fn main() -> ExitCode {
                 hdr,
                 change_max_cll,
                 gpu,
-                pstate: !no_pstate,
+                pstate,
                 slate,
             })
         }
@@ -406,7 +408,7 @@ fn main() -> ExitCode {
             card,
             config,
             sets,
-            no_pstate,
+            pstate,
             dry_run,
             linear_scanout,
         } => {
@@ -422,7 +424,7 @@ fn main() -> ExitCode {
                     config,
                     (file, saved),
                     Switches {
-                        pstate: !no_pstate,
+                        pstate,
                         dry_run,
                         linear_scanout,
                     },
@@ -651,8 +653,7 @@ fn pattern(run: PatternRun) -> Result<(), Box<dyn std::error::Error>> {
     println!("mode: {mode}");
     let (w, h) = (usize::from(mode.width), usize::from(mode.height));
 
-    // Held for the whole run: the default clock policy never ramps up for a
-    // few milliseconds of work every frame. Released, by the kernel if need
+    // With --pstate, held for the whole run; released, by the kernel if need
     // be, when this ends.
     let _clocks = if gpu && pstate {
         match cinefit_render::power::StablePstate::acquire() {
@@ -667,7 +668,7 @@ fn pattern(run: PatternRun) -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         if gpu {
-            println!("gpu clocks: default policy (--no-pstate)");
+            println!("gpu clocks: the driver's default policy");
         }
         None
     };

@@ -1561,11 +1561,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             }
         }
     } else {
-        info!("gpu clocks: default policy (--no-pstate)");
+        info!("gpu clocks: the driver's default policy");
         None
     };
     // Only a hold taken at startup is given back and taken again: one refused
-    // then (another holder, --no-pstate) stays refused for the run.
+    // then (another holder), or not asked for, stays as it is for the run.
     let holds_clocks = clocks.is_some();
 
     let pl = Placebo::new()?;
