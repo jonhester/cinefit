@@ -16,6 +16,15 @@
  * here rather than misbehaving at run time: update the shim, then this. */
 _Static_assert(PL_API_VER == 387, "shim written for libplacebo API 387 (scripts/build-libplacebo.sh)");
 
+/* cf_pl_info and cf_pl_dovi as src/ffi.rs declares them (#295). */
+_Static_assert(sizeof(cf_pl_info) == 268, "cf_pl_info size");
+_Static_assert(offsetof(cf_pl_info, vulkan_api_version) == 256, "cf_pl_info.vulkan_api_version");
+_Static_assert(offsetof(cf_pl_info, max_tex_2d_dim) == 260, "cf_pl_info.max_tex_2d_dim");
+_Static_assert(offsetof(cf_pl_info, dma_buf_import) == 264, "cf_pl_info.dma_buf_import");
+_Static_assert(sizeof(cf_pl_dovi) == 84, "cf_pl_dovi size");
+_Static_assert(offsetof(cf_pl_dovi, offset) == 36, "cf_pl_dovi.offset");
+_Static_assert(offsetof(cf_pl_dovi, linear) == 48, "cf_pl_dovi.linear");
+
 /* cf_pl_map as src/ffi.rs declares it. */
 _Static_assert(sizeof(cf_pl_map) == 28, "cf_pl_map size");
 _Static_assert(offsetof(cf_pl_map, curve) == 8, "cf_pl_map.curve");
