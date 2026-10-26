@@ -364,8 +364,13 @@ impl Drop for Capture {
 
 impl Device {
     /// Starts capturing from this device's input with format detection on.
-    /// The input starts in 720p50, a mode no source here sends, so the real
-    /// format is always reported once through [`Handler::format_changed`].
+    /// With a signal the card reports a mode for, the input opens in that
+    /// mode, and its format is reported through [`Handler::format_changed`]
+    /// before this returns. Otherwise (no signal, or a card whose status
+    /// cannot be read or names a mode it cannot open) it opens in 720p50, a
+    /// mode no source here sends, so the format is reported when the signal
+    /// arrives or is first seen: the card reports only what differs from the
+    /// mode it runs in.
     ///
     /// # Errors
     ///
