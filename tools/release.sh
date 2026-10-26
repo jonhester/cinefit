@@ -39,5 +39,7 @@ sed -i "0,/^version = \"$old\"$/s//version = \"$new\"/" Cargo.toml
 cargo update --workspace --offline -q
 git commit -q -am "release $new"
 git tag -a "v$new" -m "cinefit $new"
-git push -q origin main "v$new"
+# Atomic: if main is refused (a merge landed since the fetch), the tag is
+# refused with it, rather than publishing a release from a commit not on main.
+git push --atomic -q origin main "v$new"
 echo "released $old -> $new: the release workflow builds and publishes v$new"
