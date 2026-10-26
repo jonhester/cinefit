@@ -323,8 +323,8 @@ pub struct Menu {
     row: usize,
     in_rows: bool,
     last_key: Instant,
-    /// The rates the display offers at the panel's size, for the rate while
-    /// waiting.
+    /// The rates the display offers at the panel's size that the rate while
+    /// waiting takes.
     rates: Vec<f64>,
     version: String,
 }
@@ -333,7 +333,15 @@ pub struct Menu {
 pub type Change = (&'static str, Value);
 
 impl Menu {
-    pub fn new(rates: Vec<f64>, version: &str) -> Self {
+    /// `rates` are what the display offers at the panel's size. Those
+    /// `output.wait_hz` refuses (a display that lists 100 or 120 Hz there)
+    /// are left out: choosing one did nothing but log "refused" (#292).
+    pub fn new(mut rates: Vec<f64>, version: &str) -> Self {
+        if let Some(config::Kind::Float { min, max }) =
+            config::find("output.wait_hz").map(|s| &s.kind)
+        {
+            rates.retain(|hz| (*min..=*max).contains(hz));
+        }
         Self {
             open: false,
             page: 0,
@@ -427,6 +435,25 @@ mod tests {
 
     fn menu() -> Menu {
         Menu::new(RATES.to_vec(), "0.1.0")
+    }
+
+    #[test]
+    fn only_rates_the_setting_takes_are_offered() {
+        let m = Menu::new(
+            vec![23.976, 24.0, 50.0, 59.94, 100.0, 119.88, 120.0],
+            "0.1.0",
+        );
+        assert_eq!(m.rates, [23.976, 24.0, 50.0, 59.94]);
+        let c = Config::default();
+        for hz in m.rates {
+            assert!(
+                config::find("output.wait_hz")
+                    .unwrap()
+                    .put(&mut c.clone(), &Value::Float(hz))
+                    .is_ok(),
+                "{hz}"
+            );
+        }
     }
 
     /// Presses keys, applying each change to `c` as `play` does.
