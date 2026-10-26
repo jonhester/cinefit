@@ -277,6 +277,7 @@ unsafe extern "C" {
         dst_primaries: c_int,
         dst_trc: c_int,
         place: *const f32,
+        map: *const Map,
         src_crop: *const f32,
     ) -> c_int;
     pub fn cf_pl_target_rgba16(pl: *mut Handle, w: c_int, h: c_int) -> *mut Tex;

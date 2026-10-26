@@ -263,12 +263,12 @@ int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *rgb, uint16_t *out);
 #define CF_PL_LEVELS_LIMITED 1
 
 /* Renders the RGB over the whole of dst: the given range, primaries and
- * transfer, into full-range RGB with dst_primaries and dst_trc. Uses the bit
- * depth of the last unpack. No dithering; waits for the GPU. Returns 0, or
- * -1, logged. */
+ * transfer, into full-range RGB with dst_primaries and dst_trc, tone-mapped
+ * by `map` as cf_pl_render_ycbcr is. Uses the bit depth of the last unpack.
+ * No dithering; waits for the GPU. Returns 0, or -1, logged. */
 int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int primaries, int trc,
                      cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
-                     const float *src_crop);
+                     const cf_pl_map *map, const float *src_crop);
 
 /* A w x h RGBA 16-bit texture to render into and read back, for checks. Null
  * on failure, logged. */

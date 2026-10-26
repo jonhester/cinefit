@@ -265,15 +265,10 @@ impl Handler for Feed {
     }
 }
 
-fn ycbcr_color(info: &FrameInfo) -> YcbcrColor {
-    let bt2020 = info.color.colorspace == Some(Colorspace::Rec2020);
-    YcbcrColor {
-        matrix: if bt2020 {
-            Matrix::Bt2020Nc
-        } else {
-            Matrix::Bt709
-        },
-        primaries: if bt2020 {
+/// The colour the card reports for a frame, YCbCr or RGB alike.
+fn rgb_color(info: &FrameInfo) -> RgbColor {
+    RgbColor {
+        primaries: if info.color.colorspace == Some(Colorspace::Rec2020) {
             Primaries::Bt2020
         } else {
             Primaries::Bt709
@@ -283,6 +278,18 @@ fn ycbcr_color(info: &FrameInfo) -> YcbcrColor {
             Some(Eotf::Hlg) => Transfer::Hlg,
             _ => Transfer::Bt1886,
         },
+    }
+}
+
+fn ycbcr_color(info: &FrameInfo) -> YcbcrColor {
+    let c = rgb_color(info);
+    YcbcrColor {
+        matrix: match c.primaries {
+            Primaries::Bt2020 => Matrix::Bt2020Nc,
+            Primaries::Bt709 => Matrix::Bt709,
+        },
+        primaries: c.primaries,
+        transfer: c.transfer,
     }
 }
 
@@ -354,10 +361,11 @@ fn tunnel_frame(decoded: Result<cinefit_dovi::Tunnel, cinefit_dovi::Error>) -> T
     })
 }
 
-/// The kind of an `r210` frame, updating the last good tunnel conversion.
-fn rgb10_kind(t: TunnelFrame, last_tunnel: &mut Option<Tunnel>) -> Kind {
+/// The kind of an `r210` frame in `color`, updating the last good tunnel
+/// conversion.
+fn rgb10_kind(t: TunnelFrame, color: RgbColor, last_tunnel: &mut Option<Tunnel>) -> Kind {
     match t {
-        TunnelFrame::Absent => Kind::Rgb(rgb::Format::R210),
+        TunnelFrame::Absent => Kind::Rgb(rgb::Format::R210, color),
         TunnelFrame::Held => Kind::Tunnel,
         TunnelFrame::Update(t) => {
             *last_tunnel = Some(t);
@@ -369,9 +377,9 @@ fn rgb10_kind(t: TunnelFrame, last_tunnel: &mut Option<Tunnel>) -> Kind {
 /// The kind of an 8-bit ARGB frame. Only 10-bit tunnels are unpacked: one in
 /// 8-bit RGB would render as coloured noise, so it is a format nothing
 /// renders, black with the slate (#198).
-fn argb8_kind(t: TunnelFrame) -> Kind {
+fn argb8_kind(t: TunnelFrame, color: RgbColor) -> Kind {
     match t {
-        TunnelFrame::Absent => Kind::Rgb(rgb::Format::Argb8),
+        TunnelFrame::Absent => Kind::Rgb(rgb::Format::Argb8, color),
         TunnelFrame::Held | TunnelFrame::Update(_) => Kind::Unsupported(PixelFormat::Argb8),
     }
 }
@@ -382,16 +390,20 @@ fn classify(frame: &Frame, last_tunnel: &mut Option<Tunnel>) -> Key {
     let mut tunnel_shaped = false;
     let kind = match info.pixel_format {
         PixelFormat::V210 => Kind::Ycbcr(ycbcr_color(info)),
-        PixelFormat::Argb8 => argb8_kind(frame.pixels().map_or(TunnelFrame::Absent, |p| {
-            let parity = cinefit_dovi::argb8_parity(p.bytes(), info.width as usize, info.row_bytes);
-            tunnel_frame(cinefit_dovi::decode(parity))
-        })),
+        PixelFormat::Argb8 => argb8_kind(
+            frame.pixels().map_or(TunnelFrame::Absent, |p| {
+                let parity =
+                    cinefit_dovi::argb8_parity(p.bytes(), info.width as usize, info.row_bytes);
+                tunnel_frame(cinefit_dovi::decode(parity))
+            }),
+            rgb_color(info),
+        ),
         PixelFormat::Rgb10 => {
             let t = frame
                 .pixels()
                 .map_or(TunnelFrame::Absent, |p| decode_tunnel(info, p.bytes()));
-            let kind = rgb10_kind(t, last_tunnel);
-            tunnel_shaped = kind == Kind::Rgb(rgb::Format::R210)
+            let kind = rgb10_kind(t, rgb_color(info), last_tunnel);
+            tunnel_shaped = matches!(kind, Kind::Rgb(rgb::Format::R210, _))
                 && frame
                     .pixels()
                     .is_some_and(|p| could_be_tunnel(p.bytes(), info));
@@ -421,7 +433,7 @@ fn could_be_tunnel(bytes: &[u8], info: &FrameInfo) -> bool {
 /// How many frames in a row an input must hold before it is believed.
 fn frames_to_trust(key: Key) -> usize {
     match key.kind {
-        Kind::Rgb(rgb::Format::R210) if key.tunnel_shaped => TUNNEL_GRACE,
+        Kind::Rgb(rgb::Format::R210, _) if key.tunnel_shaped => TUNNEL_GRACE,
         _ => STABLE_FRAMES,
     }
 }
@@ -463,7 +475,10 @@ enum Prepared<'a, 'p> {
         color: YcbcrColor,
         lldv: bool,
     },
-    Rgb(&'a GpuRgb<'p>),
+    Rgb {
+        rgb: &'a GpuRgb<'p>,
+        color: RgbColor,
+    },
     Tunnel {
         planes: &'a GpuPlanes<'p>,
         tunnel: &'a Tunnel,
@@ -1706,10 +1721,10 @@ fn upload<'a, 'p>(
                 lldv,
             }
         }
-        Kind::Rgb(format) => {
+        Kind::Rgb(format, color) => {
             let rgb = sized(&mut sources.rgb, w, h, || pl.rgb(w, h))?;
             pl.unpack_rgb(rgb, bytes, info.row_bytes, format)?;
-            Prepared::Rgb(rgb)
+            Prepared::Rgb { rgb, color }
         }
         Kind::Unsupported(_) => return Ok(None),
     };
@@ -1744,6 +1759,45 @@ fn hdr10_source(hdr: Option<&HdrMetadata>) -> [u16; 2] {
     [code(bottom), code(top)]
 }
 
+/// An HDR source's peak for tone mapping: the `tonemap.source_peak` override
+/// or the HDR10 metadata for PQ. None for HLG, which has no metadata to
+/// read: [`tone_map`] takes its nominal display's.
+fn source_peak(transfer: Transfer, hdr: Option<&HdrMetadata>, dst: &Target<'_, '_>) -> Option<f32> {
+    (transfer == Transfer::Pq)
+        .then(|| dst.source_peak.or_else(|| pq_peak(hdr)))
+        .flatten()
+}
+
+/// The tone mapping for a source in `transfer` into the target: PQ and HLG
+/// into SDR are mapped, YCbCr or RGB alike (#196); anything else only
+/// changes space. `peak` is the source's, `white` what SDR white stands for,
+/// and `lldv` low-latency Dolby Vision, which passes one to one.
+fn tone_map(
+    transfer: Transfer,
+    peak: Option<f32>,
+    white: f32,
+    lldv: bool,
+    dst: &Target<'_, '_>,
+) -> Option<Mapping> {
+    let hdr = matches!(transfer, Transfer::Pq | Transfer::Hlg);
+    (hdr && dst.color.transfer == Transfer::Bt1886).then(|| Mapping {
+        // An HDR10 disc without MaxCLL or mastering: 1000 nits, the common
+        // grade. HLG's nominal display is 1000 nits too (BT.2100), as
+        // libplacebo assumes without metadata.
+        src_peak: peak.unwrap_or(1000.0),
+        dst_peak: white,
+        curve: dst.curve,
+        // Never low-latency Dolby Vision: the player has mapped it already
+        // and it passes one to one, which a measured peak below white_nits
+        // would turn into a mapping.
+        peak_detect: dst.peak_detect && !lldv,
+        // Likewise: one to one adds nothing back.
+        contrast_recovery: if lldv { 0.0 } else { dst.contrast_recovery },
+        peak_percentile: dst.peak_percentile,
+        knee_offset: if lldv { 0.0 } else { dst.knee_offset },
+    })
+}
+
 /// The final render after Dolby's mapping: one to one at the mapped peak, as
 /// the player's low-latency rendering is.
 fn one_to_one(dst: &Target<'_, '_>) -> Mapping {
@@ -1767,7 +1821,6 @@ fn one_to_one(dst: &Target<'_, '_>) -> Mapping {
 #[allow(clippy::too_many_arguments)]
 fn draw(
     pl: &Placebo,
-    info: &FrameInfo,
     hdr: Option<&HdrMetadata>,
     frame: Prepared<'_, '_>,
     hdr10_scene: Option<cinefit_render::dm::Scene>,
@@ -1799,11 +1852,7 @@ fn draw(
                 ),
                 false => (
                     color,
-                    dst.source_peak.or_else(|| {
-                        (color.transfer == Transfer::Pq)
-                            .then(|| pq_peak(hdr))
-                            .flatten()
-                    }),
+                    source_peak(color.transfer, hdr, dst),
                     dst.mapped_nits,
                 ),
             };
@@ -1818,25 +1867,7 @@ fn draw(
                 stages.render.push(ms(t));
                 return Ok(new_table);
             }
-            // HDR into SDR is tone-mapped; anything else only changes space.
-            let map =
-                (color.transfer == Transfer::Pq && out.transfer == Transfer::Bt1886).then(|| {
-                    Mapping {
-                        // An HDR10 disc without MaxCLL or mastering: 1000 nits,
-                        // the common grade.
-                        src_peak: peak.unwrap_or(1000.0),
-                        dst_peak: white,
-                        curve: dst.curve,
-                        // Never low-latency Dolby Vision: the player has mapped
-                        // it already and it passes one to one, which a measured
-                        // peak below white_nits would turn into a mapping.
-                        peak_detect: dst.peak_detect && !lldv,
-                        // Likewise: one to one adds nothing back.
-                        contrast_recovery: if lldv { 0.0 } else { dst.contrast_recovery },
-                        peak_percentile: dst.peak_percentile,
-                        knee_offset: if lldv { 0.0 } else { dst.knee_offset },
-                    }
-                });
+            let map = tone_map(color.transfer, peak, white, lldv, dst);
             pl.render_ycbcr_mapped(p, color, dst.tex, out, view, map.as_ref())?;
         }
         Prepared::Tunnel { planes: p, tunnel } => {
@@ -1863,14 +1894,16 @@ fn draw(
                 pl.render_dovi_mapped(p, &tunnel.color, dst.tex, out, view, map.as_ref())?;
             }
         }
-        Prepared::Rgb(r) => {
+        Prepared::Rgb { rgb: r, color } => {
+            let peak = source_peak(color.transfer, hdr, dst);
+            let map = tone_map(color.transfer, peak, dst.mapped_nits, false, dst);
             // The card does not report RGB's range: the setting says (#23).
             let color = RgbSourceColor {
                 levels: dst.rgb_range,
-                primaries: ycbcr_color(info).primaries,
-                transfer: ycbcr_color(info).transfer,
+                primaries: color.primaries,
+                transfer: color.transfer,
             };
-            pl.render_rgb_view(r, color, dst.tex, out, view)?;
+            pl.render_rgb_mapped(r, color, dst.tex, out, view, map.as_ref())?;
         }
     }
     stages.render.push(ms(t));
@@ -2331,7 +2364,6 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     });
                     draw(
                         &pl,
-                        &first_info,
                         start_hdr.as_ref(),
                         prepared,
                         scene,
@@ -3217,7 +3249,6 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         if let Some(prepared) = prepared {
                             let new_table = draw(
                                 &pl,
-                                &frame_info,
                                 hdr_meta.as_ref(),
                                 prepared,
                                 hdr10_scene,
@@ -3768,14 +3799,14 @@ mod tests {
     fn a_tunnel_in_8_bit_rgb_is_not_shown_as_rgb() {
         use super::{argb8_kind, tunnel_frame};
         use cinefit_dovi::Error;
-        let plain = argb8_kind(tunnel_frame(Err(Error::NoPacket { packet: 0 })));
-        assert_eq!(plain, Kind::Rgb(rgb::Format::Argb8));
+        let plain = argb8_kind(tunnel_frame(Err(Error::NoPacket { packet: 0 })), SDR_BT2020);
+        assert_eq!(plain, Kind::Rgb(rgb::Format::Argb8, SDR_BT2020));
         for t in [
             Err(Error::NoPacket { packet: 1 }),
             Ok(dovi_tunnel(UB820, Some(3079))),
         ] {
             assert_eq!(
-                argb8_kind(tunnel_frame(t)),
+                argb8_kind(tunnel_frame(t), SDR_BT2020),
                 Kind::Unsupported(PixelFormat::Argb8)
             );
         }
@@ -3788,7 +3819,7 @@ mod tests {
     fn a_tunnel_frame_without_metadata_keeps_the_last_conversion() {
         use super::{Kind, rgb10_kind, tunnel_frame};
         use cinefit_dovi::Error;
-        let rgb = Kind::Rgb(cinefit_render::rgb::Format::R210);
+        let rgb = Kind::Rgb(cinefit_render::rgb::Format::R210, SDR_BT2020);
         let mut last = None;
         for (t, kind, max) in [
             (Ok(dovi_tunnel(UB820, Some(3079))), Kind::Tunnel, 3079),
@@ -3796,7 +3827,7 @@ mod tests {
             (Ok(dovi_tunnel(UB820, Some(3465))), Kind::Tunnel, 3465),
             (Err(Error::NoPacket { packet: 0 }), rgb, 3465),
         ] {
-            assert_eq!(rgb10_kind(tunnel_frame(t), &mut last), kind);
+            assert_eq!(rgb10_kind(tunnel_frame(t), SDR_BT2020, &mut last), kind);
             assert_eq!(last.as_ref().and_then(|t| t.scene_max_pq), Some(max));
         }
     }
@@ -3991,7 +4022,7 @@ mod tests {
         stages.detected(Some(9.0), Kind::Tunnel);
         stages.detected(Some(6.0), v210);
         stages.detected(None, Kind::Tunnel);
-        stages.detected(Some(1.0), Kind::Rgb(rgb::Format::R210));
+        stages.detected(Some(1.0), Kind::Rgb(rgb::Format::R210, SDR_BT2020));
         assert_eq!(stages.detect_tunnel.last(), Some(9.0));
         assert_eq!(stages.detect_v210.last(), Some(6.0));
         assert_eq!(
@@ -4051,8 +4082,8 @@ mod tests {
             primaries: Primaries::Bt2020,
             transfer,
         };
-        let hdr10 = Content::Hdr10(ycbcr(Transfer::Pq));
-        let menu = Content::Sdr(ycbcr(Transfer::Bt1886));
+        let hdr10 = Content::Hdr10(Picture::Ycbcr(ycbcr(Transfer::Pq)));
+        let menu = Content::Sdr(Picture::Ycbcr(ycbcr(Transfer::Bt1886)));
         let mut kept = None;
         let peak =
             |content, frame, kept: &mut _| pq_peak(carried_hdr(content, frame, kept).as_ref());
@@ -4179,10 +4210,8 @@ mod tests {
             ..info
         };
         let mut changes = Vec::new();
-        for (i, kind) in [Kind::Rgb(rgb::Format::R210), Kind::Rgb(rgb::Format::R210)]
-            .into_iter()
-            .enumerate()
-        {
+        let rgb = Kind::Rgb(rgb::Format::R210, SDR_BT2020);
+        for (i, kind) in [rgb, rgb].into_iter().enumerate() {
             let found = finder.find(&rgb_info, None, kind, 1.0 + i as f64 / 24.0, 2);
             assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
             assert!(found.ms.is_none());
@@ -4200,6 +4229,58 @@ mod tests {
         });
         let found = finder.find(&info, Some(&full), sdr, 2.0, 3);
         assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
+    }
+
+    /// RGB carries the colour the card reports, as YCbCr does (#196): a
+    /// change between RGB SDR and RGB HDR10 or HLG is a new key, and each is
+    /// the content its colour says.
+    #[test]
+    fn rgb_keys_carry_their_colour() {
+        let info = |eotf| FrameInfo {
+            pixel_format: PixelFormat::Rgb10,
+            color: cinefit_decklink::ColorInfo {
+                colorspace: Some(Colorspace::Rec2020),
+                eotf,
+                hdr: None,
+            },
+            ..v210(2, 2, |_, _| 64).0
+        };
+        let kind = |eotf| rgb10_kind(TunnelFrame::Absent, rgb_color(&info(eotf)), &mut None);
+        let key = |kind| Key {
+            width: 3840,
+            height: 2160,
+            kind,
+            tunnel_shaped: false,
+        };
+        let (sdr, pq, hlg) = (
+            kind(Some(Eotf::Sdr)),
+            kind(Some(Eotf::Pq)),
+            kind(Some(Eotf::Hlg)),
+        );
+        assert_ne!(key(sdr), key(pq));
+        assert_ne!(key(pq), key(hlg));
+        let bt2020 = |transfer| RgbColor {
+            primaries: Primaries::Bt2020,
+            transfer,
+        };
+        assert_eq!(
+            Content::of(pq, false),
+            Content::Hdr10(Picture::Rgb(rgb::Format::R210, bt2020(Transfer::Pq)))
+        );
+        assert_eq!(
+            Content::of(hlg, false),
+            Content::Hlg(Picture::Rgb(rgb::Format::R210, bt2020(Transfer::Hlg)))
+        );
+        assert_eq!(
+            Content::of(sdr, false),
+            Content::Sdr(Picture::Rgb(rgb::Format::R210, bt2020(Transfer::Bt1886)))
+        );
+        // YCbCr's colour is read as before: the matrix follows the primaries.
+        let v = ycbcr_color(&info(None));
+        assert_eq!(
+            (v.matrix, v.primaries, v.transfer),
+            (Matrix::Bt2020Nc, Primaries::Bt2020, Transfer::Bt1886)
+        );
     }
 
     /// RGB that could be a tunnel waits the long grace for one to decode;
@@ -4237,7 +4318,7 @@ mod tests {
         let key = |tunnel_shaped| Key {
             width: w,
             height: h,
-            kind: Kind::Rgb(rgb::Format::R210),
+            kind: Kind::Rgb(rgb::Format::R210, SDR_BT2020),
             tunnel_shaped,
         };
         assert_eq!(frames_to_trust(key(true)), TUNNEL_GRACE);

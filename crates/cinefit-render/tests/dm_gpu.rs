@@ -1,9 +1,10 @@
 //! Dolby's display mapping on the GPU against `dm::Frame::apply`, the
 //! reference it was ported from, on a spread of BT.2020 PQ pixels and the
 //! scenes that matter: 1000- and 4000-nit grades, with and without trims, at
-//! 96 and 76 nits. Needs a Vulkan device; skipped, with a note, without one,
-//! unless `CINEFIT_REQUIRE_GPU` is set, as on a machine that has one: there a
-//! device that fails to start fails the test (#209).
+//! 96 and 76 nits. Also libplacebo's tone mapping, from RGB as from YCbCr.
+//! Needs a Vulkan device; skipped, with a note, without one, unless
+//! `CINEFIT_REQUIRE_GPU` is set, as on a machine that has one: there a device
+//! that fails to start fails the test (#209).
 //!
 //!     cargo test -p cinefit-render --test dm_gpu -- --nocapture
 
@@ -254,4 +255,109 @@ fn hdr10_through_the_mapping_is_the_conversion_then_the_mapping() {
         "the mapping barely moved the frame: {moved}"
     );
     assert!(worst <= 4, "16-bit codes apart: {worst}");
+}
+
+/// RGB and YCbCr in the same colour are tone-mapped alike (#196): a grey
+/// ramp, which either packing carries exactly, rendered from limited-range
+/// `r210` and from `v210` into SDR through the same mapping, in PQ and HLG.
+/// The mapping is the one asked for: without it, libplacebo's defaults land
+/// far from it.
+#[test]
+fn rgb_is_tone_mapped_as_ycbcr_is() {
+    use cinefit_render::{
+        Curve, Levels, Mapping, Matrix, Primaries, RgbColor, RgbSourceColor, Transfer, View,
+        YcbcrColor, rgb, v210,
+    };
+    let _one = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(pl) = placebo() else { return };
+    let (w, h) = (192, 16);
+    let luma: Vec<u16> = (0..w * h).map(|i| (64 + i % w * 876 / w) as u16).collect();
+    let grey = v210::Planes {
+        width: w,
+        height: h,
+        chroma: vec![512; w.div_ceil(2) * 2 * h],
+        luma: luma.clone(),
+    };
+    let v210_row = v210::min_row_bytes(w);
+    let v210_bytes = v210::pack(&grey, v210_row).expect("v210");
+    let rgb_bytes = rgb::pack(
+        &rgb::Rgb {
+            width: w,
+            height: h,
+            format: rgb::Format::R210,
+            rgb: luma.iter().flat_map(|&l| [l; 3]).collect(),
+        },
+        w * 4,
+    )
+    .expect("r210");
+    let mut planes = pl.planes(w, h).expect("planes");
+    pl.unpack_v210(&mut planes, &v210_bytes, v210_row)
+        .expect("unpack");
+    let mut src = pl.rgb(w, h).expect("rgb");
+    pl.unpack_rgb(&mut src, &rgb_bytes, w * 4, rgb::Format::R210)
+        .expect("unpack");
+    let sdr = RgbColor {
+        primaries: Primaries::Bt2020,
+        transfer: Transfer::Bt1886,
+    };
+    let map = Mapping {
+        src_peak: 1000.0,
+        dst_peak: 96.0,
+        curve: Curve::Bt2390,
+        peak_detect: false,
+        contrast_recovery: 0.0,
+        peak_percentile: 0.0,
+        knee_offset: 0.0,
+    };
+    for transfer in [Transfer::Pq, Transfer::Hlg] {
+        let target = pl.target_rgba16(w, h).expect("target");
+        let ycbcr = YcbcrColor {
+            matrix: Matrix::Bt2020Nc,
+            primaries: Primaries::Bt2020,
+            transfer,
+        };
+        pl.render_ycbcr_mapped(
+            &planes,
+            ycbcr,
+            target.texture(),
+            sdr,
+            View::default(),
+            Some(&map),
+        )
+        .expect("render");
+        let want = target.download().expect("download");
+        let color = RgbSourceColor {
+            levels: Levels::Limited,
+            primaries: Primaries::Bt2020,
+            transfer,
+        };
+        let rgb_render = |map: Option<&Mapping>| {
+            pl.render_rgb_mapped(&src, color, target.texture(), sdr, View::default(), map)
+                .expect("render");
+            target.download().expect("download")
+        };
+        let got = rgb_render(Some(&map));
+        let default = rgb_render(None);
+        let worst = got
+            .chunks(4)
+            .zip(want.chunks(4))
+            .flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c])))
+            .max()
+            .unwrap();
+        let moved = got
+            .chunks(4)
+            .zip(default.chunks(4))
+            .filter(|(a, b)| a[1].abs_diff(b[1]) > 1000)
+            .count();
+        eprintln!("{transfer:?}: worst {worst}, {moved} of {} moved", w * h);
+        // HLG's highlights reach 10 apart (PQ 2) in single channels of the
+        // brightest greys, either way: under a sixth of a 10-bit step.
+        assert!(worst <= 16, "{transfer:?}: 16-bit codes apart: {worst}");
+        assert!(
+            moved > w * h / 4,
+            "{transfer:?}: the mapping barely differs from the defaults: {moved}"
+        );
+    }
 }

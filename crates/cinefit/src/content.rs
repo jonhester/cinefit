@@ -14,7 +14,9 @@ use crate::osd::{BannerText, Encoding, InfoSection};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Kind {
     Ycbcr(YcbcrColor),
-    Rgb(rgb::Format),
+    /// RGB in one of the card's formats, with the colour the card reports
+    /// for it: its range is the `input.rgb_range` setting's.
+    Rgb(rgb::Format, RgbColor),
     Tunnel,
     /// A capture format nothing renders. `Argb8` here is 8-bit RGB carrying
     /// a Dolby Vision tunnel (#198): plain 8-bit RGB is [`Kind::Rgb`].
@@ -42,11 +44,11 @@ pub(crate) struct Key {
 /// low-latency Dolby Vision was decided separately in five places (#99).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Content {
-    /// YCbCr in SDR, BT.709 or BT.2020.
-    Sdr(YcbcrColor),
-    /// YCbCr in PQ: HDR10.
-    Hdr10(YcbcrColor),
-    Hlg(YcbcrColor),
+    /// SDR, BT.709 or BT.2020.
+    Sdr(Picture),
+    /// PQ: HDR10.
+    Hdr10(Picture),
+    Hlg(Picture),
     /// A player's low-latency Dolby Vision: YCbCr labelled SDR BT.2020 whose
     /// pixels are PQ, already mapped by the player (`input.lldv`). The
     /// chain gives no Dolby Vision flag or metadata (#94), so the setting
@@ -54,36 +56,77 @@ pub(crate) enum Content {
     Lldv(YcbcrColor),
     /// The Dolby Vision tunnel, decoded by cinefit.
     Tunnel,
-    Rgb(rgb::Format),
     /// A capture format nothing renders.
     Unsupported(PixelFormat),
+}
+
+/// A picture's pixels as captured: how they are packed, and their colour.
+/// RGB and YCbCr in the same colour are the same content (#196): RGB HDR10
+/// is signalled and tone-mapped as YCbCr HDR10 is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Picture {
+    Ycbcr(YcbcrColor),
+    Rgb(rgb::Format, RgbColor),
+}
+
+impl Picture {
+    pub(crate) fn primaries(self) -> Primaries {
+        match self {
+            Self::Ycbcr(c) => c.primaries,
+            Self::Rgb(_, c) => c.primaries,
+        }
+    }
+
+    pub(crate) fn transfer(self) -> Transfer {
+        match self {
+            Self::Ycbcr(c) => c.transfer,
+            Self::Rgb(_, c) => c.transfer,
+        }
+    }
 }
 
 impl Content {
     /// What a frame of `kind` is, with the `input.lldv` setting.
     pub(crate) fn of(kind: Kind, lldv: bool) -> Self {
-        match kind {
-            Kind::Ycbcr(c) if c.transfer == Transfer::Pq => Self::Hdr10(c),
-            Kind::Ycbcr(c) if c.transfer == Transfer::Hlg => Self::Hlg(c),
-            Kind::Ycbcr(c) if lldv && c.primaries == Primaries::Bt2020 => Self::Lldv(c),
-            Kind::Ycbcr(c) => Self::Sdr(c),
-            Kind::Rgb(f) => Self::Rgb(f),
-            Kind::Tunnel => Self::Tunnel,
-            Kind::Unsupported(f) => Self::Unsupported(f),
+        let picture = match kind {
+            Kind::Ycbcr(c) => Picture::Ycbcr(c),
+            Kind::Rgb(f, c) => Picture::Rgb(f, c),
+            Kind::Tunnel => return Self::Tunnel,
+            Kind::Unsupported(f) => return Self::Unsupported(f),
+        };
+        match (picture, picture.transfer()) {
+            (_, Transfer::Pq) => Self::Hdr10(picture),
+            (_, Transfer::Hlg) => Self::Hlg(picture),
+            // A player sends low-latency Dolby Vision as YCbCr, and only
+            // YCbCr is rendered as it.
+            (Picture::Ycbcr(c), _) if lldv && c.primaries == Primaries::Bt2020 => Self::Lldv(c),
+            _ => Self::Sdr(picture),
         }
     }
 
     /// A short name for the dataset's records (#91).
     pub(crate) fn tag(self) -> &'static str {
         match self {
+            // RGB of any transfer, as before #196: no detector reading or
+            // thumbnail comes with it.
+            _ if self.is_rgb() => "rgb",
             Self::Sdr(_) => "sdr",
             Self::Hdr10(_) => "hdr10",
             Self::Hlg(_) => "hlg",
             Self::Lldv(_) => "lldv",
             Self::Tunnel => "tunnel",
-            Self::Rgb(_) => "rgb",
             Self::Unsupported(_) => "unsupported",
         }
+    }
+
+    /// RGB, in any colour.
+    pub(crate) fn is_rgb(self) -> bool {
+        matches!(
+            self,
+            Self::Sdr(Picture::Rgb(..))
+                | Self::Hdr10(Picture::Rgb(..))
+                | Self::Hlg(Picture::Rgb(..))
+        )
     }
 
     /// Low-latency Dolby Vision or the tunnel.
@@ -349,9 +392,8 @@ pub(crate) fn input_section(
         Content::Lldv(_) => "Dolby Vision \u{b7} low latency".into(),
         Content::Hdr10(_) => "HDR10".into(),
         Content::Hlg(_) => "HLG".into(),
-        Content::Sdr(c) if c.primaries == Primaries::Bt2020 => "SDR BT.2020".into(),
+        Content::Sdr(p) if p.primaries() == Primaries::Bt2020 => "SDR BT.2020".into(),
         Content::Sdr(_) => "SDR".into(),
-        Content::Rgb(_) => "RGB".into(),
         Content::Unsupported(f) => format!("{}: nothing renders it", unsupported(f)),
     };
     let mut detail = format!("{width} \u{d7} {height}");
@@ -400,7 +442,7 @@ pub(crate) fn output_section(
                 "tone-mapped by cinefit"
             }
         }
-        Some(Content::Sdr(c)) if c.primaries == Primaries::Bt709 => "BT.709 placed in BT.2020",
+        Some(Content::Sdr(p)) if p.primaries() == Primaries::Bt709 => "BT.709 placed in BT.2020",
         Some(Content::Unsupported(_)) => "black: nothing renders the input",
         Some(_) => "unchanged",
     };
@@ -458,7 +500,8 @@ pub(crate) fn banner_for(
     out_width: u32,
     config: &Config,
 ) -> Option<BannerText> {
-    let what = format!("{} {}", size_name(key.0, key.1), rate_name(rate_mhz));
+    let rgb = if content.is_rgb() { " \u{b7} RGB" } else { "" };
+    let what = format!("{} {}{rgb}", size_name(key.0, key.1), rate_name(rate_mhz));
     let scaled = if key.0 < out_width.min(3840) {
         " \u{b7} scaled to 4K"
     } else {
@@ -484,14 +527,14 @@ pub(crate) fn banner_for(
             },
             if passthrough {
                 format!("{what} \u{b7} to the projector")
-            } else if cinefit_hdr && matches!(content, Content::Hdr10(_)) {
+            // Measured from YCbCr only: RGB HDR10 is tone-mapped.
+            } else if cinefit_hdr && matches!(content, Content::Hdr10(Picture::Ycbcr(_))) {
                 format!("{what} \u{b7} cinefit HDR, mapped scene by scene")
             } else {
                 format!("{what} \u{b7} tone-mapped by cinefit")
             },
         ),
         Content::Sdr(_) => ("SDR", format!("{what}{scaled}")),
-        Content::Rgb(_) => ("SDR", format!("{what} \u{b7} RGB{scaled}")),
     };
     Some(BannerText {
         title: title.into(),
@@ -512,7 +555,7 @@ pub(crate) fn rate_mhz(f: &InputFormat) -> u32 {
 pub(crate) fn unread_by_detector(kind: Kind) -> Option<&'static str> {
     match kind {
         Kind::Ycbcr(_) | Kind::Tunnel => None,
-        Kind::Rgb(_) => Some("the detector does not read RGB"),
+        Kind::Rgb(..) => Some("the detector does not read RGB"),
         Kind::Unsupported(_) => Some("nothing reads this format"),
     }
 }
@@ -557,7 +600,10 @@ pub(crate) fn peak_words(content: Content, code: u16, lldv: Option<u16>) -> Stri
 pub(crate) fn describe(kind: Kind) -> String {
     match kind {
         Kind::Ycbcr(c) => format!("YCbCr {:?} {:?} {:?}", c.matrix, c.primaries, c.transfer),
-        Kind::Rgb(f) => format!("RGB {f:?}, range from input.rgb_range"),
+        Kind::Rgb(f, c) => format!(
+            "RGB {f:?} {:?} {:?}, range from input.rgb_range",
+            c.primaries, c.transfer
+        ),
         Kind::Tunnel => "Dolby Vision tunnel".into(),
         Kind::Unsupported(f) => format!("{}, unsupported", unsupported(f)),
     }
@@ -582,11 +628,99 @@ mod tests {
     }
 
     fn bt709() -> Content {
-        Content::Sdr(YcbcrColor {
+        Content::Sdr(Picture::Ycbcr(YcbcrColor {
             matrix: Matrix::Bt709,
             primaries: Primaries::Bt709,
             transfer: Transfer::Bt1886,
-        })
+        }))
+    }
+
+    /// BT.2020 `r210` with `transfer`.
+    fn rgb(transfer: Transfer) -> Kind {
+        Kind::Rgb(
+            rgb::Format::R210,
+            RgbColor {
+                primaries: Primaries::Bt2020,
+                transfer,
+            },
+        )
+    }
+
+    /// RGB is the content its colour says, as YCbCr is (#196): RGB HDR10 and
+    /// HLG are signalled and banner-named as YCbCr's are, never low-latency
+    /// Dolby Vision, and still tagged RGB for the dataset.
+    #[test]
+    fn rgb_is_what_its_colour_says() {
+        let of = |t| Content::of(rgb(t), true);
+        assert!(matches!(of(Transfer::Pq), Content::Hdr10(Picture::Rgb(..))));
+        assert!(matches!(of(Transfer::Hlg), Content::Hlg(Picture::Rgb(..))));
+        // Labelled SDR BT.2020 with input.lldv on: plain SDR in RGB.
+        assert!(matches!(
+            of(Transfer::Bt1886),
+            Content::Sdr(Picture::Rgb(..))
+        ));
+        assert!(of(Transfer::Pq).is_rgb() && !content(Transfer::Pq).is_rgb());
+        assert_eq!(of(Transfer::Pq).tag(), "rgb");
+        assert_eq!(content(Transfer::Pq).tag(), "hdr10");
+
+        // Signalled as YCbCr in the same colour is.
+        for t in [Transfer::Pq, Transfer::Hlg, Transfer::Bt1886] {
+            assert_eq!(
+                output_in(OutputMode::Passthrough, of(t), None, None),
+                output_in(OutputMode::Passthrough, content(t), None, None),
+                "{t:?}"
+            );
+        }
+        let (h, out) = output_in(OutputMode::Passthrough, of(Transfer::Pq), None, None);
+        assert_eq!(h.map(|h| h.eotf), Some(cinefit_kms::Eotf::Pq));
+        assert_eq!(out.transfer, Transfer::Pq);
+        // An RGB HDR10 title's metadata is carried as YCbCr's is.
+        let meta = HdrMetadata {
+            red: None,
+            green: None,
+            blue: None,
+            white: None,
+            max_mastering: None,
+            min_mastering: None,
+            max_cll: Some(1200.0),
+            max_fall: None,
+        };
+        let mut kept = None;
+        carried_hdr(of(Transfer::Pq), Some(meta), &mut kept);
+        assert_eq!(
+            carried_hdr(of(Transfer::Pq), None, &mut kept).and_then(|h| h.max_cll),
+            Some(1200.0)
+        );
+
+        let b = |content, mode| {
+            let c = Config {
+                mode,
+                ..Config::default()
+            };
+            banner_for(content, (3840, 2160), 23976, 4096, &c)
+                .map(|b| format!("{} / {}", b.title, b.detail))
+        };
+        assert_eq!(
+            b(of(Transfer::Pq), OutputMode::Passthrough).as_deref(),
+            Some("HDR10 / 4K 23.976 \u{b7} RGB \u{b7} to the projector")
+        );
+        // No L1 is measured from RGB: tone-mapped, not mapped scene by scene.
+        assert_eq!(
+            b(of(Transfer::Pq), OutputMode::CinefitHdr).as_deref(),
+            Some("HDR10 / 4K 23.976 \u{b7} RGB \u{b7} tone-mapped by cinefit")
+        );
+        assert_eq!(
+            b(of(Transfer::Hlg), OutputMode::Sdr2020).as_deref(),
+            Some("HLG / 4K 23.976 \u{b7} RGB \u{b7} tone-mapped by cinefit")
+        );
+        assert_eq!(
+            b(of(Transfer::Bt1886), OutputMode::Passthrough).as_deref(),
+            Some("SDR / 4K 23.976 \u{b7} RGB")
+        );
+        assert_eq!(
+            input_section(Some((of(Transfer::Hlg), 3840, 2160)), None, None, None).line,
+            "HLG"
+        );
     }
 
     #[test]
@@ -977,9 +1111,9 @@ mod tests {
             (out.primaries, out.transfer),
             (Primaries::Bt709, Transfer::Bt1886)
         );
-        // Plain RGB is signalled as SDR for now.
+        // RGB in SDR is signalled as SDR.
         assert!(
-            output_for(Content::Rgb(rgb::Format::R210), None, None)
+            output_for(Content::of(rgb(Transfer::Bt1886), false), None, None)
                 .0
                 .is_none()
         );
