@@ -1904,10 +1904,32 @@ pub fn run(opts: Options) -> Result<(), Box<dyn Error>> {
     result
 }
 
+/// Puts a change from the menu or the web page into `next`, the settings
+/// the page shows, and into `running` too unless it applies only at the
+/// next start: the output's buffers, geometry and overlay keep the size they
+/// were made at, so a new panel size in `running` would make the next
+/// modeset ask for a mode they do not fit (#266). Whether `running` took it.
+fn put_change(
+    setting: &config::Setting,
+    value: &config::Value,
+    running: &mut Config,
+    next: &mut Config,
+) -> Result<bool, config::Error> {
+    setting.put(next, value)?;
+    if setting.apply == config::Apply::Start {
+        return Ok(false);
+    }
+    setting.put(running, value)?;
+    Ok(true)
+}
+
 fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // The settings as they are now: the menu changes them mid-run, and what
     // reads them reads this, each time.
     let mut cfg = opts.config.clone();
+    // The same with the changes that apply when cinefit next starts, which
+    // the web page shows next to its "Applies when cinefit next starts".
+    let mut next_cfg = cfg.clone();
     let (file_path, mut file_cfg) = opts.file.clone();
     let run_for = match opts.seconds {
         None => None,
@@ -2563,10 +2585,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             }
             for (key, value, from) in changes {
                 let setting = config::find(key).expect("changes name settings");
-                if let Err(e) = setting.put(&mut cfg, &value) {
-                    warn!("{from}: {key} = {value} refused: {e}");
-                    continue;
-                }
+                let applied = match put_change(setting, &value, &mut cfg, &mut next_cfg) {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        warn!("{from}: {key} = {value} refused: {e}");
+                        continue;
+                    }
+                };
                 // Saved over the file as it is, without --set.
                 let _ = setting.put(&mut file_cfg, &value);
                 let saved = match config::save(&file_cfg, &file_path) {
@@ -2578,6 +2603,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     run_started.elapsed().as_secs_f64(),
                     setting.apply
                 );
+                if !applied {
+                    continue;
+                }
                 // What reads it each frame needs nothing; the rest is told
                 // here.
                 match key {
@@ -2730,11 +2758,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             "version": crate::VERSION,
                             "pill": pill,
                             "now": now_rows,
-                            "settings": crate::web::settings_json(&cfg),
+                            "settings": crate::web::settings_json(&next_cfg),
                             "dataset": dataset.state(),
                             "saved": last_saved,
                         }),
-                        &cfg,
+                        &next_cfg,
                     );
                 }
                 ui.set_info(text);
@@ -4368,5 +4396,28 @@ mod tests {
             place,
         );
         assert!(black.contains("0.0% of the picture area"), "{black}");
+    }
+
+    /// A panel size from the web page is saved for the next start and shown
+    /// there, never put under the running output's buffers (#266).
+    #[test]
+    fn a_change_for_the_next_start_leaves_the_running_settings() {
+        let mut running = Config::default();
+        let mut next = running.clone();
+        let width = config::find("output.width").unwrap();
+        let narrower = config::Value::Int(i64::from(running.width) - 256);
+        assert!(!put_change(width, &narrower, &mut running, &mut next).unwrap());
+        assert_eq!(running.width, Config::default().width);
+        assert_eq!(width.get(&next), narrower);
+
+        let crop = config::find("detect.crop").unwrap();
+        let off = config::Value::Name("off".into());
+        assert!(put_change(crop, &off, &mut running, &mut next).unwrap());
+        assert!(!running.crop && !next.crop);
+
+        // Refused, it changes neither.
+        let too_narrow = config::Value::Int(1);
+        assert!(put_change(width, &too_narrow, &mut running, &mut next).is_err());
+        assert_eq!(width.get(&next), narrower);
     }
 }
