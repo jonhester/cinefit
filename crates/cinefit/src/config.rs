@@ -1057,6 +1057,10 @@ mod tests {
             Err(Error::Value { key, value, .. }) if key == "slate.venue" && value == "an array"
         ));
         assert!(matches!(
+            parse("[slate]\nvenue = { name = \"a\" }\n", p()),
+            Err(Error::Value { key, value, .. }) if key == "slate.venue" && value == "a table"
+        ));
+        assert!(matches!(
             parse("[atv]\nhost = 2026-10-26\n", p()),
             Err(Error::Value { key, .. }) if key == "atv.host"
         ));
