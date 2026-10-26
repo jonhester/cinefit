@@ -330,16 +330,43 @@ impl Placebo {
         unsafe { ffi::cf_pl_gpu_timing(self.handle.as_ptr(), c_int::from(on)) != 0 }
     }
 
-    /// Each pass's latest GPU time and how many it has had, in [`PASSES`]
-    /// order: a result belongs to an earlier run of its pass, a frame or two
-    /// back, and a pass that has not run reads 0.
-    pub fn gpu_times(&self) -> GpuTimes {
-        let mut t = ffi::GpuTimes::default();
-        // SAFETY: the handle is live and `t` is the struct the shim fills.
-        unsafe { ffi::cf_pl_get_gpu_times(self.handle.as_ptr(), &mut t) };
-        GpuTimes {
-            ms: t.ms,
-            count: t.count,
+    /// The tag the runs submitted from now on carry, so their GPU results
+    /// can be put down to them: a frame's number, say (#263).
+    pub fn set_gpu_tag(&self, tag: u64) {
+        // SAFETY: the handle is live.
+        unsafe { ffi::cf_pl_gpu_tag(self.handle.as_ptr(), tag) }
+    }
+
+    /// The GPU results new since the last call, oldest first, each given once,
+    /// appended to `out`; and the runs timing could not follow, so far. A
+    /// result comes in a frame or two after its run (#263).
+    pub fn take_gpu_results(&self, out: &mut Vec<GpuResult>) -> GpuLosses {
+        let mut buf = [ffi::GpuSample::default(); 64];
+        let mut losses = ffi::GpuLosses::default();
+        loop {
+            // SAFETY: the handle is live; `buf` holds `buf.len()` samples and
+            // `losses` is the struct the shim fills.
+            let n = unsafe {
+                ffi::cf_pl_gpu_take(
+                    self.handle.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut losses,
+                )
+            };
+            out.extend(buf[..n].iter().map(|s| GpuResult {
+                pass: s.pass as usize,
+                ms: s.ms,
+                tag: (s.tag != ffi::UNTAGGED).then_some(s.tag),
+            }));
+            if n < buf.len() {
+                break;
+            }
+        }
+        GpuLosses {
+            dropped: losses.dropped,
+            untimed: losses.untimed,
+            unanswered: losses.unanswered,
         }
     }
 
@@ -376,7 +403,7 @@ impl Placebo {
     }
 }
 
-/// The passes [`Placebo::gpu_times`] times, in its order: the frame's upload,
+/// The passes [`Placebo::take_gpu_results`] times, in its order: the frame's upload,
 /// its unpack on the GPU, the tunnel's decode (Dolby path only), the Dolby
 /// mapping, and the render that scales, converts and writes the output.
 pub const PASSES: [&str; 5] = [
@@ -387,11 +414,26 @@ pub const PASSES: [&str; 5] = [
     "output",
 ];
 
-/// GPU time per pass: each pass's latest result (ms) and how many it has had.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct GpuTimes {
-    pub ms: [f64; 5],
-    pub count: [u64; 5],
+/// One GPU result: its pass (a [`PASSES`] index), its time, and the tag of
+/// the run it measured. The render passes (tunnel decode, output) are timed
+/// inside libplacebo, which cannot say which run a result is from: theirs
+/// have no tag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuResult {
+    pub pass: usize,
+    pub ms: f64,
+    pub tag: Option<u64>,
+}
+
+/// Runs timing could not follow since it went on, per pass ([`PASSES`]
+/// order): results dropped for want of room before being taken, runs left
+/// untimed for want of a free timer, and timers that never answered (a run
+/// with no GPU work, as some uploads, or a lost result) and were replaced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuLosses {
+    pub dropped: [u64; 5],
+    pub untimed: [u64; 5],
+    pub unanswered: [u64; 5],
 }
 
 /// Captured 4:2:2 YCbCr on the GPU, as planes libplacebo renders from: see

@@ -10,9 +10,20 @@
 
 use cinefit_render::dm::{Frame, Scene};
 use cinefit_render::{
-    Curve, DoviColor, Mapping, Matrix, PASSES, Placebo, Primaries, RgbColor, Transfer, View,
-    YcbcrColor,
+    Curve, DoviColor, GpuResult, Mapping, Matrix, PASSES, Placebo, Primaries, RgbColor, Transfer,
+    View, YcbcrColor,
 };
+
+/// Every result taken so far.
+fn take(pl: &Placebo) -> Vec<GpuResult> {
+    let mut out = Vec::new();
+    pl.take_gpu_results(&mut out);
+    out
+}
+
+fn of(results: &[GpuResult], pass: usize) -> Vec<GpuResult> {
+    results.iter().filter(|r| r.pass == pass).copied().collect()
+}
 
 fn placebo() -> Option<Placebo> {
     match Placebo::new() {
@@ -53,26 +64,74 @@ fn each_pass_a_frame_takes_is_timed() {
 
     // Off: nothing is timed.
     ycbcr_frame(&pl, &mut planes);
-    assert_eq!(pl.gpu_times().count, [0; 5], "timing off");
+    assert!(take(&pl).is_empty(), "timing off");
 
     if !pl.set_gpu_timing(true) {
         eprintln!("skipped: the GPU has no timers");
         return;
     }
-    // Results come in a frame or two later: a few frames each way.
-    for _ in 0..8 {
+    // Results come in a frame or two later: a few frames each way, each
+    // tagged, the results taken after each as play takes them.
+    let mut t = Vec::new();
+    for tag in 1..=8 {
+        pl.set_gpu_tag(tag);
         ycbcr_frame(&pl, &mut planes);
+        t.extend(take(&pl));
     }
-    let t = pl.gpu_times();
-    let timed = |t: &cinefit_render::GpuTimes| -> Vec<&str> {
-        (0..5)
-            .filter(|&i| t.count[i] > 0)
-            .map(|i| PASSES[i])
-            .collect()
-    };
-    let passes: Vec<&str> = timed(&t).into_iter().filter(|&p| p != "upload").collect();
-    assert_eq!(passes, ["unpack", "output"], "{t:?}");
-    assert!(t.ms[4] > 0.0 && t.ms[4] < 1000.0, "{t:?}");
+    let mut passes: Vec<&str> = t.iter().map(|r| PASSES[r.pass]).collect();
+    passes.sort_unstable();
+    passes.dedup();
+    passes.retain(|&p| p != "upload");
+    assert_eq!(passes, ["output", "unpack"], "{t:?}");
+    assert!(t.iter().all(|r| r.ms > 0.0 && r.ms < 1000.0), "{t:?}");
+    // Each unpack once, under its own frame's tag; the output untagged.
+    let mut tags: Vec<u64> = of(&t, 1).iter().map(|r| r.tag.expect("tagged")).collect();
+    let n = tags.len();
+    tags.dedup();
+    assert_eq!(tags.len(), n, "an unpack result given twice: {t:?}");
+    assert!(
+        n >= 6 && tags.iter().all(|&g| (1..=8).contains(&g)),
+        "{t:?}"
+    );
+    assert!(of(&t, 4).iter().all(|r| r.tag.is_none()), "{t:?}");
+
+    // Runs whose results come in together are each kept (#263): four unpacks
+    // before any result is read, then a render that waits for the GPU.
+    for tag in 100..104 {
+        pl.set_gpu_tag(tag);
+        pl.unpack_v210(&mut planes, &v210, w.div_ceil(6) * 16)
+            .expect("unpack");
+    }
+    pl.set_gpu_tag(104);
+    pl.render_ycbcr(&planes, ycbcr, tgt.texture(), sdr, None)
+        .expect("render");
+    let together: Vec<u64> = of(&take(&pl), 1).iter().filter_map(|r| r.tag).collect();
+    assert_eq!(together, [100, 101, 102, 103], "{together:?}");
+
+    // libplacebo's history of a pass is 256 long: past it, still each new
+    // result once (a few may still be on their way at the end).
+    take(&pl);
+    let mut outputs = 0;
+    for tag in 200..500 {
+        pl.set_gpu_tag(tag);
+        ycbcr_frame(&pl, &mut planes);
+        outputs += of(&take(&pl), 4).len();
+    }
+    assert!(
+        (297..=300).contains(&outputs),
+        "300 renders, {outputs} output results"
+    );
+    // Passes that answer lose nothing; an upload with no GPU work, as here
+    // on some GPUs, shows as unanswered rather than as a result.
+    let losses = pl.take_gpu_results(&mut Vec::new());
+    for i in [1, 4] {
+        assert_eq!(
+            (losses.dropped[i], losses.untimed[i], losses.unanswered[i]),
+            (0, 0, 0),
+            "{}: {losses:?}",
+            PASSES[i]
+        );
+    }
 
     let ictcp = [
         [1.0, 0.009, 0.111],
@@ -98,6 +157,7 @@ fn each_pass_a_frame_takes_is_timed() {
         peak_percentile: 0.0,
         knee_offset: 0.0,
     };
+    let mut d = Vec::new();
     for _ in 0..8 {
         pl.unpack_tunnel(&mut planes, &tunnel, w * 4)
             .expect("unpack");
@@ -111,25 +171,25 @@ fn each_pass_a_frame_takes_is_timed() {
             &map,
         )
         .expect("render");
+        d.extend(take(&pl));
     }
-    let d = pl.gpu_times();
     for (i, pass) in PASSES.iter().enumerate().skip(1) {
         assert!(
-            d.count[i] > t.count[i],
+            !of(&d, i).is_empty(),
             "{pass} not timed on the Dolby path: {d:?}"
         );
     }
     eprintln!(
         "upload timed: {}",
-        if d.count[0] > 0 {
-            "yes"
-        } else {
+        if of(&d, 0).is_empty() {
             "no (no transfer-queue timers)"
+        } else {
+            "yes"
         }
     );
 
     // Off again: nothing more.
     assert!(!pl.set_gpu_timing(false));
     ycbcr_frame(&pl, &mut planes);
-    assert_eq!(pl.gpu_times().count, d.count, "timing off again");
+    assert!(take(&pl).is_empty(), "timing off again");
 }

@@ -33,6 +33,31 @@ _Static_assert(offsetof(cf_pl_dm, hue_s1) == 4136, "cf_pl_dm.hue_s1");
 _Static_assert(offsetof(cf_pl_dm, hue_fix) == 4140, "cf_pl_dm.hue_fix");
 _Static_assert(offsetof(cf_pl_dm, hue_cmp) == 4156, "cf_pl_dm.hue_cmp");
 
+/* GPU timing (#263). libplacebo's Vulkan timer is a ring of queries that
+ * skips a run whose slot is still busy and drops its oldest result when full,
+ * so results cannot be matched to runs by order. Each of our own timers holds
+ * one query at a time instead: a result read from it is that run's. */
+#define TIMER_POOL 4        /* timers per own pass: runs in flight at once */
+#define TIMER_PATIENCE 16   /* takes (frames) a query may wait before its timer is replaced */
+#define RESULT_QUEUE 512    /* results kept until taken */
+#define PASSES_FOLLOWED 32  /* render passes whose history is followed */
+#define HISTORY 256         /* = pl_dispatch_info.samples */
+#define NEW_PER_CALL 8      /* new results a pass may bring to one render call */
+
+struct own_timer {
+    pl_timer timer;
+    bool busy;              /* a run's query is in it, not yet read */
+    uint64_t tag;
+    int waited;
+};
+
+/* A render pass's history as last reported, to tell its new results. */
+struct pass_history {
+    uint64_t signature;
+    int n;
+    uint64_t ns[HISTORY];
+};
+
 struct cf_pl {
     pl_log log;
     pl_vulkan vk;
@@ -43,70 +68,189 @@ struct cf_pl {
     pl_tex dm_mid, dm_lut;
     cf_pl_log_cb log_cb;
     void *log_ctx;
-    /* GPU timing (#219): NULL timers and no callback while off. */
+    /* GPU timing (#219, #263): no timers and no callback while off. */
     bool timing;
-    pl_timer t_upload, t_unpack, t_map;
-    cf_pl_gpu_times times;
-    uint64_t pass_ns;
-    bool pass_timed;
+    uint64_t tag;
+    struct own_timer own[CF_PL_PASSES][TIMER_POOL];
+    cf_pl_gpu_sample queue[RESULT_QUEUE];
+    size_t queued;
+    cf_pl_gpu_losses losses;
+    struct pass_history history[PASSES_FOLLOWED];
+    int followed;
+    /* The render call in progress: each pass's new results, oldest first. */
+    struct { int n; uint64_t ns[NEW_PER_CALL]; } call[PASSES_FOLLOWED];
+    int call_passes;
+    int call_pass;          /* CF_PL_PASS_* the call's results are queued under */
 };
 
-_Static_assert(sizeof(cf_pl_gpu_times) == 80, "cf_pl_gpu_times size");
-_Static_assert(offsetof(cf_pl_gpu_times, count) == 40, "cf_pl_gpu_times.count");
+_Static_assert(sizeof(cf_pl_gpu_sample) == 24, "cf_pl_gpu_sample size");
+_Static_assert(offsetof(cf_pl_gpu_sample, ms) == 8, "cf_pl_gpu_sample.ms");
+_Static_assert(offsetof(cf_pl_gpu_sample, pass) == 16, "cf_pl_gpu_sample.pass");
+_Static_assert(sizeof(cf_pl_gpu_losses) == 120, "cf_pl_gpu_losses size");
+_Static_assert(offsetof(cf_pl_gpu_losses, untimed) == 40, "cf_pl_gpu_losses.untimed");
+_Static_assert(offsetof(cf_pl_gpu_losses, unanswered) == 80, "cf_pl_gpu_losses.unanswered");
 
-/* A pass's newest result, when there is one: results come in later, so this
- * is an earlier run of the same pass, a frame or two back. */
-static void take(cf_pl *pl, int pass, pl_timer t) {
-    if (!t) return;
-    uint64_t ns, last = 0;
-    while ((ns = pl_timer_query(pl->vk->gpu, t))) last = ns;
-    if (last) {
-        pl->times.ms[pass] = (double)last / 1e6;
-        pl->times.count[pass]++;
+static void push_result(cf_pl *pl, int pass, uint64_t ns, uint64_t tag) {
+    if (pl->queued == RESULT_QUEUE) {
+        pl->losses.dropped[pass]++;
+        return;
     }
+    pl->queue[pl->queued++] = (cf_pl_gpu_sample){.tag = tag, .ms = (double)ns / 1e6, .pass = pass};
+}
+
+/* A free timer for a run of `pass`, tagged with the current tag, or NULL
+ * (the run goes untimed) while timing is off or every timer still waits. */
+static pl_timer own_timer(cf_pl *pl, int pass) {
+    if (!pl->timing) return NULL;
+    for (int i = 0; i < TIMER_POOL; i++) {
+        struct own_timer *t = &pl->own[pass][i];
+        if (!t->busy && t->timer) {
+            *t = (struct own_timer){.timer = t->timer, .busy = true, .tag = pl->tag};
+            return t->timer;
+        }
+    }
+    pl->losses.untimed[pass]++;
+    return NULL;
+}
+
+/* Every own timer's result that has come in, each queued once. */
+static void collect(cf_pl *pl) {
+    if (!pl->timing) return;
+    for (int p = 0; p < CF_PL_PASSES; p++)
+        for (int i = 0; i < TIMER_POOL; i++) {
+            struct own_timer *t = &pl->own[p][i];
+            if (!t->busy) continue;
+            uint64_t ns = pl_timer_query(pl->vk->gpu, t->timer);
+            if (ns) {
+                push_result(pl, p, ns, t->tag);
+                t->busy = false;
+            }
+        }
+}
+
+/* A render pass's results new since it last reported (#263). libplacebo
+ * hands over the pass's whole history on every run, oldest first and at most
+ * HISTORY long, with `last` its newest whether or not one came in since: the
+ * new ones are what the history gained. Once it is full, they are the tail
+ * past the longest overlap with what was seen. Returns how many, at the end
+ * of `info->samples`. */
+static int new_results(cf_pl *pl, const struct pl_dispatch_info *info) {
+    struct pass_history *h = NULL;
+    for (int i = 0; i < pl->followed && !h; i++)
+        if (pl->history[i].signature == info->signature) h = &pl->history[i];
+    if (!h) {
+        if (pl->followed == PASSES_FOLLOWED) return 0;
+        h = &pl->history[pl->followed++];
+        h->signature = info->signature;
+        h->n = 0;
+    }
+    int n = info->num_samples, k = n;
+    if (n < HISTORY) {
+        /* Not yet full: appended to (or started over, if the pass was made anew). */
+        if (n >= h->n) k = n - h->n;
+    } else {
+        for (int m = n; m > 0; m--) {
+            if (m > h->n) continue;
+            if (!memcmp(info->samples, h->ns + h->n - m, (size_t)m * sizeof h->ns[0])) {
+                k = n - m;
+                break;
+            }
+        }
+    }
+    memcpy(h->ns, info->samples, (size_t)n * sizeof h->ns[0]);
+    h->n = n;
+    return k;
 }
 
 static void on_pass(void *priv, const struct pl_render_info *info) {
     struct cf_pl *pl = priv;
-    if (info->pass->num_samples > 0) {
-        pl->pass_ns += info->pass->last;
-        pl->pass_timed = true;
+    if (pl->call_passes == PASSES_FOLLOWED) return;
+    int k = new_results(pl, info->pass);
+    if (k > NEW_PER_CALL) {
+        pl->losses.dropped[pl->call_pass] += k - NEW_PER_CALL;
+        k = NEW_PER_CALL;
     }
+    if (!k) return;
+    const uint64_t *ns = info->pass->samples + info->pass->num_samples - k;
+    pl->call[pl->call_passes].n = k;
+    memcpy(pl->call[pl->call_passes].ns, ns, (size_t)k * sizeof ns[0]);
+    pl->call_passes++;
 }
 
-/* pl_render_image, its passes' GPU time summed into `pass` while timing. */
+/* pl_render_image, its passes' new GPU results queued under `pass` while
+ * timing. Results arrive in order, so the newest of each pass are from the
+ * same earlier run, the next newest from the run before, and so on: each such
+ * generation, its passes summed, is one result. */
 static bool render_timed(cf_pl *pl, int pass, const struct pl_frame *image,
                          const struct pl_frame *target, struct pl_render_params *params) {
     if (pl->timing) {
         params->info_callback = on_pass;
         params->info_priv = pl;
-        pl->pass_ns = 0;
-        pl->pass_timed = false;
+        pl->call_passes = 0;
+        pl->call_pass = pass;
     }
     bool ok = pl_render_image(pl->renderer, image, target, params);
-    if (ok && pl->timing && pl->pass_timed) {
-        pl->times.ms[pass] = (double)pl->pass_ns / 1e6;
-        pl->times.count[pass]++;
+    if (pl->timing) {
+        int generations = 0;
+        for (int i = 0; i < pl->call_passes; i++)
+            if (pl->call[i].n > generations) generations = pl->call[i].n;
+        for (int g = 0; g < generations; g++) {
+            uint64_t ns = 0;
+            for (int i = 0; i < pl->call_passes; i++) {
+                int at = pl->call[i].n - generations + g;
+                if (at >= 0) ns += pl->call[i].ns[at];
+            }
+            push_result(pl, pass, ns, CF_PL_UNTAGGED);
+        }
     }
     return ok;
 }
 
 int cf_pl_gpu_timing(cf_pl *pl, int on) {
     pl_gpu gpu = pl->vk->gpu;
-    pl_timer_destroy(gpu, &pl->t_upload);
-    pl_timer_destroy(gpu, &pl->t_unpack);
-    pl_timer_destroy(gpu, &pl->t_map);
+    for (int p = 0; p < CF_PL_PASSES; p++)
+        for (int i = 0; i < TIMER_POOL; i++) {
+            pl_timer_destroy(gpu, &pl->own[p][i].timer);
+            pl->own[p][i] = (struct own_timer){0};
+        }
     pl->timing = false;
+    pl->queued = 0;
+    pl->followed = 0;
+    pl->losses = (cf_pl_gpu_losses){0};
     if (!on) return 0;
-    pl->t_upload = pl_timer_create(gpu);
-    pl->t_unpack = pl_timer_create(gpu);
-    pl->t_map = pl_timer_create(gpu);
-    pl->timing = pl->t_upload && pl->t_unpack && pl->t_map;
-    if (!pl->timing) cf_pl_gpu_timing(pl, 0);
-    return pl->timing;
+    bool all = true;
+    for (int p = 0; p < CF_PL_PASSES; p++)
+        for (int i = 0; i < TIMER_POOL; i++)
+            all = all && (pl->own[p][i].timer = pl_timer_create(gpu));
+    if (!all) return cf_pl_gpu_timing(pl, 0);
+    pl->timing = true;
+    return 1;
 }
 
-void cf_pl_get_gpu_times(cf_pl *pl, cf_pl_gpu_times *out) { *out = pl->times; }
+void cf_pl_gpu_tag(cf_pl *pl, uint64_t tag) { pl->tag = tag; }
+
+size_t cf_pl_gpu_take(cf_pl *pl, cf_pl_gpu_sample *out, size_t cap, cf_pl_gpu_losses *losses) {
+    collect(pl);
+    if (pl->timing) {
+        /* A query that has waited this long will not answer: its run
+         * recorded no GPU work, or the result was lost. A new timer, so a
+         * result that does come cannot be put down to a later run. */
+        for (int p = 0; p < CF_PL_PASSES; p++)
+            for (int i = 0; i < TIMER_POOL; i++) {
+                struct own_timer *t = &pl->own[p][i];
+                if (!t->busy || ++t->waited <= TIMER_PATIENCE) continue;
+                pl_timer_destroy(pl->vk->gpu, &t->timer);
+                *t = (struct own_timer){.timer = pl_timer_create(pl->vk->gpu)};
+                pl->losses.unanswered[p]++;
+            }
+    }
+    size_t n = pl->queued < cap ? pl->queued : cap;
+    memcpy(out, pl->queue, n * sizeof *out);
+    memmove(pl->queue, pl->queue + n, (pl->queued - n) * sizeof *out);
+    pl->queued -= n;
+    if (losses) *losses = pl->losses;
+    return n;
+}
 
 static void forward_log(void *priv, enum pl_log_level level, const char *msg) {
     struct cf_pl *pl = priv;
@@ -443,9 +587,9 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
         return -1;
     if (!pl_tex_upload(gpu, pl_tex_transfer_params(
             .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes,
-            .timer = pl->t_upload)))
+            .timer = own_timer(pl, CF_PL_PASS_UPLOAD))))
         return -1;
-    take(pl, CF_PL_PASS_UPLOAD, pl->t_upload);
+    collect(pl);
 
     pl_shader sh = pl_dispatch_begin(pl->dispatch);
     bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
@@ -490,10 +634,10 @@ int cf_pl_unpack_v210(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t ro
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
-            .timer = pl->t_unpack,
+            .timer = own_timer(pl, CF_PL_PASS_UNPACK),
             .dispatch_size = {(groups + V210_LOCAL - 1) / V210_LOCAL, p->h, 1})))
         return -1;
-    take(pl, CF_PL_PASS_UNPACK, pl->t_unpack);
+    collect(pl);
     p->depth = 10;
     p->filled = true;
     return 0;
@@ -738,9 +882,9 @@ int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *r, const uint8_t *data, size_t row_by
         return -1;
     if (!pl_tex_upload(gpu, pl_tex_transfer_params(
             .tex = r->packed, .ptr = (void *)data, .row_pitch = row_bytes,
-            .timer = pl->t_upload)))
+            .timer = own_timer(pl, CF_PL_PASS_UPLOAD))))
         return -1;
-    take(pl, CF_PL_PASS_UPLOAD, pl->t_upload);
+    collect(pl);
 
     pl_shader sh = pl_dispatch_begin(pl->dispatch);
     bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
@@ -776,11 +920,11 @@ int cf_pl_unpack_rgb(cf_pl *pl, cf_pl_rgb *r, const uint8_t *data, size_t row_by
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
-            .timer = pl->t_unpack,
+            .timer = own_timer(pl, CF_PL_PASS_UNPACK),
             .dispatch_size = {(r->w + RGB_LOCAL_X - 1) / RGB_LOCAL_X,
                               (r->h + RGB_LOCAL_Y - 1) / RGB_LOCAL_Y, 1})))
         return -1;
-    take(pl, CF_PL_PASS_UNPACK, pl->t_unpack);
+    collect(pl);
     r->depth = format == CF_PL_R210 ? 10 : 8;
     r->filled = true;
     return 0;
@@ -882,9 +1026,9 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
         return -1;
     if (!pl_tex_upload(gpu, pl_tex_transfer_params(
             .tex = p->packed, .ptr = (void *)data, .row_pitch = row_bytes,
-            .timer = pl->t_upload)))
+            .timer = own_timer(pl, CF_PL_PASS_UPLOAD))))
         return -1;
-    take(pl, CF_PL_PASS_UPLOAD, pl->t_upload);
+    collect(pl);
 
     int pairs = p->w / 2;
     pl_shader sh = pl_dispatch_begin(pl->dispatch);
@@ -926,11 +1070,11 @@ int cf_pl_unpack_tunnel(cf_pl *pl, cf_pl_planes *p, const uint8_t *data, size_t 
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
-            .timer = pl->t_unpack,
+            .timer = own_timer(pl, CF_PL_PASS_UNPACK),
             .dispatch_size = {(pairs + RGB_LOCAL_X - 1) / RGB_LOCAL_X,
                               (p->h + RGB_LOCAL_Y - 1) / RGB_LOCAL_Y, 1})))
         return -1;
-    take(pl, CF_PL_PASS_UNPACK, pl->t_unpack);
+    collect(pl);
     p->depth = 12;
     p->filled = true;
     return 0;
@@ -1142,10 +1286,10 @@ static int dm_pass(cf_pl *pl, pl_tex img, const cf_pl_dm *dm) {
     }
     if (!pl_dispatch_compute(pl->dispatch, pl_dispatch_compute_params(
             .shader = &sh,
-            .timer = pl->t_map,
+            .timer = own_timer(pl, CF_PL_PASS_MAP),
             .dispatch_size = {(w + DM_LOCAL - 1) / DM_LOCAL, (h + DM_LOCAL - 1) / DM_LOCAL, 1})))
         return -1;
-    take(pl, CF_PL_PASS_MAP, pl->t_map);
+    collect(pl);
     return 0;
 }
 

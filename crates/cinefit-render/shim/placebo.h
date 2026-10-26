@@ -161,9 +161,8 @@ int cf_pl_render_dovi(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
                       cf_pl_tex *dst, int dst_primaries, int dst_trc, const float *place,
                       const cf_pl_map *map, const float *src_crop);
 
-/* GPU time per pass, from libplacebo's timers (#219): each pass's latest
- * result in ms and how many results it has had, so a reader takes each
- * once. Passes in CF_PL_PASS_* order; a pass that has not run reads 0. */
+/* GPU time per pass, from libplacebo's timers (#219, #263). Passes in
+ * CF_PL_PASS_* order. */
 enum {
     CF_PL_PASS_UPLOAD,
     CF_PL_PASS_UNPACK,
@@ -172,14 +171,35 @@ enum {
     CF_PL_PASS_OUTPUT,
     CF_PL_PASSES
 };
+/* One GPU result: the pass, its time, and the tag set when the run it
+ * measured was submitted. A result comes in a frame or two after its run.
+ * The render passes (decode, output) are timed inside libplacebo, which
+ * cannot say which run a result is from: theirs are CF_PL_UNTAGGED. */
+#define CF_PL_UNTAGGED UINT64_MAX
 typedef struct {
-    double ms[CF_PL_PASSES];
-    uint64_t count[CF_PL_PASSES];
-} cf_pl_gpu_times;
+    uint64_t tag;
+    double ms;
+    int32_t pass;
+    int32_t pad;
+} cf_pl_gpu_sample;
+/* Runs timing could not follow, since timing went on, per pass: results
+ * dropped for want of room before being taken, runs left untimed for want of
+ * a free timer, and timers that never answered (a run that recorded no GPU
+ * work, as some uploads, or a result lost) and were replaced. */
+typedef struct {
+    uint64_t dropped[CF_PL_PASSES];
+    uint64_t untimed[CF_PL_PASSES];
+    uint64_t unanswered[CF_PL_PASSES];
+} cf_pl_gpu_losses;
 
 /* Timing on (1 if the GPU has timers) or off (nothing attached, no cost). */
 int cf_pl_gpu_timing(cf_pl *pl, int on);
-void cf_pl_get_gpu_times(cf_pl *pl, cf_pl_gpu_times *out);
+/* The tag the runs submitted from now on carry: a frame's number, say. */
+void cf_pl_gpu_tag(cf_pl *pl, uint64_t tag);
+/* Results new since the last call, oldest first, each given once: up to
+ * `cap` into `out`, the rest kept for the next call. `losses` (may be NULL)
+ * gets the counts so far. */
+size_t cf_pl_gpu_take(cf_pl *pl, cf_pl_gpu_sample *out, size_t cap, cf_pl_gpu_losses *losses);
 
 /* Points in a cf_pl_dm intensity table. */
 #define CF_PL_DM_LUT 1025
