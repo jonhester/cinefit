@@ -431,8 +431,13 @@ void cf_pl_tex_destroy(cf_pl *pl, cf_pl_tex *t) {
 }
 
 int cf_pl_clear_black(cf_pl *pl, cf_pl_tex *dst) {
+    pl_tex tex = unwrap_tex(dst);
+    // A clear needs blit_dst, which an imported buffer has only when its
+    // format is blittable. Without it libplacebo logs and does nothing, and
+    // the buffer would go out holding the last frame drawn into it (#284).
+    if (!tex->params.blit_dst) return -1;
     // Zero in every channel: black for PQ and SDR alike, full-range RGB.
-    pl_tex_clear(pl->vk->gpu, unwrap_tex(dst), (float[4]){0.0f, 0.0f, 0.0f, 1.0f});
+    pl_tex_clear(pl->vk->gpu, tex, (float[4]){0.0f, 0.0f, 0.0f, 1.0f});
     pl_gpu_finish(pl->vk->gpu);
     return 0;
 }
