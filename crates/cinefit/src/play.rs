@@ -3178,8 +3178,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             )
                         });
                         dataset.set_hdr(frame_info.color.hdr, t);
-                        dataset.record(cfg.record, &found, t, epoch, content);
-                        dataset.keep(&cfg, &found, t, &frame);
+                        // The receiver in standby still passes the player's
+                        // signal through: those frames are not a viewing, and
+                        // recording them would open a session the next
+                        // viewing is then appended to (#285).
+                        if standby_since.is_none() {
+                            dataset.record(cfg.record, &found, t, epoch, content);
+                            dataset.keep(&cfg, &found, t, &frame);
+                        }
                         let source = found.source;
                         last_source = source;
                         let view = view_for(
