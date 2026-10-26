@@ -862,8 +862,21 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, Error> {
                 toml::Value::Integer(n) => Value::Int(*n),
                 toml::Value::String(n) => Value::Name(n.clone()),
                 toml::Value::Float(x) => Value::Float(*x),
-                // A bool or table fits no setting: refused by put.
-                other => Value::Name(format!("a {}", other.type_str())),
+                // A boolean, date, array or table fits no setting. Refused
+                // here: as text it would pass a text setting's check
+                // (`avr.denon = false` looked up a host named "a boolean").
+                other => {
+                    return Err(Error::Value {
+                        key,
+                        value: match other {
+                            toml::Value::Boolean(b) => b.to_string(),
+                            toml::Value::Datetime(d) => d.to_string(),
+                            toml::Value::Array(_) => "an array".into(),
+                            _ => "a table".into(),
+                        },
+                        range: s.range(),
+                    });
+                }
             };
             s.put(&mut c, &value)?;
         }
@@ -1025,6 +1038,27 @@ mod tests {
         assert!(matches!(
             parse("[input]\nrgb_range = \"tv\"\n", p()),
             Err(Error::Value { .. })
+        ));
+    }
+
+    #[test]
+    fn a_boolean_or_an_array_is_refused_not_taken_as_text() {
+        let e = parse("[avr]\ndenon = false\n", p()).unwrap_err();
+        assert!(
+            matches!(&e, Error::Value { key, value, .. } if key == "avr.denon" && value == "false"),
+            "{e}"
+        );
+        assert!(
+            e.to_string().starts_with("avr.denon = false: must be text"),
+            "{e}"
+        );
+        assert!(matches!(
+            parse("[slate]\nvenue = [\"a\", \"b\"]\n", p()),
+            Err(Error::Value { key, value, .. }) if key == "slate.venue" && value == "an array"
+        ));
+        assert!(matches!(
+            parse("[atv]\nhost = 2026-10-26\n", p()),
+            Err(Error::Value { key, .. }) if key == "atv.host"
         ));
     }
 
