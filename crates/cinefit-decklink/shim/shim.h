@@ -131,8 +131,9 @@ cf_dl_input *cf_dl_input_open(cf_dl_device *dev) CF_DL_NOEXCEPT;
 
 /* Enables the input with format detection and starts it: in the mode the card
  * already detects, with on_format called once first to choose the pixel
- * format, or in a fallback mode if it detects none. Returns 0, or the
- * failing call's HRESULT with its name in *failed_call. E_ACCESSDENIED from
+ * format, or with none detected in 720p50, a mode no source here sends, so
+ * the first signal is reported as a change. Returns 0, or the failing call's
+ * HRESULT with its name in *failed_call. E_ACCESSDENIED from
  * EnableVideoInput means another program holds the input. Callbacks may run
  * from here until cf_dl_input_stop returns, with ctx passed through. */
 int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
