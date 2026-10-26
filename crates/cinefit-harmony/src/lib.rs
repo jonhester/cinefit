@@ -236,23 +236,36 @@ impl Hub {
     }
 
     /// Reads and discards any immediately available ack frames after a press,
-    /// so they do not pile up before the next request. Best effort: a read
-    /// timeout just ends the drain.
+    /// so they do not pile up before the next request. Best effort: nothing
+    /// arriving within a short wait ends the drain. Only the wait for a
+    /// frame's first byte is short; the rest is read with the normal timeout,
+    /// since a drain that gave up mid-frame left the next request reading
+    /// from the middle of one (#296).
     fn drain_acks(&mut self) -> Result<()> {
-        // A short read timeout for the non-blocking drain, restored after.
-        self.ws
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_millis(400)))?;
+        let mut first = [0u8; 1];
         loop {
-            match self.ws.read_text() {
-                Ok(Some(_)) => continue,
-                Ok(None) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            let s = self.ws.get_ref();
+            s.set_read_timeout(Some(Duration::from_millis(400)))?;
+            let waiting = s.peek(&mut first);
+            s.set_read_timeout(Some(TIMEOUT))?;
+            match waiting {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
+            if self.ws.read_text()?.is_none() {
+                break;
+            }
         }
-        self.ws.get_ref().set_read_timeout(Some(TIMEOUT))?;
         Ok(())
     }
 }
@@ -408,6 +421,36 @@ fn split_http(text: &str) -> Result<(u16, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ack whose second half comes after the drain's short wait is read
+    /// whole, and the next message reads from a frame's start (#296).
+    #[test]
+    fn a_drain_reads_a_late_frame_whole() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let frame = |text: &[u8]| [&[0x81, text.len() as u8][..], text].concat();
+            let ack = frame(b"{\"code\":200}");
+            c.write_all(&ack[..4]).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            c.write_all(&ack[4..]).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            c.write_all(&frame(b"next")).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut h = Hub {
+            ws: WebSocket::new(stream),
+            remote_id: "0".into(),
+            next_id: 0,
+        };
+        h.drain_acks().unwrap();
+        assert_eq!(h.ws.read_text().unwrap().as_deref(), Some("next"));
+        hub.join().unwrap();
+    }
 
     const CONFIG: &str = r#"{
         "id":"0","code":200,"msg":"OK",

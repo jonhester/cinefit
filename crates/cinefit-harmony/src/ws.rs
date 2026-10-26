@@ -122,7 +122,8 @@ impl<S: Read + Write> WebSocket<S> {
     }
 
     fn send_control(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
-        // Control payloads are short (<=125), so one length byte suffices.
+        // Control payloads are short (<=125, as read_frame enforces on what
+        // is echoed), so one length byte suffices.
         let mask = self.next_mask();
         let mut frame = Vec::with_capacity(payload.len() + 6);
         frame.push(0x80 | opcode);
@@ -140,8 +141,18 @@ impl<S: Read + Write> WebSocket<S> {
         if !self.read_exact_or_eof(&mut first)? {
             return Ok(None);
         }
+        let opcode = first[0] & 0x0f;
+        // A control frame carries at most 125 bytes (RFC 6455 5.5). A longer
+        // one is a broken peer; echoing it as a ping or close would go out
+        // with its length cut to one byte (#296).
+        if opcode & 0x8 != 0 && first[1] & 0x7f > 125 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a WebSocket control frame longer than 125 bytes",
+            ));
+        }
         let payload = self.read_payload(first[1], room)?;
-        Ok(Some((first[0] & 0x80 != 0, first[0] & 0x0f, payload)))
+        Ok(Some((first[0] & 0x80 != 0, opcode, payload)))
     }
 
     /// Reads a frame payload given its second header byte. Server frames are
@@ -405,6 +416,22 @@ mod tests {
         let raw = vec![0x02, 0x01, 0xff, 0x80, 0x01, 0xfe, 0x81, 0x01, b'c'];
         let mut ws = WebSocket::new(Cursor::new(raw));
         assert_eq!(ws.read_text().unwrap().as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn a_control_frame_over_125_bytes_is_refused() {
+        // A ping with a 16-bit length of 200: never answered.
+        let mut raw = vec![0x89, 126];
+        raw.extend_from_slice(&200u16.to_be_bytes());
+        raw.extend_from_slice(&[0u8; 200]);
+        let mut ws = WebSocket::new(Cursor::new(raw));
+        let e = ws.read_text().expect_err("too long a ping");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        assert_eq!(
+            ws.stream.position(),
+            2,
+            "refused at its header, nothing echoed"
+        );
     }
 
     #[test]
