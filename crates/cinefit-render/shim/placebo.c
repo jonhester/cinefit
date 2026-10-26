@@ -730,9 +730,10 @@ static void apply_map(struct pl_frame *image, struct pl_frame *target,
     }
 }
 
-int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
-                       cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
-                       const cf_pl_map *map, const float *src_crop) {
+/* The YCbCr planes rendered into `d`, timed as `pass`. */
+static int render_ycbcr_into(cf_pl *pl, int pass, cf_pl_planes *src, int matrix, int prim,
+                             int trc, pl_tex d, int dst_prim, int dst_trc, const float *place,
+                             const cf_pl_map *map, const float *src_crop) {
     if (!src->filled) {
         log_err(pl, "planes read before any frame was unpacked into them");
         return -1;
@@ -761,7 +762,6 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
     // between two luma pixels.
     pl_frame_set_chroma_location(&image, PL_CHROMA_LEFT);
 
-    pl_tex d = unwrap_tex(dst);
     struct pl_frame target = {
         .num_planes = 1,
         .planes = {{ .texture = d, .components = 3, .component_mapping = {0, 1, 2} }},
@@ -780,7 +780,15 @@ int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int t
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     apply_map(&image, &target, &params, &cmp, &pdp, map);
-    if (!render_timed(pl, CF_PL_PASS_OUTPUT, &image, &target, &params)) return -1;
+    return render_timed(pl, pass, &image, &target, &params) ? 0 : -1;
+}
+
+int cf_pl_render_ycbcr(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
+                       cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
+                       const cf_pl_map *map, const float *src_crop) {
+    if (render_ycbcr_into(pl, CF_PL_PASS_OUTPUT, src, matrix, prim, trc, unwrap_tex(dst), dst_prim,
+                          dst_trc, place, map, src_crop))
+        return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
 }
@@ -1293,22 +1301,24 @@ static int dm_pass(cf_pl *pl, pl_tex img, const cf_pl_dm *dm) {
     return 0;
 }
 
-int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
-                         const cf_pl_dm *dm, cf_pl_tex *dst, int dst_prim, int dst_trc,
-                         const float *place, const cf_pl_map *map, const float *src_crop) {
-    pl_gpu gpu = pl->vk->gpu;
+/* The Dolby mapping's working texture, BT.2020 PQ RGB at the frame's own
+ * size: the bars are cropped and the picture placed by the last step, as for
+ * every other source. Decoded, then mapped in place, then placed: one
+ * full-size texture. */
+static int dm_mid_for(cf_pl *pl, int w, int h) {
     pl_fmt fmt = storable_fmt(pl, "rgba16");
     if (!fmt) return -1;
-    // The whole frame at its own size: the bars are cropped and the picture
-    // placed by the last step, as for every other source.
-    // Decoded, then mapped in place, then placed: one full-size texture.
-    if (!pl_tex_recreate(gpu, &pl->dm_mid, pl_tex_params(
-            .w = src->w, .h = src->h, .format = fmt, .renderable = true, .sampleable = true,
-            .storable = true, .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0)))
-        return -1;
-    if (render_dovi(pl, CF_PL_PASS_DECODE, src, d, pl->dm_mid, CF_PL_PRIM_BT2020, CF_PL_TRC_PQ, NULL,
-                    NULL, NULL))
-        return -1;
+    return pl_tex_recreate(pl->vk->gpu, &pl->dm_mid, pl_tex_params(
+               .w = w, .h = h, .format = fmt, .renderable = true, .sampleable = true,
+               .storable = true, .blit_dst = (fmt->caps & PL_FMT_CAP_BLITTABLE) != 0))
+               ? 0
+               : -1;
+}
+
+/* dm_mid, decoded, mapped in place and then cropped and placed into dst. */
+static int dm_map_out(cf_pl *pl, const cf_pl_dm *dm, cf_pl_tex *dst, int dst_prim, int dst_trc,
+                      const float *place, const cf_pl_map *map, const float *src_crop) {
+    pl_gpu gpu = pl->vk->gpu;
     if (dm_pass(pl, pl->dm_mid, dm)) return -1;
 
     struct pl_frame image = {
@@ -1334,6 +1344,27 @@ int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
     if (!render_timed(pl, CF_PL_PASS_OUTPUT, &image, &target, &params)) return -1;
     pl_gpu_finish(gpu);
     return 0;
+}
+
+int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *d,
+                         const cf_pl_dm *dm, cf_pl_tex *dst, int dst_prim, int dst_trc,
+                         const float *place, const cf_pl_map *map, const float *src_crop) {
+    if (dm_mid_for(pl, src->w, src->h)) return -1;
+    if (render_dovi(pl, CF_PL_PASS_DECODE, src, d, pl->dm_mid, CF_PL_PRIM_BT2020, CF_PL_TRC_PQ, NULL,
+                    NULL, NULL))
+        return -1;
+    return dm_map_out(pl, dm, dst, dst_prim, dst_trc, place, map, src_crop);
+}
+
+int cf_pl_render_ycbcr_dm(cf_pl *pl, cf_pl_planes *src, int matrix, int prim, int trc,
+                          const cf_pl_dm *dm, cf_pl_tex *dst, int dst_prim, int dst_trc,
+                          const float *place, const cf_pl_map *map, const float *src_crop) {
+    if (dm_mid_for(pl, src->w, src->h)) return -1;
+    // HDR10 to BT.2020 PQ RGB, unmapped: the same colour space on both sides.
+    if (render_ycbcr_into(pl, CF_PL_PASS_DECODE, src, matrix, prim, trc, pl->dm_mid,
+                          CF_PL_PRIM_BT2020, CF_PL_TRC_PQ, NULL, NULL, NULL))
+        return -1;
+    return dm_map_out(pl, dm, dst, dst_prim, dst_trc, place, map, src_crop);
 }
 
 int cf_pl_dm_rgba16(cf_pl *pl, int w, int h, const uint16_t *in, const cf_pl_dm *dm,

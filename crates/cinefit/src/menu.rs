@@ -180,10 +180,12 @@ fn choices(key: &str, c: &Config, rates: &[f64]) -> (Vec<Choice>, Option<usize>)
             &[
                 ("passthrough", "To the projector"),
                 ("sdr2020", "Tone-mapped to SDR BT.2020"),
+                ("dolby", "Dolby\u{2019}s mapping, measured"),
             ],
             match c.mode {
                 OutputMode::Passthrough => "passthrough",
                 OutputMode::Sdr2020 => "sdr2020",
+                OutputMode::Dolby => "dolby",
             },
         ),
         "geometry.screen_ar" => {

@@ -260,7 +260,7 @@ pub(crate) fn output_in(
     tunnel: Option<&Tunnel>,
 ) -> (Option<cinefit_kms::HdrStatic>, RgbColor) {
     let sdr = (None, SDR_BT2020);
-    if content.is_dolby_vision() || mode == OutputMode::Sdr2020 {
+    if content.is_dolby_vision() || mode != OutputMode::Passthrough {
         return sdr;
     }
     match output_for(content, hdr, tunnel) {
@@ -447,6 +447,7 @@ pub(crate) fn banner_for(
         ""
     };
     let passthrough = config.mode == OutputMode::Passthrough;
+    let dolby = config.mode == OutputMode::Dolby;
     let (title, detail) = match content {
         Content::Unsupported(_) => return None,
         Content::Tunnel => (
@@ -465,6 +466,8 @@ pub(crate) fn banner_for(
             },
             if passthrough {
                 format!("{what} \u{b7} to the projector")
+            } else if dolby && matches!(content, Content::Hdr10(_)) {
+                format!("{what} \u{b7} Dolby\u{2019}s mapping, measured by cinefit")
             } else {
                 format!("{what} \u{b7} tone-mapped by cinefit")
             },
@@ -658,18 +661,20 @@ mod tests {
 
     #[test]
     fn dolby_vision_is_never_passed_through() {
-        use OutputMode::{Passthrough, Sdr2020};
+        use OutputMode::{Dolby, Passthrough, Sdr2020};
         let lldv = content(Transfer::Bt1886);
         let hdr10 = content(Transfer::Pq);
-        for mode in [Sdr2020, Passthrough] {
+        for mode in [Sdr2020, Passthrough, Dolby] {
             assert_eq!(
                 output_in(mode, Content::Tunnel, None, None),
                 (None, SDR_BT2020)
             );
             assert_eq!(output_in(mode, lldv, None, None), (None, SDR_BT2020));
         }
-        // HDR10 is passed through only when asked.
+        // HDR10 is passed through only when asked; Dolby's mapping is SDR
+        // out, as sdr2020 (#141).
         assert_eq!(output_in(Sdr2020, hdr10, None, None), (None, SDR_BT2020));
+        assert_eq!(output_in(Dolby, hdr10, None, None), (None, SDR_BT2020));
         let (h, out) = output_in(Passthrough, hdr10, None, None);
         assert_eq!(h.map(|h| h.eotf), Some(cinefit_kms::Eotf::Pq));
         assert_eq!(out.transfer, Transfer::Pq);

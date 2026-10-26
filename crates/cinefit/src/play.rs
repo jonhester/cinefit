@@ -21,6 +21,7 @@ use crate::config::{self, Config};
 use crate::content::*;
 use crate::dataset;
 use crate::follow;
+use crate::l1;
 use crate::menu::Menu;
 use crate::osd::InfoText;
 use crate::pairfollow;
@@ -852,6 +853,9 @@ struct CropFinder {
     /// by its shots (#109). The epoch it last saw, to start again on a new one.
     tunnel_cuts: cinefit_detect::cuts::Cuts,
     tunnel_epoch: u32,
+    /// Measure HDR10 frames' L1 for Dolby's mapping (`output.mode` dolby,
+    /// #141), over the rows the crop keeps.
+    measure: bool,
 }
 
 /// What the detector made of one frame.
@@ -874,6 +878,8 @@ struct Found {
     /// A hard cut on this frame: from the detector on YCbCr, from a cut
     /// detector of its own on the tunnel (#109).
     cut: bool,
+    /// HDR10 only, while measuring: the frame's L1 over the picture (#141).
+    l1: Option<l1::FrameL1>,
 }
 
 /// The brightest luma code in a frame, from every 16th row: enough to see
@@ -1425,6 +1431,12 @@ impl CropFinder {
             .filter(|_| matches!(kind, Kind::Ycbcr(_)))
             .and_then(|b| V210::new(b, info.width, info.height, info.row_bytes));
         let peak = v210.as_ref().map(peak_luma);
+        let pq = matches!(kind, Kind::Ycbcr(c) if c.transfer == Transfer::Pq);
+        let measure = |top, bottom| {
+            v210.as_ref()
+                .filter(|_| self.measure && pq)
+                .and_then(|v| l1::measure(v, top, bottom))
+        };
         // The tunnel: its bars for the detector, in v210's scale (#69), and
         // for the dataset its fingerprint and cuts, while recording (#109).
         let bars = bytes
@@ -1456,6 +1468,7 @@ impl CropFinder {
                 thumb,
                 candidate: false,
                 cut: tunnel_cut,
+                l1: measure(0, 0),
             };
         }
         // A crop belongs to the picture it was found on: held over RGB, a
@@ -1479,6 +1492,7 @@ impl CropFinder {
                 thumb,
                 candidate: false,
                 cut: tunnel_cut,
+                l1: None,
             };
         }
         self.unread = false;
@@ -1512,6 +1526,7 @@ impl CropFinder {
             reading,
             thumb,
             candidate,
+            l1: measure(c.top, c.bottom),
         }
     }
 }
@@ -1663,15 +1678,45 @@ fn pq_peak(hdr: Option<&HdrMetadata>) -> Option<f32> {
     Some(p as f32)
 }
 
+/// An HDR10 title's source range for Dolby's mapping, 12-bit PQ codes: its
+/// mastering display's, or MaxCLL for the top; without either the common
+/// 1000-nit grade, and 0.0001 nits at the bottom (#141).
+fn hdr10_source(hdr: Option<&HdrMetadata>) -> [u16; 2] {
+    let nits = |v: Option<f64>| v.filter(|&n| n > 0.0);
+    let top = hdr
+        .and_then(|h| nits(h.max_mastering).or(nits(h.max_cll)))
+        .unwrap_or(1000.0);
+    let bottom = hdr.and_then(|h| nits(h.min_mastering)).unwrap_or(0.0001);
+    let code = |n: f64| (cinefit_render::dm::pq_oetf(n) * 4095.0).round() as u16;
+    [code(bottom), code(top)]
+}
+
+/// The final render after Dolby's mapping: one to one at the mapped peak, as
+/// the player's low-latency rendering is.
+fn one_to_one(dst: &Target<'_, '_>) -> Mapping {
+    Mapping {
+        src_peak: dst.mapped_nits,
+        dst_peak: dst.mapped_nits,
+        curve: dst.curve,
+        peak_detect: false,
+        contrast_recovery: 0.0,
+        peak_percentile: dst.peak_percentile,
+        knee_offset: 0.0,
+    }
+}
+
 /// The second half: the uploaded frame drawn into the target, with the crop
 /// the detector found for this same frame. `hdr` is the HDR10 metadata in
-/// force for it, carried over frames without a block; `dm` the last tunnel
-/// mapping, kept between frames.
+/// force for it, carried over frames without a block; `hdr10_scene` the
+/// shot's measured L1 for Dolby's mapping, with `output.mode` dolby; `dm` the
+/// last mapping table, kept between frames.
+#[allow(clippy::too_many_arguments)]
 fn draw(
     pl: &Placebo,
     info: &FrameInfo,
     hdr: Option<&HdrMetadata>,
     frame: Prepared<'_, '_>,
+    hdr10_scene: Option<cinefit_render::dm::Scene>,
     dm: &mut DmCache,
     dst: &Target<'_, '_>,
     stages: &mut Stages,
@@ -1708,6 +1753,17 @@ fn draw(
                     dst.mapped_nits,
                 ),
             };
+            // HDR10 into SDR through Dolby's mapping, on the shot's measured
+            // L1 and no trims, then one to one (#141).
+            if let (false, Transfer::Pq, Transfer::Bt1886, Some(scene)) =
+                (lldv, color.transfer, out.transfer, hdr10_scene)
+            {
+                let (frame, built) = dm_frame(dm, scene, dst.mapped_nits);
+                new_table = built;
+                pl.render_ycbcr_dm(p, color, frame, dst.tex, out, view, &one_to_one(dst))?;
+                stages.render.push(ms(t));
+                return Ok(new_table);
+            }
             // HDR into SDR is tone-mapped; anything else only changes space.
             let map =
                 (color.transfer == Transfer::Pq && out.transfer == Transfer::Bt1886).then(|| {
@@ -1736,15 +1792,7 @@ fn draw(
             if let (Transfer::Bt1886, Some(scene)) = (out.transfer, tunnel.dm_scene()) {
                 let (frame, built) = dm_frame(dm, scene, dst.mapped_nits);
                 new_table = built;
-                let map = Mapping {
-                    src_peak: dst.mapped_nits,
-                    dst_peak: dst.mapped_nits,
-                    curve: dst.curve,
-                    peak_detect: false,
-                    contrast_recovery: 0.0,
-                    peak_percentile: dst.peak_percentile,
-                    knee_offset: 0.0,
-                };
+                let map = one_to_one(dst);
                 pl.render_dovi_dm(p, &tunnel.color, frame, dst.tex, out, view, &map)?;
             } else {
                 // No level 1: from the grade's own peak, with peak detection
@@ -2093,6 +2141,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // first frame is the source's.
     let mut sources = Sources::default();
     let mut dm_cache: DmCache = None;
+    // HDR10 through Dolby's mapping (#141): the shot's L1 so far, and the
+    // epoch it belongs to.
+    let mut shot_l1 = l1::Shot::default();
+    let mut shot_epoch = 0;
     let mut stages = Stages::default();
     // Each frame's tag for its GPU runs, and the results taken after it.
     let mut frame_tag = 0u64;
@@ -2120,6 +2172,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         thumbs: cfg.record,
         tunnel_cuts: Default::default(),
         tunnel_epoch: 0,
+        measure: cfg.mode == config::OutputMode::Dolby,
     };
     // The detector's dataset (#91): a session directory, opened on the first
     // frame recorded, so a run with nothing coming in leaves none.
@@ -2180,11 +2233,20 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             let Some(prepared) = prepared else {
                 return Err("the first frame could not be rendered".into());
             };
+            // The first frame alone is its shot so far.
+            let scene = found.l1.map(|f| {
+                cinefit_render::dm::Scene::from_codes(
+                    l1::Shot::default().push(f, true),
+                    hdr10_source(first_info.color.hdr.as_ref()),
+                    vec![],
+                )
+            });
             draw(
                 &pl,
                 &first_info,
                 first_info.color.hdr.as_ref(),
                 prepared,
+                scene,
                 &mut dm_cache,
                 &target(scan.texture(0), out_color, view, &cfg),
                 &mut stages,
@@ -2479,6 +2541,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 match key {
                     "detect.crop" => finder.set_on(cfg.crop),
                     "detect.record" => finder.thumbs = cfg.record,
+                    "output.mode" => finder.measure = cfg.mode == config::OutputMode::Dolby,
                     "geometry.screen_ar" => {
                         win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
                         ui.set_band((win.y, win.h));
@@ -3007,6 +3070,18 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             (t, epoch),
                         )?;
                         noted(&found, &frame_info, t);
+                        let hdr10_scene = found.l1.map(|frame_l1| {
+                            if epoch != shot_epoch {
+                                shot_l1.reset();
+                                shot_epoch = epoch;
+                            }
+                            let codes = shot_l1.push(frame_l1, found.cut);
+                            cinefit_render::dm::Scene::from_codes(
+                                codes,
+                                hdr10_source(hdr_meta.as_ref()),
+                                vec![],
+                            )
+                        });
                         dataset.set_hdr(frame_info.color.hdr, t);
                         dataset.record(cfg.record, &found, t, epoch, content);
                         dataset.keep(&cfg, &found, t, &frame);
@@ -3027,6 +3102,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 &frame_info,
                                 hdr_meta.as_ref(),
                                 prepared,
+                                hdr10_scene,
                                 &mut dm_cache,
                                 &target(scan.texture(free), out_color, view, &cfg),
                                 &mut stages,
@@ -3647,6 +3723,31 @@ mod tests {
 
     use super::*;
 
+    /// An HDR10 title's source range: its mastering display, else MaxCLL for
+    /// the top; without metadata 1000 nits over 0.0001 (#141).
+    #[test]
+    fn an_hdr10_source_range_comes_from_its_metadata() {
+        let code = |n: f64| (cinefit_render::dm::pq_oetf(n) * 4095.0).round() as u16;
+        assert_eq!(hdr10_source(None), [code(0.0001), code(1000.0)]);
+        let mut h = HdrMetadata {
+            red: None,
+            green: None,
+            blue: None,
+            white: None,
+            max_mastering: None,
+            min_mastering: None,
+            max_cll: Some(488.0),
+            max_fall: None,
+        };
+        assert_eq!(hdr10_source(Some(&h)), [code(0.0001), code(488.0)]);
+        h.max_mastering = Some(4000.0);
+        h.min_mastering = Some(0.005);
+        assert_eq!(hdr10_source(Some(&h)), [code(0.005), code(4000.0)]);
+        // Zero is unreported, not black.
+        h.min_mastering = Some(0.0);
+        assert_eq!(hdr10_source(Some(&h))[0], code(0.0001));
+    }
+
     // Frames are put down to what was going on, a GPU result is taken once,
     // and the summary has a block for each situation seen (#219).
     #[test]
@@ -3910,6 +4011,7 @@ mod tests {
             thumbs: false,
             tunnel_cuts: Default::default(),
             tunnel_epoch: 0,
+            measure: false,
         };
         let sdr = Kind::Ycbcr(YcbcrColor {
             matrix: Matrix::Bt2020Nc,
@@ -3998,6 +4100,7 @@ mod tests {
             thumbs: false,
             tunnel_cuts: Default::default(),
             tunnel_epoch: 0,
+            measure: false,
         }
     }
 

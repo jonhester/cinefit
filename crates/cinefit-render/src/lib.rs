@@ -404,15 +404,10 @@ impl Placebo {
 }
 
 /// The passes [`Placebo::take_gpu_results`] times, in its order: the frame's upload,
-/// its unpack on the GPU, the tunnel's decode (Dolby path only), the Dolby
-/// mapping, and the render that scales, converts and writes the output.
-pub const PASSES: [&str; 5] = [
-    "upload",
-    "unpack",
-    "tunnel decode",
-    "Dolby mapping",
-    "output",
-];
+/// its unpack on the GPU, the decode into the Dolby mapping's RGB (the
+/// tunnel's, or HDR10's under `output.mode` dolby), the Dolby mapping, and the
+/// render that scales, converts and writes the output.
+pub const PASSES: [&str; 5] = ["upload", "unpack", "decode", "Dolby mapping", "output"];
 
 /// One GPU result: its pass (a [`PASSES`] index), its time, and the tag of
 /// the run it measured. The render passes (tunnel decode, output) are timed
@@ -882,6 +877,54 @@ impl Placebo {
         place: Option<Rect>,
     ) -> Result<(), Error> {
         self.render_ycbcr_mapped(src, color, dst, dst_color, View::placed(place), None)
+    }
+
+    /// An HDR10 frame (PQ YCbCr planes) through Dolby's display mapping
+    /// (#141): converted to BT.2020 PQ RGB, mapped by `frame`, then cropped
+    /// and placed by `view` as [`Self::render_dovi_dm`] does. `map` is the
+    /// final render's, one to one at the mapped peak.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_ycbcr_dm(
+        &self,
+        src: &GpuPlanes<'_>,
+        color: YcbcrColor,
+        frame: &dm::Frame,
+        dst: &Texture<'_>,
+        dst_color: RgbColor,
+        view: View,
+        map: &Mapping,
+    ) -> Result<(), Error> {
+        let place = Rect::raw(view.dst.as_ref());
+        let src_crop = Rect::raw(view.src.as_ref());
+        let map = map.raw();
+        let dm = frame.raw();
+        let matrix = match color.matrix {
+            Matrix::Bt709 => ffi::MATRIX_BT709,
+            Matrix::Bt2020Nc => ffi::MATRIX_BT2020_NC,
+        };
+        self.owns(src.pl)?;
+        self.owns(dst.pl)?;
+        // SAFETY: `dm` and `map` are structs whose layout the shim shares,
+        // `place` and `src_crop` null or four floats, all read during the
+        // call; the planes and the texture belong to this live device
+        // (checked above).
+        let rc = unsafe {
+            ffi::cf_pl_render_ycbcr_dm(
+                self.handle.as_ptr(),
+                src.raw.as_ptr(),
+                matrix,
+                primaries_raw(color.primaries),
+                transfer_raw(color.transfer),
+                &dm,
+                dst.tex.as_ptr(),
+                primaries_raw(dst_color.primaries),
+                transfer_raw(dst_color.transfer),
+                place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                &map,
+                src_crop.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(Error::Render) }
     }
 
     /// [`render_ycbcr`](Self::render_ycbcr), with a tone mapping into a

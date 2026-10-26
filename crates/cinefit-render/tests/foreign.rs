@@ -100,6 +100,10 @@ fn another_instances_resources_are_refused() {
         b.render_dovi_dm(&planes, &dovi, &frame, ours, out, View::default(), &map),
     );
     foreign(
+        "render_ycbcr_dm",
+        b.render_ycbcr_dm(&planes, ycbcr, &frame, ours, out, View::default(), &map),
+    );
+    foreign(
         "unpack_rgb",
         b.unpack_rgb(&mut src_rgb, &words, 4 * w, rgb::Format::R210),
     );

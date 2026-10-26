@@ -169,6 +169,9 @@ impl fmt::Display for Ratio {
 pub enum OutputMode {
     Sdr2020,
     Passthrough,
+    /// HDR10 through Dolby's display mapping, its L1 measured from the
+    /// picture (#141); out as SDR BT.2020, as sdr2020.
+    Dolby,
 }
 
 impl Default for Config {
@@ -350,25 +353,27 @@ static SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "output.mode",
-        kind: Kind::Choice(&["sdr2020", "passthrough"]),
+        kind: Kind::Choice(&["sdr2020", "passthrough", "dolby"]),
         apply: Apply::Modeset,
         help: "sdr2020: SDR in a BT.2020 container, HDR tone-mapped into tonemap.target_nits; set the display \
-               to an SDR BT.2020 mode. passthrough: HDR10 goes out as HDR10, for the display to map. Dolby \
-               Vision always goes out as SDR BT.2020.",
+               to an SDR BT.2020 mode. passthrough: HDR10 goes out as HDR10, for the display to map. dolby: as \
+               sdr2020, with HDR10 through Dolby's display mapping, its scene levels measured from the picture \
+               shot by shot. Dolby Vision always goes out as SDR BT.2020.",
         get: |c| {
             Value::Name(
                 match c.mode {
                     OutputMode::Sdr2020 => "sdr2020",
                     OutputMode::Passthrough => "passthrough",
+                    OutputMode::Dolby => "dolby",
                 }
                 .into(),
             )
         },
         set: Set::Name(|c, v| {
-            c.mode = if v == "passthrough" {
-                OutputMode::Passthrough
-            } else {
-                OutputMode::Sdr2020
+            c.mode = match v {
+                "passthrough" => OutputMode::Passthrough,
+                "dolby" => OutputMode::Dolby,
+                _ => OutputMode::Sdr2020,
             }
         }),
     },
