@@ -188,19 +188,26 @@ pub fn load(session: &Path, content: Option<&str>) -> Result<Pass, Box<dyn Error
     let thumbs = std::fs::read(session.join("thumbs.bin"))?;
     let mut pass = Pass::default();
     let mut next_thumb = 0;
-    for line in frames.lines().skip(1) {
+    let mut lines = frames.lines();
+    // A session from before the cut column has no cuts to pair by. Told by
+    // its header: a line's length cannot tell it from a session still being
+    // written, whose last line can stop at any field (#291).
+    if !lines
+        .next()
+        .is_some_and(|h| h.split(',').nth(8) == Some("cut"))
+    {
+        return Err(format!(
+            "{}: no cut column in frames.csv (recorded before #109)",
+            session.display()
+        )
+        .into());
+    }
+    for line in lines {
         let f: Vec<&str> = line.split(',').collect();
-        // A session still being written ends mid-line; one from before the
-        // cut column has no cuts to pair by.
-        if f.len() < 9 {
-            if f.len() < 8 {
-                break;
-            }
-            return Err(format!(
-                "{}: no cut column in frames.csv (recorded before #109)",
-                session.display()
-            )
-            .into());
+        // A session still being written ends mid-line, perhaps just before
+        // the cut field.
+        if f.len() < 9 || f[8].is_empty() {
+            break;
         }
         let index: u64 = f[0].parse()?;
         // Read in order whatever the content, to stay in step with
@@ -433,6 +440,41 @@ mod tests {
         // Whatever paired is the same frame of the film.
         assert!(found.pairs.iter().all(|p| p.a == p.b));
         assert!(!found.pairs.is_empty());
+    }
+
+    #[test]
+    fn a_session_still_being_written_loads_up_to_its_last_whole_line() {
+        let dir = std::env::temp_dir().join(format!("cinefit-pairs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("thumbs.bin"), vec![0u8; 2 * THUMB]).unwrap();
+        let header = "index,time,epoch,content,crop_top,crop_bottom,reading,thumb,cut\n";
+        let whole = "0,0.000,1,tunnel,0,0,1,1,1\n1,0.042,1,tunnel,0,0,1,0,0\n";
+        // Cut after each field of the third line, the thumb's among them:
+        // 8 fields is a line still being written, not an old session.
+        let third = "2,0.083,1,tunnel,0,0,1,1,0";
+        for end in (0..third.len()).filter(|&i| third.as_bytes()[i] == b',') {
+            std::fs::write(
+                dir.join("frames.csv"),
+                format!("{header}{whole}{}", &third[..=end]),
+            )
+            .unwrap();
+            let pass = load(&dir, None).unwrap_or_else(|e| panic!("cut at {end}: {e}"));
+            assert_eq!(pass.content.len(), 2, "cut at {end}");
+            assert_eq!(pass.cuts, [0]);
+        }
+        // From before #109: no cut column.
+        std::fs::write(
+            dir.join("frames.csv"),
+            "index,time,epoch,content,crop_top,crop_bottom,reading,thumb\n0,0.000,1,tunnel,0,0,1,1\n",
+        )
+        .unwrap();
+        assert!(
+            load(&dir, None)
+                .unwrap_err()
+                .to_string()
+                .contains("no cut column")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
