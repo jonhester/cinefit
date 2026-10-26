@@ -733,7 +733,16 @@ fn replay_readings(
         |n| n.to_string_lossy().into_owned(),
     );
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let rs: Vec<Reading> = text.lines().filter_map(readings::parse).collect();
+    let (rs, bad) = readings::parse_all(&text);
+    if bad > 0 {
+        // Said, so a file in a format this version does not know is not
+        // taken for one with no readings (#293).
+        eprintln!(
+            "{}: {bad} {} not read as readings, skipped",
+            path.display(),
+            if bad == 1 { "line" } else { "lines" }
+        );
+    }
     let (Some(first), Some(last)) = (rs.first(), rs.last()) else {
         return Ok(None);
     };

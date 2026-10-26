@@ -13,7 +13,21 @@ use cinefit_detect::readings::{self, Reading};
 /// writes `hindsight.csv` there, one line a shot.
 pub fn run(session: &Path, worst: usize) -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(session.join("readings.csv"))?;
-    let readings: Vec<Reading> = text.lines().filter_map(readings::parse).collect();
+    let (readings, bad) = readings::parse_all(&text);
+    let lines = if bad == 1 { "line" } else { "lines" };
+    if bad > 0 && readings.is_empty() {
+        return Err(format!(
+            "{}: no line of readings.csv reads as a reading ({bad} {lines} that do not)",
+            session.display()
+        )
+        .into());
+    }
+    if bad > 0 {
+        eprintln!(
+            "{}: {bad} {lines} of readings.csv not read as readings, skipped",
+            session.display()
+        );
+    }
     let shown = shown_crops(&std::fs::read_to_string(session.join("frames.csv"))?)?;
     // The readings with a frame line, in order. A session still being
     // written can have its newest readings flushed before their lines.
