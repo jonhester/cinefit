@@ -1981,6 +1981,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut last_tunnel = None;
     let started = Instant::now();
     let (mut key, mut stable, mut first) = (None, 0usize, None);
+    // The HDR10 metadata in force at the last frame, carried over the frames
+    // the card sends without it (#61), so the start is chosen from a block
+    // seen earlier in pre-roll when the last frame had none (#279).
+    let (mut pre_meta, mut first_hdr) = (None, None);
     // The format report can trail the first frames, so it is waited for too.
     let has_format = || {
         format
@@ -2002,6 +2006,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             key = Some(k);
             stable = 1;
         }
+        first_hdr = carried_hdr(
+            Content::of(k.kind, cfg.lldv),
+            frame.info().color.hdr,
+            &mut pre_meta,
+        );
         first = Some(frame);
     }
     let reported = *format.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2065,14 +2074,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     info!("mode: {mode}");
     // What the first input is, resolved once (#99).
     let start_content = start.as_ref().map(|s| Content::of(s.0.kind, cfg.lldv));
-    let start_hdr = start.as_ref().and_then(|s| s.1.info().color.hdr);
-    let (hdr, mut out_color) = match (&start, start_content) {
-        (Some((_, first, _)), Some(content)) => output_in(
-            cfg.mode,
-            content,
-            first.info().color.hdr.as_ref(),
-            last_tunnel.as_ref(),
-        ),
+    let start_hdr = start.as_ref().and(first_hdr);
+    let (hdr, mut out_color) = match start_content {
+        Some(content) => output_in(cfg.mode, content, start_hdr.as_ref(), last_tunnel.as_ref()),
         _ => (None, SDR_BT2020),
     };
     match &hdr {
@@ -2308,14 +2312,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     let scene = found.l1.map(|f| {
                         cinefit_render::dm::Scene::from_codes(
                             l1::Shot::default().push(f, true),
-                            hdr10_source(first_info.color.hdr.as_ref()),
+                            hdr10_source(start_hdr.as_ref()),
                             vec![],
                         )
                     });
                     draw(
                         &pl,
                         &first_info,
-                        first_info.color.hdr.as_ref(),
+                        start_hdr.as_ref(),
                         prepared,
                         scene,
                         &mut dm_cache,
@@ -2413,11 +2417,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     match (&start_key, &start_input) {
         (Some(key), Some(input)) => {
             if let Some(b) = banner_for(
-                Content::of(key.kind, opts.config.lldv),
+                Content::of(key.kind, cfg.lldv),
                 (key.width, key.height),
                 rate_mhz(input),
                 size.0,
-                &opts.config,
+                &cfg,
             ) {
                 ui.picture(b, true, now);
             }
@@ -3124,7 +3128,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 (k.width, k.height),
                                 want.rate_mhz,
                                 size.0,
-                                &opts.config,
+                                &cfg,
                             )
                         {
                             let resync = want.mode_key() != policy.committed().mode_key();
@@ -3178,8 +3182,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             )
                         });
                         dataset.set_hdr(hdr_meta, t);
-                        dataset.record(cfg.record, &found, t, epoch, content);
-                        dataset.keep(&cfg, &found, t, &frame);
+                        // The receiver in standby still passes the player's
+                        // signal through: those frames are not a viewing, and
+                        // recording them would open a session the next
+                        // viewing is then appended to (#285).
+                        if standby_since.is_none() {
+                            dataset.record(cfg.record, &found, t, epoch, content);
+                            dataset.keep(&cfg, &found, t, &frame);
+                        }
                         let source = found.source;
                         last_source = source;
                         let view = view_for(
@@ -3246,21 +3256,25 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // A source through a receiver in standby does not light it:
                 // the receiver coming on does, as its frames then ask.
                 let quiet = dark || standby_since.is_some();
-                let want = if quiet {
-                    latest_want = None;
-                    None
-                } else {
-                    latest_want.take()
-                };
                 let unshowable =
                     !quiet && matches!(last_key.map(|k| k.kind), Some(Kind::Unsupported(_)));
-                let want = want.or_else(|| {
-                    (menu.is_open() || cfg.idle_off == 0 || unshowable).then(|| follow::Want {
-                        rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
-                        signal: follow::Signal::Sdr,
-                    })
-                });
-                let Some(a) = want.and_then(|w| policy.wake(&w, now)) else {
+                let action = if quiet || unshowable {
+                    latest_want = None;
+                    let waiting =
+                        (menu.is_open() || cfg.idle_off == 0 || unshowable).then(|| follow::Want {
+                            rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
+                            signal: follow::Signal::Sdr,
+                        });
+                    policy.wake(None, waiting.as_ref(), now)
+                } else {
+                    // A source to follow: its frames light the output once
+                    // they have held, as a change does while it runs (#277).
+                    // A pass between two of them changes nothing.
+                    latest_want
+                        .take()
+                        .and_then(|w| policy.wake(Some(&w), None, now))
+                };
+                let Some(a) = action else {
                     ready = None;
                     continue;
                 };

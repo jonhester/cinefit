@@ -151,8 +151,8 @@ fn is_keyboard(d: &Device) -> bool {
 
 fn run(dir: &Path, pending: &Mutex<Vec<Action>>, stop: &AtomicBool, log: &dyn Fn(String)) {
     let mut devices: Vec<(PathBuf, Device)> = Vec::new();
-    // Nodes looked at and passed over (not keyboards, or not openable), so a
-    // rescan does not reopen them every time; forgotten when they go away.
+    // Nodes opened and passed over as not keyboards, so a rescan does not
+    // reopen them every time; forgotten when they go away.
     let mut passed: HashSet<PathBuf> = HashSet::new();
     let mut scanned: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
@@ -216,12 +216,13 @@ fn scan(
         if passed.contains(&path) || devices.iter().any(|(p, _)| *p == path) {
             continue;
         }
-        // Not a device node (a test's plain file), not readable, or not a
-        // keyboard: passed over until it goes away.
+        // Not openable: tried again at the next rescan. A node just plugged
+        // in is root's until udev gives it the input group a moment later,
+        // and a rescan in that gap must not ignore the remote for good (#287).
         let Ok(mut d) = Device::open(&path) else {
-            passed.insert(path);
             continue;
         };
+        // Not a keyboard: passed over until it goes away.
         if !is_keyboard(&d) || d.set_nonblocking(true).is_err() {
             passed.insert(path);
             continue;
@@ -295,6 +296,21 @@ mod tests {
         ] {
             assert_eq!(on_key(k, 2), None, "held {k:?}");
         }
+    }
+
+    #[test]
+    fn a_node_that_does_not_open_is_tried_again() {
+        let dir = std::env::temp_dir().join(format!("cinefit-input-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named like a node, but not one: it fails to open, as a node does
+        // before udev has set its permissions.
+        std::fs::write(dir.join("event0"), b"").unwrap();
+        let mut devices = Vec::new();
+        let mut passed = HashSet::new();
+        scan(&dir, &mut devices, &mut passed, &|_| {});
+        assert!(devices.is_empty());
+        assert!(passed.is_empty(), "{passed:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

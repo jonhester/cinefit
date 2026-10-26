@@ -54,9 +54,11 @@ namespace {
 // to open in 720p50, a mode no source here sends, to force a format change
 // and so learn the detected flags; that made every open restart the input
 // inside the callback within its first frames, which the C++ version never
-// did. With no signal detected, the C++ version's guess: the card reports
-// the real format when one arrives.
-constexpr BMDDisplayMode kFallbackMode = bmdMode4K2160p2398;
+// did. With no signal detected it still opens in 720p50: the SDK reports only
+// what differs from the enabled mode, so a source arriving in a guessed mode
+// (the C++ version's 2160p23.98 YCbCr) would never be reported at all. The
+// cost is one restart when the signal arrives, which is a change anyway.
+constexpr BMDDisplayMode kFallbackMode = bmdModeHD720p50;
 constexpr BMDPixelFormat kFallbackPixelFormat = bmdFormat10BitYUV;
 
 bool same_iid(REFIID a, REFIID b) { return memcmp(&a, &b, sizeof a) == 0; }

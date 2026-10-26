@@ -939,14 +939,25 @@ impl Output {
         let mut hdr_blob = None;
         match &self.hdr {
             Some(hdr) => {
-                let prop = p
+                let made = p
                     .hdr_metadata
-                    .ok_or(Error::MissingProperty("HDR_OUTPUT_METADATA"))?;
-                let id = blob_id(
-                    self.card
-                        .create_property_blob(&hdr.blob())
-                        .map_err(io("creating the HDR metadata blob"))?,
-                );
+                    .ok_or(Error::MissingProperty("HDR_OUTPUT_METADATA"))
+                    .and_then(|prop| {
+                        self.card
+                            .create_property_blob(&hdr.blob())
+                            .map(|b| (prop, blob_id(b)))
+                            .map_err(io("creating the HDR metadata blob"))
+                    });
+                let (prop, id) = match made {
+                    Ok(made) => made,
+                    Err(e) => {
+                        // The mode blob is already made, and nothing else
+                        // frees it before the fd closes: a refused switch is
+                        // retried, one blob a try (#281).
+                        let _ = self.card.destroy_property_blob(blob);
+                        return Err(e);
+                    }
+                };
                 hdr_blob = Some(id);
                 set.push((conn, prop, id));
                 if let Some(cs) = &p.colorspace
@@ -1118,22 +1129,32 @@ impl Output {
     }
 
     /// Changes the HDR metadata while already in HDR, carried by the next
-    /// [`Self::flip`]. That flip is not allowed to modeset, so if the driver
-    /// would need one for this change, the flip fails instead of the display
-    /// resyncing.
+    /// [`Self::flip`]. Flips are not allowed to modeset, so the change is
+    /// tried first in a test commit without one: a driver that would need a
+    /// modeset for it refuses it here, the display does not resync, and the
+    /// flip never carries it (#278).
     ///
     /// # Errors
     ///
-    /// If the connector has no HDR property, or the blob cannot be created.
+    /// If the connector has no HDR property, the blob cannot be created, or
+    /// the driver refuses the change without a modeset.
     pub fn update_hdr(&mut self, hdr: &HdrStatic) -> Result<(), Error> {
-        if self.props.hdr_metadata.is_none() {
+        let Some(prop) = self.props.hdr_metadata else {
             return Err(Error::MissingProperty("HDR_OUTPUT_METADATA"));
-        }
+        };
         let id = blob_id(
             self.card
                 .create_property_blob(&hdr.blob())
                 .map_err(io("creating the HDR metadata blob"))?,
         );
+        if let Err(e) = commit(
+            &self.card,
+            AtomicCommitFlags::TEST_ONLY,
+            request(&[(self.connector.into(), prop, id)]),
+        ) {
+            let _ = self.card.destroy_property_blob(id);
+            return Err(e);
+        }
         if let Some(old) = self.pending_hdr_blob.replace(id) {
             let _ = self.card.destroy_property_blob(old);
         }

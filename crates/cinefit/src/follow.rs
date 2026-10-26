@@ -131,10 +131,39 @@ impl Policy {
         }
     }
 
-    /// After the output slept (#144): a modeset into what the source wants
-    /// now, at once and even into what was committed before, since nothing
-    /// is lit. A refused one is held off as any refused modeset is.
-    pub fn wake(&self, want: &Want, now: Duration) -> Option<Action> {
+    /// After the output slept (#144): a modeset that lights it, even into
+    /// what was committed before, since nothing is lit. `frame` is what a
+    /// source's frame wants, once a frame: it lights the output once it has
+    /// held for [`STABLE_FRAMES`], as a change does while running, because
+    /// the first frames after a source change can carry the wrong EOTF and
+    /// would cost a second resync (#277). Without a source to follow
+    /// (`frame` `None`), `waiting` is the waiting mode if something calls for
+    /// a picture, and lights at once. A refused modeset is held off as any
+    /// refused modeset is.
+    pub fn wake(
+        &mut self,
+        frame: Option<&Want>,
+        waiting: Option<&Want>,
+        now: Duration,
+    ) -> Option<Action> {
+        let want = match frame {
+            Some(w) => {
+                let key = w.mode_key();
+                let count = match self.mode_candidate {
+                    Some((k, n)) if k == key => n + 1,
+                    _ => 1,
+                };
+                self.mode_candidate = Some((key, count));
+                if count < STABLE_FRAMES {
+                    return None;
+                }
+                w
+            }
+            None => {
+                self.mode_candidate = None;
+                waiting?
+            }
+        };
         let held_off = self
             .refused
             .is_some_and(|(k, at)| k == want.mode_key() && now.saturating_sub(at) < RETRY);
@@ -293,25 +322,57 @@ mod tests {
         assert_eq!(p.committed(), want(FILM, hdr(1000.0)));
     }
 
-    /// #144: waking is a modeset at once, even into the mode committed
-    /// before; a refused wake waits as a refused modeset does.
+    /// #144: waking into the waiting mode is a modeset at once, even into
+    /// the mode committed before; a refused wake waits as a refused modeset
+    /// does.
     #[test]
     fn a_wake_modesets_at_once_and_waits_after_a_refusal() {
         let film = want(FILM, Signal::Sdr);
         let mut p = Policy::new(film);
-        assert_eq!(p.wake(&film, Duration::ZERO), Some(Action::Modeset(film)));
-        p.done(&Action::Modeset(film), false, Duration::ZERO);
-        assert_eq!(p.wake(&film, Duration::from_secs(1)), None);
         assert_eq!(
-            p.wake(&film, RETRY),
+            p.wake(None, Some(&film), Duration::ZERO),
+            Some(Action::Modeset(film))
+        );
+        p.done(&Action::Modeset(film), false, Duration::ZERO);
+        assert_eq!(p.wake(None, Some(&film), Duration::from_secs(1)), None);
+        assert_eq!(
+            p.wake(None, Some(&film), RETRY),
             Some(Action::Modeset(film)),
             "tried again after RETRY"
         );
         // Something else is not held off by the refusal.
         let menu = want(MENU, Signal::Sdr);
         assert_eq!(
-            p.wake(&menu, Duration::from_secs(1)),
+            p.wake(None, Some(&menu), Duration::from_secs(1)),
             Some(Action::Modeset(menu))
+        );
+        assert_eq!(p.wake(None, None, Duration::from_secs(1)), None);
+    }
+
+    /// #277: a source's frames wake the output only once they have held, so
+    /// a title whose first frames read as SDR wakes once, into HDR.
+    #[test]
+    fn a_wake_from_frames_waits_for_them_to_hold() {
+        let film = want(FILM, hdr(1000.0));
+        let mut p = Policy::new(want(MENU, Signal::Sdr));
+        let frame = |i: u32| Duration::from_millis(42 * u64::from(i));
+        for i in 0..3 {
+            assert_eq!(p.wake(Some(&want(FILM, Signal::Sdr)), None, frame(i)), None);
+        }
+        for i in 1..STABLE_FRAMES {
+            assert_eq!(p.wake(Some(&film), None, frame(2 + i)), None, "frame {i}");
+        }
+        let lit = frame(2 + STABLE_FRAMES);
+        assert_eq!(p.wake(Some(&film), None, lit), Some(Action::Modeset(film)));
+        // A refused one waits RETRY, frames or not.
+        p.done(&Action::Modeset(film), false, lit);
+        let again = (1..)
+            .map(|i| lit + frame(i))
+            .find(|&at| p.wake(Some(&film), None, at).is_some())
+            .expect("tried again");
+        assert!(
+            again >= lit + RETRY && again < lit + RETRY + frame(2),
+            "{again:?}"
         );
     }
 }

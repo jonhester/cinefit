@@ -22,6 +22,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use log::{info, warn};
@@ -32,6 +33,11 @@ use crate::config::{self, Apply, Config, Kind};
 
 /// The page, with its style and script, in the binary.
 const PAGE: &str = include_str!("../assets/web/index.html");
+
+/// Requests served at once, each on its own thread. Past this, a request is
+/// answered 503 at once: a client that stalls holds its thread until TCP
+/// gives up on it, and the stalled ones must not add up without bound.
+const IN_FLIGHT: usize = 16;
 
 /// What `play` and the server share.
 #[derive(Default)]
@@ -47,6 +53,8 @@ struct Shared {
     pairing: Mutex<Option<cinefit_atv::pair::PairSetup>>,
     /// Save frame presses not yet taken by `play` (#92).
     saves: Mutex<u32>,
+    /// Requests being served now.
+    busy: AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -78,8 +86,29 @@ impl Web {
         std::thread::Builder::new()
             .name("web".into())
             .spawn(move || {
+                // Each request on a thread of its own: a body or a reply is
+                // read and written on the thread that serves it, and tiny_http
+                // sets no socket timeouts, so a client that stalls mid-request
+                // or stops reading a log (a phone going to sleep) would
+                // otherwise hold the page up for everyone (#286).
                 for request in server.incoming_requests() {
-                    serve(&s, request);
+                    if s.busy.fetch_add(1, Ordering::Relaxed) >= IN_FLIGHT {
+                        s.busy.fetch_sub(1, Ordering::Relaxed);
+                        let _ = request.respond(Response::empty(503));
+                        continue;
+                    }
+                    let t = Arc::clone(&s);
+                    let spawned = std::thread::Builder::new()
+                        .name("web-request".into())
+                        .spawn(move || {
+                            serve(&t, request);
+                            t.busy.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    if spawned.is_err() {
+                        // The request went with the closure: its connection
+                        // is closed.
+                        s.busy.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
             })
             .ok()?;
@@ -606,6 +635,39 @@ mod tests {
         );
         assert!(rebound.contains(" 403 "), "{rebound:.80}");
         assert!(web.take_changes().is_empty());
+    }
+
+    #[test]
+    fn a_stalled_client_does_not_hold_up_the_others() {
+        use std::io::Write;
+        let (port, web) = (0..5)
+            .find_map(|_| {
+                let port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .ok()?
+                    .local_addr()
+                    .ok()?
+                    .port();
+                Web::start(port).map(|w| (port, w))
+            })
+            .expect("serves");
+        web.publish(json!({"pill": "Playing"}), &Config::default());
+        // Headers that promise a body over tiny_http's 1024 bytes, which it
+        // leaves for the serving thread to read, and then nothing.
+        let mut stalled = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stalled
+            .write_all(
+                b"POST /api/set HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2000\r\n\r\n{",
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        c.write_all(b"GET /api/state HTTP/1.0\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        assert!(out.contains(r#""pill":"Playing""#), "{out:?}");
+        drop(stalled);
     }
 
     #[test]
