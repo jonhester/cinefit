@@ -127,7 +127,9 @@ impl Tracker {
                 self.edges
                     .iter()
                     .find(|(_, t, b)| near(*t, d.crop.top) && near(*b, d.crop.bottom))
-                    .map(|(n, _, _)| frame - n)
+                    // A number before the edge's is no latency: not one
+                    // to wrap into a huge one.
+                    .and_then(|(n, _, _)| frame.checked_sub(*n))
             })
             .flatten();
         self.switches.push(Switch {
@@ -801,6 +803,20 @@ mod tests {
                 bottom: 279
             }
         );
+    }
+
+    #[test]
+    fn a_frame_number_going_backwards_gives_no_latency() {
+        let mut t = Tracker::default();
+        let push = |t: &mut Tracker, n: u64, d: &Decision| t.push(n, n as f64 / 24.0, d);
+        push(&mut t, 50, &decision((0, 0), Some((280, 279)), ""));
+        push(
+            &mut t,
+            3,
+            &decision((280, 279), Some((280, 279)), "zoom in (new)"),
+        );
+        assert_eq!(t.switches.len(), 1);
+        assert_eq!(t.switches[0].latency, None);
     }
 
     #[test]

@@ -518,6 +518,8 @@ pub struct ClipFrame {
     /// The frame's place in the source's stream, from the card's stream
     /// time: unlike `index`, it skips the frames a recording dropped. When
     /// any frame of the recording has no usable timing, `index` for all.
+    /// Always increasing: across a format change, where stream time starts
+    /// again, the new run follows on from the last frame before it.
     pub frame_number: u64,
     /// Seconds: the source's stream time for a C++ clip, which trimming
     /// keeps, so a trimmed piece's times are the original clip's; the
@@ -538,7 +540,8 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
     }
     let bad = |n: usize| std::io::Error::other(format!("frames.csv line {n} does not parse"));
     let mut frames = Vec::new();
-    // Each frame's stream slot, where the card's timing gives one.
+    // Each frame's stream slot and frame duration, where the card's timing
+    // gives them.
     let mut slots = Vec::new();
     for (n, line) in text.lines().enumerate().skip(1) {
         let f: Vec<&str> = line.split(',').collect();
@@ -573,7 +576,7 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
         });
         slots.push(match (opt(4)?, opt(5)?) {
             (Some(time), Some(duration)) if time >= 0 && duration > 0 => {
-                Some(time as u64 / duration as u64)
+                Some((time as u64 / duration as u64, duration as u64))
             }
             _ => None,
         });
@@ -581,12 +584,35 @@ pub fn read_index(dir: &Path) -> std::io::Result<Vec<ClipFrame>> {
     // Stream slots only when every frame has one: one frame numbered by its
     // index among slots would move backwards or land on another's slot, and
     // replay and compare take the numbers as one sequence.
-    if let Some(slots) = slots.into_iter().collect::<Option<Vec<u64>>>() {
-        for (f, s) in frames.iter_mut().zip(slots) {
-            f.frame_number = s;
+    if let Some(slots) = slots.into_iter().collect::<Option<Vec<_>>>() {
+        for (f, n) in frames.iter_mut().zip(stream_numbers(&slots)) {
+            f.frame_number = n;
         }
     }
     Ok(frames)
+}
+
+/// Frame numbers from (slot, duration) pairs, one run per stream. A format
+/// change restarts the card's streams, and stream time starts again in the
+/// new mode's units: a slot that does not increase, or a new duration, starts
+/// a run. Each run is numbered on from the last frame of the one before
+/// rather than the whole recording falling back to its indexes: within a run
+/// the slots still show the frames a recording dropped, which compare's
+/// alignment depends on, and the frames lost across the change itself are
+/// unknowable either way.
+fn stream_numbers(slots: &[(u64, u64)]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(slots.len());
+    let mut prev: Option<(u64, u64, u64)> = None;
+    for &(slot, duration) in slots {
+        let n = match prev {
+            None => slot,
+            Some((n, s, d)) if d == duration && slot > s => n.saturating_add(slot - s),
+            Some((n, _, _)) => n.saturating_add(1),
+        };
+        out.push(n);
+        prev = Some((n, slot, duration));
+    }
+    out
 }
 
 /// The largest picture the card delivers, and its bytes at 4 a pixel with
@@ -1334,6 +1360,54 @@ pub(crate) mod tests {
             .map(|f| f.frame_number)
             .collect();
         assert_eq!(numbers, [20, 22, 24]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A recording across a format change: stream time starts again, and then
+    // the rate changes. Each run follows on from the one before, its own
+    // dropped frames still skipped, so the numbers never go backwards or
+    // land on an earlier frame's.
+    #[test]
+    fn stream_time_starting_again_numbers_on_from_the_last_frame() {
+        let dir =
+            std::env::temp_dir().join(format!("cinefit-record-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let timings = [
+            (20 * 1001, 1001),
+            (21 * 1001, 1001),
+            (23 * 1001, 1001),
+            // The streams restart: the same mode, from 0.
+            (0, 1001),
+            (1001, 1001),
+            (3 * 1001, 1001),
+            // A new rate whose slots happen to be later: still a new run.
+            (5 * 1000, 1000),
+            (6 * 1000, 1000),
+        ];
+        let mut csv = format!("{CSV_HEADER}\n");
+        for (k, &(stream_time, duration)) in timings.iter().enumerate() {
+            let item = Item {
+                index: k as u64,
+                at: Duration::from_millis(42 * k as u64),
+                info: FrameInfo {
+                    stream_time: Some(stream_time),
+                    duration: Some(duration),
+                    ..info(16)
+                },
+                buf: Vec::new(),
+                len: 32,
+            };
+            csv += &csv_line(&item, 32 * k as u64, None);
+            csv.push('\n');
+        }
+        std::fs::write(dir.join("frames.csv"), csv).expect("write");
+        let numbers: Vec<u64> = read_index(&dir)
+            .expect("index")
+            .iter()
+            .map(|f| f.frame_number)
+            .collect();
+        assert_eq!(numbers, [20, 21, 23, 24, 25, 27, 28, 29]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
