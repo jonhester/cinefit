@@ -60,11 +60,14 @@ pub fn parse_status(xml: &str) -> Option<(bool, String)> {
 }
 
 /// Power and the input from the text protocol's `PW` and `SI` replies; the
-/// last of each counts. `None` without both.
+/// last of each counts. `None` without both. Only whole lines count: a read
+/// can end mid-line, and `SIB` of `SIBD`, or `PWO` of `PWON`, would read as
+/// another input or as standby (#288).
 pub fn parse_power_input(text: &str) -> Option<(bool, String)> {
     let mut power = None;
     let mut input = None;
-    for line in text.split('\r').map(str::trim) {
+    let whole = text.rfind('\r').map_or("", |end| &text[..end]);
+    for line in whole.split('\r').map(str::trim) {
         if let Some(p) = line.strip_prefix("PW") {
             power = Some(p.eq_ignore_ascii_case("ON"));
         } else if let Some(i) = line.strip_prefix("SI").filter(|i| !i.is_empty()) {
@@ -216,8 +219,8 @@ fn status(host: &str) -> Option<(bool, String)> {
 fn power_input(host: &str) -> Option<(bool, String)> {
     let mut s = connect(host, 23)?;
     s.write_all(b"PW?\rSI?\r").ok()?;
-    // Read until both have answered or the receiver goes quiet; it also
-    // sends unrelated status lines (SV, ZM), which are skipped.
+    // Read until both whole lines have answered or the receiver goes quiet;
+    // it also sends unrelated status lines (SV, ZM), which are skipped.
     let mut text = String::new();
     let mut buf = [0u8; 256];
     let started = Instant::now();
@@ -302,6 +305,13 @@ mod tests {
         assert_eq!(parse_power_input("PWON\rSVOFF\r"), None);
         assert_eq!(parse_power_input("SIBD\r"), None);
         assert_eq!(parse_power_input(""), None);
+        // A read that ends mid-line: the part line waits for the rest.
+        assert_eq!(parse_power_input("PWON\rSIB"), None);
+        assert_eq!(parse_power_input("SIBD\rPWO"), None);
+        assert_eq!(
+            parse_power_input("SIBD\rPWON\rSIM"),
+            Some((true, "BD".to_string()))
+        );
     }
 
     /// Against a real receiver: `CINEFIT_DENON=HOST`. Skipped when unset.
