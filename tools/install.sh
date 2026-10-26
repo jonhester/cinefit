@@ -103,10 +103,12 @@ restart() {
 # would leave current on the binary that failed.
 place() {
     dest="$app/$2"
-    new="$dest/.cinefit.new"
     mkdir -p "$dest"
+    # A name of its own, so two installs into one directory cannot rename
+    # in each other's unchecked copy.
+    new=$(mktemp "$dest/.cinefit.XXXXXX")
     cp "$1" "$new"
-    chmod +x "$new"
+    chmod 755 "$new"
 
     # Everything it links resolves, and libplacebo is inside it: a copy that
     # loaded one from a build tree would break the day that tree changed.
