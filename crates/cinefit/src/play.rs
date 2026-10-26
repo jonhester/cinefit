@@ -1927,10 +1927,17 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     // The settings as they are now: the menu changes them mid-run, and what
     // reads them reads this, each time.
     let mut cfg = opts.config.clone();
-    // The same with the changes that apply when cinefit next starts, which
-    // the web page shows next to its "Applies when cinefit next starts".
-    let mut next_cfg = cfg.clone();
     let (file_path, mut file_cfg) = opts.file.clone();
+    // The same with the changes that apply when cinefit next starts, which
+    // the web page shows next to its "Applies when cinefit next starts":
+    // those come from the file, not from a --set that only this run has.
+    let mut next_cfg = cfg.clone();
+    for s in config::settings()
+        .iter()
+        .filter(|s| s.apply == config::Apply::Start)
+    {
+        let _ = s.put(&mut next_cfg, &s.get(&file_cfg));
+    }
     let run_for = match opts.seconds {
         None => None,
         Some(s) => Some(
