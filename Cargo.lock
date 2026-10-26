@@ -214,7 +214,7 @@ checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
 name = "cinefit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cinefit-atv",
  "cinefit-decklink",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "cinefit-atv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -254,29 +254,29 @@ dependencies = [
 
 [[package]]
 name = "cinefit-decklink"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "cinefit-detect"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "cinefit-dovi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc",
 ]
 
 [[package]]
 name = "cinefit-geometry"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "cinefit-harmony"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "serde_json",
@@ -284,14 +284,14 @@ dependencies = [
 
 [[package]]
 name = "cinefit-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "evdev",
 ]
 
 [[package]]
 name = "cinefit-kms"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "drm",
  "gbm",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "cinefit-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "cinefit-dovi",
