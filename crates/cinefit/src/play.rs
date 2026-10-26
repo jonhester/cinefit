@@ -1103,8 +1103,9 @@ impl Dataset {
         };
         if let (Some(r), Some(px)) = (self.recorder.as_mut(), frame.pixels()) {
             let budget = u64::from(cfg.frames_gb) << 30;
-            r.keep(index, t, frame.info(), px.bytes(), why, budget);
-            if pairing {
+            // Only a frame the clip will hold: pair follow keeps partners
+            // of these, and a partner of a frame never saved is no pair.
+            if r.keep(index, t, frame.info(), px.bytes(), why, budget) && pairing {
                 self.kept.insert(index);
             }
         }

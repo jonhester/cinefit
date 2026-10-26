@@ -169,7 +169,7 @@ impl ClipWriter {
     }
 
     /// No more frames: the writer writes what is queued and closes zstd.
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         drop(
             self.feed
                 .0
@@ -201,8 +201,9 @@ impl ClipFeed {
 
     /// As [`ClipFeed::offer`], under a frame number of the caller's: the
     /// dataset keeps a few frames of many, numbered as its readings are
-    /// (#91).
-    pub fn offer_as(&self, index: u64, at: Duration, info: &FrameInfo, bytes: &[u8]) {
+    /// (#91). Returns whether the frame was queued for writing, so the
+    /// dataset lists only frames the clip will hold.
+    pub fn offer_as(&self, index: u64, at: Duration, info: &FrameInfo, bytes: &[u8]) -> bool {
         let mut buf = {
             let mut free = self.0.free.lock().unwrap_or_else(PoisonError::into_inner);
             match free.pop() {
@@ -218,7 +219,7 @@ impl ClipFeed {
                 }
                 None => {
                     self.0.dropped.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    return false;
                 }
             }
         };
@@ -236,6 +237,7 @@ impl ClipFeed {
         if !sent {
             self.0.dropped.fetch_add(1, Ordering::Relaxed);
         }
+        sent
     }
 }
 
@@ -1196,6 +1198,10 @@ pub(crate) mod tests {
         let r = w.finish().expect("finish");
         assert_eq!((r.written, r.dropped), (3, 0));
         feed.offer(Duration::from_secs(1), &info(16), &[9; 32]);
+        assert!(
+            !feed.offer_as(9, Duration::from_secs(1), &info(16), &[9; 32]),
+            "a frame offered with the writer gone says it was not queued"
+        );
         assert_eq!(read_index(&dir).expect("index").len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }

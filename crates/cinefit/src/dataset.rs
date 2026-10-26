@@ -286,7 +286,9 @@ impl Recorder {
     /// drops it (counted) rather than wait. Within `budget` bytes for the
     /// kept frames of every session: the first keep of a session makes room
     /// by deleting the oldest sessions' (on a thread of its own), and a
-    /// session that alone reaches it keeps no more.
+    /// session that alone reaches it keeps no more. Returns whether the
+    /// frame was queued for the clip: only those are listed in `kept.csv`,
+    /// which pairing trusts.
     pub fn keep(
         &mut self,
         index: u64,
@@ -295,9 +297,9 @@ impl Recorder {
         bytes: &[u8],
         why: &str,
         budget: u64,
-    ) {
+    ) -> bool {
         if budget == 0 {
-            return;
+            return false;
         }
         if self.keeper.is_none() {
             let dir = self.dir.join("frames");
@@ -315,7 +317,7 @@ impl Recorder {
                 Ok(k) => self.keeper = Some(k),
                 Err(e) => {
                     warn!("dataset: no full frames this session: {e}");
-                    return;
+                    return false;
                 }
             }
             if let Some(caught) = self.dir.parent().map(Path::to_path_buf) {
@@ -332,10 +334,10 @@ impl Recorder {
             }
         }
         let Some(k) = self.keeper.as_mut() else {
-            return;
+            return false;
         };
         if k.full {
-            return;
+            return false;
         }
         // The clip's size as written so far: a cheap look, before each keep.
         // What zstd still holds is not on disk yet, so the budget can be
@@ -344,15 +346,21 @@ impl Recorder {
         if size + bytes.len() as u64 > budget {
             k.full = true;
             info!("dataset: this session's kept frames reached the budget; no more kept");
-            return;
+            return false;
         }
-        k.clip
+        // A frame the writer had no room for is counted there, not listed.
+        if !k
+            .clip
             .feed()
-            .offer_as(index, Duration::from_secs_f64(time.max(0.0)), info, bytes);
+            .offer_as(index, Duration::from_secs_f64(time.max(0.0)), info, bytes)
+        {
+            return false;
+        }
         // At once: a few lines a minute, and a look at a pass still running
         // (cinefit pairs) should see them.
         let _ = writeln!(k.why, "{index},{time:.3},{why}").and_then(|()| k.why.flush());
         k.kept += 1;
+        true
     }
 
     /// Ends the session: the writer drains its queue and closes the files.
@@ -371,7 +379,7 @@ impl Recorder {
         if let Some(mut k) = self.keeper.take() {
             k.why.flush()?;
             let r = k.clip.finish()?;
-            (kept, kept_dropped) = (k.kept.saturating_sub(r.dropped), r.dropped);
+            (kept, kept_dropped) = (k.kept, r.dropped);
         }
         Ok(Summary {
             dir: self.dir.clone(),
@@ -689,14 +697,14 @@ mod tests {
         let mut r = Recorder::start(dir.clone()).unwrap();
         let info = crate::record::tests::info(16);
         let (a, b) = (vec![1u8; 32], vec![2u8; 32]);
-        r.keep(7, 0.29, &info, &a, "crop change", 1 << 30);
-        r.keep(42, 1.75, &info, &b, "sample", 1 << 30);
+        assert!(r.keep(7, 0.29, &info, &a, "crop change", 1 << 30));
+        assert!(r.keep(42, 1.75, &info, &b, "sample", 1 << 30));
         // A budget the next frame alone would cross: not kept, and the
         // session keeps no more even under a larger one. (What zstd has not
         // yet written is not counted, so a budget is overshot by at most a
         // few frames; here nothing is on disk yet, so smaller than a frame.)
-        r.keep(43, 1.79, &info, &b, "sample", 31);
-        r.keep(44, 1.83, &info, &b, "sample", 1 << 30);
+        assert!(!r.keep(43, 1.79, &info, &b, "sample", 31));
+        assert!(!r.keep(44, 1.83, &info, &b, "sample", 1 << 30));
         let s = r.finish().unwrap();
         assert_eq!((s.kept, s.kept_dropped), (2, 0));
 
@@ -720,6 +728,37 @@ mod tests {
             why,
             "index,time,why\n7,0.290,crop change\n42,1.750,sample\n"
         );
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// A frame the clip writer drops is not listed in kept.csv, which pairs
+    /// trust, nor counted as kept: here the writer has stopped.
+    #[test]
+    fn a_frame_the_clip_dropped_is_not_listed_as_kept() {
+        if std::process::Command::new("zstd")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("zstd not installed: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("cinefit-keep-drop-{}", std::process::id()))
+            .join("20261015-030000");
+        let _ = fs::remove_dir_all(&dir);
+        let mut r = Recorder::start(dir.clone()).unwrap();
+        let info = crate::record::tests::info(16);
+        assert!(r.keep(7, 0.29, &info, &[1u8; 32], "sample", 1 << 30));
+        r.keeper.as_ref().unwrap().clip.close();
+        assert!(!r.keep(8, 0.33, &info, &[2u8; 32], "sample", 1 << 30));
+        let s = r.finish().unwrap();
+        assert_eq!((s.kept, s.kept_dropped), (1, 1));
+        let frames = dir.join("frames");
+        let index = crate::record::read_index(&frames).unwrap();
+        assert_eq!(index.iter().map(|f| f.index).collect::<Vec<_>>(), [7]);
+        let why = fs::read_to_string(frames.join("kept.csv")).unwrap();
+        assert_eq!(why, "index,time,why\n7,0.290,sample\n");
         let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
