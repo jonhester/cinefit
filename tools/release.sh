@@ -41,5 +41,11 @@ git commit -q -am "release $new"
 git tag -a "v$new" -m "cinefit $new"
 # Atomic: if main is refused (a merge landed since the fetch), the tag is
 # refused with it, rather than publishing a release from a commit not on main.
-git push --atomic -q origin main "v$new"
+# Refused or not sent, the local commit and tag are undone, so the next run
+# starts again from origin/main (the tree was clean before the bump).
+if ! git push --atomic -q origin main "v$new"; then
+    git tag -d "v$new" >/dev/null
+    git reset -q --hard HEAD^
+    die "push refused; the release commit and tag were undone here"
+fi
 echo "released $old -> $new: the release workflow builds and publishes v$new"
