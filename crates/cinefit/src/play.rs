@@ -1981,6 +1981,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut last_tunnel = None;
     let started = Instant::now();
     let (mut key, mut stable, mut first) = (None, 0usize, None);
+    // The HDR10 metadata in force at the last frame, carried over the frames
+    // the card sends without it (#61), so the start is chosen from a block
+    // seen earlier in pre-roll when the last frame had none (#279).
+    let (mut pre_meta, mut first_hdr) = (None, None);
     // The format report can trail the first frames, so it is waited for too.
     let has_format = || {
         format
@@ -2002,6 +2006,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
             key = Some(k);
             stable = 1;
         }
+        first_hdr = carried_hdr(
+            Content::of(k.kind, cfg.lldv),
+            frame.info().color.hdr,
+            &mut pre_meta,
+        );
         first = Some(frame);
     }
     let reported = *format.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2065,14 +2074,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     info!("mode: {mode}");
     // What the first input is, resolved once (#99).
     let start_content = start.as_ref().map(|s| Content::of(s.0.kind, cfg.lldv));
-    let start_hdr = start.as_ref().and_then(|s| s.1.info().color.hdr);
-    let (hdr, mut out_color) = match (&start, start_content) {
-        (Some((_, first, _)), Some(content)) => output_in(
-            cfg.mode,
-            content,
-            first.info().color.hdr.as_ref(),
-            last_tunnel.as_ref(),
-        ),
+    let start_hdr = start.as_ref().and(first_hdr);
+    let (hdr, mut out_color) = match start_content {
+        Some(content) => output_in(cfg.mode, content, start_hdr.as_ref(), last_tunnel.as_ref()),
         _ => (None, SDR_BT2020),
     };
     match &hdr {
@@ -2308,14 +2312,14 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                     let scene = found.l1.map(|f| {
                         cinefit_render::dm::Scene::from_codes(
                             l1::Shot::default().push(f, true),
-                            hdr10_source(first_info.color.hdr.as_ref()),
+                            hdr10_source(start_hdr.as_ref()),
                             vec![],
                         )
                     });
                     draw(
                         &pl,
                         &first_info,
-                        first_info.color.hdr.as_ref(),
+                        start_hdr.as_ref(),
                         prepared,
                         scene,
                         &mut dm_cache,
