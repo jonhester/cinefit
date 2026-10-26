@@ -3181,7 +3181,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 vec![],
                             )
                         });
-                        dataset.set_hdr(frame_info.color.hdr, t);
+                        dataset.set_hdr(hdr_meta, t);
                         // The receiver in standby still passes the player's
                         // signal through: those frames are not a viewing, and
                         // recording them would open a session the next
