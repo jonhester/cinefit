@@ -56,7 +56,8 @@ pub fn pq_to_nits(code: u16) -> f64 {
 /// values arrive padded to 10 bits, so the top 8 bits of each are the data.
 pub fn r210_parity(bytes: &[u8], width: usize, row_bytes: usize) -> impl Fn(usize) -> Option<bool> {
     move |i| {
-        let (y, x) = (i / width, i % width);
+        // A frame of width 0 has no bits; dividing by it panicked (#294).
+        let (y, x) = (i.checked_div(width)?, i.checked_rem(width)?);
         let o = y.checked_mul(row_bytes)?.checked_add(x * 4)?;
         let w = u32::from_be_bytes(bytes.get(o..o + 4)?.try_into().ok()?);
         let rgb = (w >> 22) ^ (w >> 12) ^ (w >> 2);
@@ -71,7 +72,7 @@ pub fn argb8_parity(
     row_bytes: usize,
 ) -> impl Fn(usize) -> Option<bool> {
     move |i| {
-        let (y, x) = (i / width, i % width);
+        let (y, x) = (i.checked_div(width)?, i.checked_rem(width)?);
         let o = y.checked_mul(row_bytes)?.checked_add(x * 4)?;
         let px = bytes.get(o..o + 4)?;
         Some((px[1] ^ px[2] ^ px[3]).count_ones() % 2 == 1)
@@ -84,6 +85,13 @@ mod tests {
 
     fn r210(r: u32, g: u32, b: u32) -> [u8; 4] {
         (r << 20 | g << 10 | b).to_be_bytes()
+    }
+
+    #[test]
+    fn a_frame_of_width_zero_has_no_bits() {
+        let bytes = [0xFFu8; 64];
+        assert_eq!(r210_parity(&bytes, 0, 16)(0), None);
+        assert_eq!(argb8_parity(&bytes, 0, 16)(5), None);
     }
 
     #[test]
