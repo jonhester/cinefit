@@ -99,7 +99,9 @@ struct Switch {
     to: Crop,
     reason: &'static str,
     /// Zoom-ins only: frames from the first frame since the previous change
-    /// whose measured edges matched the new crop (within 2 rows) to the
+    /// whose measured edges matched the new crop (within 2 rows, or up to the
+    /// policy's `widen_max` deeper: a return to a remembered height lands on
+    /// its wide rows while the clip's opening frames read deep) to the
     /// change. `None` when no frame showed them.
     latency: Option<u64>,
 }
@@ -121,7 +123,8 @@ impl Tracker {
             return;
         }
         let zoom_in = d.crop.top + d.crop.bottom > self.crop.top + self.crop.bottom;
-        let near = |e: Option<u32>, c: u32| e.is_some_and(|e| e.abs_diff(c) <= 2);
+        let near =
+            |e: Option<u32>, c: u32| e.is_some_and(|e| c.saturating_sub(2) <= e && e <= c + 8);
         let latency = zoom_in
             .then(|| {
                 self.edges
@@ -812,6 +815,22 @@ mod tests {
                 bottom: 279
             }
         );
+    }
+
+    #[test]
+    fn a_return_landing_on_the_wide_rows_counts_from_the_deep_reading() {
+        let mut t = Tracker::default();
+        let push = |t: &mut Tracker, n: u64, d: &Decision| t.push(n, n as f64 / 24.0, d);
+        push(&mut t, 0, &decision((0, 0), None, ""));
+        // The clip opens reading 4 rows deep; the crop lands on the wide rows
+        // the height is remembered at.
+        push(&mut t, 1, &decision((0, 0), Some((276, 276)), ""));
+        push(
+            &mut t,
+            2,
+            &decision((272, 272), Some((275, 275)), "zoom in (recent)"),
+        );
+        assert_eq!(t.switches[0].latency, Some(1));
     }
 
     #[test]

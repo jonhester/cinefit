@@ -210,7 +210,15 @@ pub struct Share {
 const STANDARD: [f64; 9] = [1.85, 1.90, 2.00, 2.20, 2.35, 2.39, 2.40, 2.55, 2.76];
 
 struct Known {
+    /// The widest rows the height has shown: what a return lands on.
     rows: Crop,
+    /// The deepest rows it has read, at most `widen_max` inside `rows`. A
+    /// scaled clip opens from black with its matte read 3-4 rows deep for
+    /// half a second, then fills out (Top Gun featurettes: 275/275, then
+    /// 272/272 on every scope clip). Remembering only the wide rows made
+    /// each return a never-seen height, 3 rows past `tol_match`, and the
+    /// crop waited for a new height's evidence on every clip.
+    tight: Crop,
     last_on_screen: f64,
     penalised_until: f64,
 }
@@ -323,8 +331,28 @@ impl ArPolicy {
         a.top.abs_diff(b.top) <= t && a.bottom.abs_diff(b.bottom) <= t
     }
 
+    /// A height is a range of rows, from the widest it has shown to the
+    /// deepest it has read: a frame within `tol_match` of either, or between
+    /// them, is that height.
     fn find_known(&self, rows: Crop) -> Option<usize> {
-        self.known.iter().position(|k| self.same(k.rows, rows))
+        let t = self.tol(self.p.tol_match);
+        let within = |wide: u32, tight: u32, x: u32| wide.saturating_sub(t) <= x && x <= tight + t;
+        self.known.iter().position(|k| {
+            within(k.rows.top, k.tight.top, rows.top)
+                && within(k.rows.bottom, k.tight.bottom, rows.bottom)
+        })
+    }
+
+    /// A frame of known height `i` read at `rows`: the height remembers how
+    /// deep it read, never more than `widen_max` inside its wide rows, so a
+    /// dark scene's edge creeping into the picture cannot stretch the height
+    /// a frame at a time. Its wide rows move only where they did before: a
+    /// zoom-in to it, or a matte opening; a frame a row wider is noise.
+    fn remember(&mut self, i: usize, rows: Crop) {
+        let cap = self.tol(self.p.widen_max);
+        let k = &mut self.known[i];
+        k.tight.top = k.tight.top.max(rows.top).min(k.rows.top + cap);
+        k.tight.bottom = k.tight.bottom.max(rows.bottom).min(k.rows.bottom + cap);
     }
 
     fn near_standard(&self, rows: Crop, within: u32) -> bool {
@@ -621,7 +649,14 @@ impl ArPolicy {
                 top: o.top.bar,
                 bottom: o.bottom.bar,
             };
-            if self.pending_confirm && self.same(rows, self.crop) {
+            let k = self.find_known(rows);
+            if let Some(i) = k {
+                self.remember(i, rows);
+            }
+            // The crop's own height, read exactly or anywhere it has read
+            // before (a scaled clip's opening frames read deep).
+            let at_crop = k.is_some_and(|i| self.same(self.known[i].rows, self.crop));
+            if self.pending_confirm && (at_crop || self.same(rows, self.crop)) {
                 self.pending_confirm = false;
             }
 
@@ -632,8 +667,9 @@ impl ArPolicy {
             });
             // At the current crop or taller: nothing to do. After a widen, a
             // frame up to intrude_max a side inside the crop is the same
-            // picture measured tight, not a new height to zoom in to.
-            if rows.active(self.height) + slack >= self.crop.active(self.height) {
+            // picture measured tight, not a new height to zoom in to; so is
+            // any frame the crop's own height has read before.
+            if at_crop || rows.active(self.height) + slack >= self.crop.active(self.height) {
                 self.candidate = None;
                 self.nonstd = None;
             } else if t - self.last_ui < self.p.ui_hold_s {
@@ -645,11 +681,18 @@ impl ArPolicy {
                 self.candidate = None;
                 self.nonstd = None;
             } else {
-                let k = self.find_known(rows);
+                let continuing = self
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|c| self.same(c.rows, rows));
                 // A height near no standard ratio is held to a stricter test
                 // (nonstd_s, nonstd_cuts): that is what rejects a menu whose
-                // dark edges look letterboxed at an arbitrary height.
-                if k.is_none() && !self.near_standard(rows, self.tol(self.p.tol_ar)) {
+                // dark edges look letterboxed at an arbitrary height. A
+                // candidate already counting is not dropped at the band's
+                // edge: a reading that jitters a row across it (265/265 to
+                // 265/266 on a 2.356:1 clip, twice in 1.8 s) started over.
+                if k.is_none() && !continuing && !self.near_standard(rows, self.tol(self.p.tol_ar))
+                {
                     self.candidate = None;
                     let held = self
                         .nonstd
@@ -674,6 +717,7 @@ impl ArPolicy {
                         self.crop = rows;
                         self.known.push(Known {
                             rows: self.crop,
+                            tight: self.crop,
                             last_on_screen: t,
                             penalised_until: -1.0,
                         });
@@ -686,10 +730,6 @@ impl ArPolicy {
                     }
                 } else {
                     self.nonstd = None;
-                    let continuing = self
-                        .candidate
-                        .as_ref()
-                        .is_some_and(|c| self.same(c.rows, rows));
                     match &mut self.candidate {
                         Some(c) if continuing => c.streak += 1,
                         _ => {
@@ -726,7 +766,8 @@ impl ArPolicy {
                         // out, and it flapped until the picture was far enough
                         // off to count as new. So the known height widens to
                         // contain the frame, and keeps the wider rows: at
-                        // worst a row of bar shows.
+                        // worst a row of bar shows. A frame reading deeper
+                        // than the wide rows lands on them, not on itself.
                         self.crop = match k {
                             Some(i) => {
                                 let kr = &mut self.known[i].rows;
@@ -737,6 +778,7 @@ impl ArPolicy {
                             None => {
                                 self.known.push(Known {
                                     rows,
+                                    tight: rows,
                                     last_on_screen: t,
                                     penalised_until: -1.0,
                                 });
@@ -954,6 +996,54 @@ mod tests {
             "never-seen height: several frames, under 0.5 s bright ({at})"
         );
         assert_eq!(r.changes, 1, "one switch in a minute");
+    }
+
+    // A scaled scope clip opens from black reading 275/275, then fills out
+    // to 272/272 (Top Gun featurettes). The height is remembered as that
+    // range, so the next clip's deep opening frame is recent, and lands on
+    // the wide rows.
+    #[test]
+    fn a_height_read_deep_on_its_opening_frames_is_still_recent() {
+        let mut r = Run::new();
+        let (deep, wide) = (crop(275, 275), crop(272, 272));
+        r.learn(deep);
+        r.feed(&letterbox(wide), 12);
+        assert_eq!(r.p.crop(), wide, "widened to the picture");
+        r.feed(&full(), 48);
+        assert_eq!(r.p.crop(), FULL);
+        let d = r.push(&letterbox(deep));
+        assert!(d.changed, "return on the deep reading: first frame");
+        assert_eq!(r.p.crop(), wide, "on the wide rows, not the deep ones");
+        assert_eq!(d.diag.reason, "zoom in (recent)");
+        let d = r.push(&letterbox(deep));
+        assert!(
+            !d.changed && d.diag.candidate.is_none(),
+            "the crop's own height, read deep"
+        );
+        // Deeper than widen_max inside: another height.
+        r.feed(&full(), 48);
+        let d = r.push(&letterbox(crop(281, 281)));
+        assert!(!d.changed, "9 rows inside is not the same height");
+    }
+
+    // 265/265 (2.356:1) is 4 rows from 2.35, at the standard band's edge;
+    // 265/266 is 5, outside it. A row of jitter across the edge must not
+    // start the evidence over: a soft-edged clip in a Top Gun featurette did
+    // that twice in 1.8 s and was never cropped.
+    #[test]
+    fn a_candidate_survives_a_row_of_jitter_across_the_band() {
+        let mut r = Run::new();
+        r.feed(&letterbox_s(crop(265, 265), 0.5), 4);
+        let before = r.last.diag.candidate.expect("counting").evidence;
+        r.push(&letterbox_s(crop(265, 266), 0.5));
+        let after = r.last.diag.candidate.expect("still counting").evidence;
+        assert!(after > before, "{after} > {before}");
+        r.feed(&letterbox_s(crop(265, 265), 0.5), 24);
+        assert_eq!(
+            r.p.crop(),
+            crop(265, 265),
+            "adopted as new, on evidence alone"
+        );
     }
 
     #[test]
