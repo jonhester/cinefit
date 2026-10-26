@@ -463,10 +463,14 @@ struct Stages {
     detect_tunnel: Times,
     detect_v210: Times,
     detect_and_upload: Times,
-    /// GPU time per pass ([`cinefit_render::PASSES`]), with `--gpu-timers`;
-    /// the results already taken, by count.
+    /// GPU time per pass ([`cinefit_render::PASSES`]), with `--gpu-timers`,
+    /// every result once; and the runs timing could not follow.
     gpu: [Times; 5],
-    gpu_taken: [u64; 5],
+    gpu_losses: cinefit_render::GpuLosses,
+    /// The last frames drawn, by tag, and what was going on at each: a GPU
+    /// result comes in a frame or two after its run, and is put down to the
+    /// frame it measured, not the one drawn when it came in (#263).
+    recent: std::collections::VecDeque<(u64, Situation)>,
     /// The same, by what was going on (#219), and the flips missed in each.
     by: [Split; 3],
 }
@@ -514,10 +518,26 @@ struct Split {
     gpu: [Times; 5],
 }
 
+/// Frames whose situation is remembered for their GPU results to find: far
+/// more than results lag, which is a frame or two.
+const RECENT_FRAMES: usize = 64;
+
 impl Stages {
     /// A frame drawn, under what was going on: its stage times (the latest
-    /// pushed, this frame's) and any GPU results new since the last.
-    fn frame_done(&mut self, situation: Situation, gpu: Option<cinefit_render::GpuTimes>) {
+    /// pushed, this frame's), and the GPU results new since the last, each put
+    /// down to the frame its run was tagged with. A result without a tag (the
+    /// render passes, timed inside libplacebo) counts only in the totals.
+    fn frame_done(
+        &mut self,
+        tag: u64,
+        situation: Situation,
+        gpu: &[cinefit_render::GpuResult],
+        losses: cinefit_render::GpuLosses,
+    ) {
+        if self.recent.len() == RECENT_FRAMES {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((tag, situation));
         let s = &mut self.by[situation as usize];
         s.frames += 1;
         for (from, to) in [
@@ -529,15 +549,16 @@ impl Stages {
                 to.push(v);
             }
         }
-        if let Some(g) = gpu {
-            for i in 0..5 {
-                if g.count[i] > self.gpu_taken[i] {
-                    self.gpu_taken[i] = g.count[i];
-                    self.gpu[i].push(g.ms[i]);
-                    s.gpu[i].push(g.ms[i]);
-                }
+        for r in gpu {
+            self.gpu[r.pass].push(r.ms);
+            let of = r
+                .tag
+                .and_then(|t| self.recent.iter().find(|(tag, _)| *tag == t));
+            if let Some(&(_, at)) = of {
+                self.by[at as usize].gpu[r.pass].push(r.ms);
             }
         }
+        self.gpu_losses = losses;
     }
 
     /// The end-of-run lines for the GPU passes and each situation (#219).
@@ -553,6 +574,15 @@ impl Stages {
         };
         if gpu {
             passes(&self.gpu, &mut lines, "");
+            let l = self.gpu_losses;
+            for (i, pass) in cinefit_render::PASSES.iter().enumerate() {
+                let (d, u, a) = (l.dropped[i], l.untimed[i], l.unanswered[i]);
+                if d + u + a > 0 {
+                    lines.push(format!(
+                        "GPU {pass} runs not followed: {d} results dropped, {u} untimed (no free timer), {a} timers unanswered"
+                    ));
+                }
+            }
         }
         for situation in Situation::ALL {
             let s = &self.by[situation as usize];
@@ -2064,6 +2094,9 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     let mut sources = Sources::default();
     let mut dm_cache: DmCache = None;
     let mut stages = Stages::default();
+    // Each frame's tag for its GPU runs, and the results taken after it.
+    let mut frame_tag = 0u64;
+    let mut gpu_results = Vec::new();
 
     // The bar detector reads each YCbCr frame on this thread (about 8 ms at
     // 2160p) and its crop goes to the geometry: the picture at constant
@@ -2955,6 +2988,10 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         // each return of the signal, is a new epoch for the
                         // detector, which forgets what it learned.
                         let started = Instant::now();
+                        frame_tag += 1;
+                        if gpu_timers {
+                            pl.set_gpu_tag(frame_tag);
+                        }
                         let t = run_started.elapsed().as_secs_f64();
                         let frame_info = *frame.info();
                         let epoch = epochs.now();
@@ -2996,7 +3033,13 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                             )?;
                             ready_situation =
                                 Situation::of(new_table, menu.is_open() || ui.info_open());
-                            stages.frame_done(ready_situation, gpu_timers.then(|| pl.gpu_times()));
+                            let losses = if gpu_timers {
+                                pl.take_gpu_results(&mut gpu_results)
+                            } else {
+                                cinefit_render::GpuLosses::default()
+                            };
+                            stages.frame_done(frame_tag, ready_situation, &gpu_results, losses);
+                            gpu_results.clear();
                             ready = Some(free);
                             ui.set_slate(None);
                             if let Some(r) = stages.render.last() {
@@ -3611,35 +3654,88 @@ mod tests {
         assert_eq!(Situation::of(false, false), Situation::Steady);
         assert_eq!(Situation::of(true, false), Situation::NewTable);
         assert_eq!(Situation::of(true, true), Situation::Overlay);
-        let mut stages = Stages::default();
-        let gpu = |count: u64, ms: f64| cinefit_render::GpuTimes {
-            ms: [0.0, 0.5, 0.0, 0.0, ms],
-            count: [0, count, 0, 0, count],
+        use cinefit_render::{GpuLosses, GpuResult};
+        let unpack = |tag: u64, ms: f64| GpuResult {
+            pass: 1,
+            ms,
+            tag: Some(tag),
         };
+        let output = |ms: f64| GpuResult {
+            pass: 4,
+            ms,
+            tag: None,
+        };
+        let none = GpuLosses::default();
+        let mut stages = Stages::default();
         stages.render.push(4.0);
-        stages.frame_done(Situation::Steady, Some(gpu(1, 2.0)));
-        // The same result read again is not a second one.
-        stages.frame_done(Situation::Steady, Some(gpu(1, 2.0)));
+        stages.frame_done(1, Situation::Steady, &[], none);
+        stages.frame_done(2, Situation::Steady, &[unpack(1, 0.5), output(2.0)], none);
         stages.render.push(9.0);
-        stages.frame_done(Situation::NewTable, Some(gpu(2, 6.0)));
+        // Frame 2's slow unpack comes in at the scene change: it is frame 2's,
+        // and so steady's, not the scene change's (#263).
+        stages.frame_done(3, Situation::NewTable, &[unpack(2, 7.0)], none);
         stages.by[Situation::NewTable as usize].missed += 1;
-        assert_eq!(stages.gpu[4].count(), 2);
-        assert_eq!(stages.by[Situation::Steady as usize].frames, 2);
-        assert_eq!(stages.by[Situation::Steady as usize].gpu[4].count(), 1);
+        // Results that came in together after a stall are each kept: the
+        // spike among them too.
+        stages.frame_done(
+            4,
+            Situation::Steady,
+            &[unpack(3, 0.6), output(2.0), output(30.0), unpack(4, 0.5)],
+            GpuLosses {
+                untimed: [1, 0, 0, 0, 0],
+                ..none
+            },
+        );
+        let steady = &stages.by[Situation::Steady as usize];
+        assert_eq!(steady.frames, 3);
+        assert_eq!(steady.gpu[1].count(), 3, "frames 1, 2 and 4's unpacks");
+        let table = &stages.by[Situation::NewTable as usize];
+        assert_eq!(table.gpu[1].count(), 1, "frame 3's unpack");
+        assert_eq!(stages.gpu[1].count(), 4);
+        // Untagged render results: in the totals only, every one of them.
+        assert_eq!(stages.gpu[4].count(), 3);
+        assert!(
+            Situation::ALL
+                .iter()
+                .all(|&s| stages.by[s as usize].gpu[4].count() == 0)
+        );
         let lines = stages.split_lines(true);
         let text = lines.join("\n");
-        assert!(text.contains("steady: 2 frames, 0 flips missed"), "{text}");
+        assert!(text.contains("steady: 3 frames, 0 flips missed"), "{text}");
         assert!(
             text.contains("a new Dolby table (a scene change): 1 frames, 1 flips missed"),
             "{text}"
         );
         assert!(text.contains("GPU output: median"), "{text}");
+        assert!(
+            text.contains("GPU upload runs not followed: 0 results dropped, 1 untimed"),
+            "{text}"
+        );
         assert!(!text.contains("menu or info panel"), "{text}");
         let off = stages.split_lines(false).join("\n");
         assert!(
             !off.contains("GPU output") && !off.contains("GPU unpack"),
             "no timers, no GPU pass lines: {off}"
         );
+    }
+
+    /// A result whose frame has left the recent ones still counts in the
+    /// totals, under no situation.
+    #[test]
+    fn a_result_too_late_for_its_frame_counts_in_the_totals() {
+        let mut stages = Stages::default();
+        let none = cinefit_render::GpuLosses::default();
+        for tag in 1..=RECENT_FRAMES as u64 + 1 {
+            stages.frame_done(tag, Situation::Steady, &[], none);
+        }
+        let late = cinefit_render::GpuResult {
+            pass: 0,
+            ms: 1.0,
+            tag: Some(1),
+        };
+        stages.frame_done(100, Situation::Steady, &[late], none);
+        assert_eq!(stages.gpu[0].count(), 1);
+        assert_eq!(stages.by[Situation::Steady as usize].gpu[0].count(), 0);
     }
 
     // Detection is timed by what it read, apart from the upload (#220).

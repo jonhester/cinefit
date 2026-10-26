@@ -29,16 +29,35 @@ const _: () = assert!(size_of::<Dovi>() == 84);
 const _: () = assert!(offset_of!(Dovi, offset) == 36);
 const _: () = assert!(offset_of!(Dovi, linear) == 48);
 
-/// `cf_pl_gpu_times`: GPU time per pass (`CF_PL_PASS_*` order).
+/// `cf_pl_gpu_sample`: one GPU result (`CF_PL_PASS_*` pass).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct GpuTimes {
-    pub ms: [f64; 5],
-    pub count: [u64; 5],
+pub struct GpuSample {
+    pub tag: u64,
+    pub ms: f64,
+    pub pass: i32,
+    pub pad: i32,
 }
 
-const _: () = assert!(size_of::<GpuTimes>() == 80);
-const _: () = assert!(offset_of!(GpuTimes, count) == 40);
+const _: () = assert!(size_of::<GpuSample>() == 24);
+const _: () = assert!(offset_of!(GpuSample, ms) == 8);
+const _: () = assert!(offset_of!(GpuSample, pass) == 16);
+
+/// `CF_PL_UNTAGGED`.
+pub const UNTAGGED: u64 = u64::MAX;
+
+/// `cf_pl_gpu_losses`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuLosses {
+    pub dropped: [u64; 5],
+    pub untimed: [u64; 5],
+    pub unanswered: [u64; 5],
+}
+
+const _: () = assert!(size_of::<GpuLosses>() == 120);
+const _: () = assert!(offset_of!(GpuLosses, untimed) == 40);
+const _: () = assert!(offset_of!(GpuLosses, unanswered) == 80);
 
 /// `cf_pl_dm`.
 #[repr(C)]
@@ -130,7 +149,13 @@ unsafe extern "C" {
     ) -> *mut Handle;
     pub fn cf_pl_destroy(pl: *mut Handle);
     pub fn cf_pl_gpu_timing(pl: *mut Handle, on: c_int) -> c_int;
-    pub fn cf_pl_get_gpu_times(pl: *mut Handle, out: *mut GpuTimes);
+    pub fn cf_pl_gpu_tag(pl: *mut Handle, tag: u64);
+    pub fn cf_pl_gpu_take(
+        pl: *mut Handle,
+        out: *mut GpuSample,
+        cap: usize,
+        losses: *mut GpuLosses,
+    ) -> usize;
     pub fn cf_pl_get_info(pl: *mut Handle, out: *mut Info);
     pub fn cf_pl_render_rgba8(
         pl: *mut Handle,
