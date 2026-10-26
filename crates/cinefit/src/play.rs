@@ -2272,27 +2272,39 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 source,
                 cfg.fill_max_ar.value(),
             );
-            let Some(prepared) = prepared else {
-                return Err("the first frame could not be rendered".into());
-            };
-            // The first frame alone is its shot so far.
-            let scene = found.l1.map(|f| {
-                cinefit_render::dm::Scene::from_codes(
-                    l1::Shot::default().push(f, true),
-                    hdr10_source(first_info.color.hdr.as_ref()),
-                    vec![],
-                )
-            });
-            draw(
-                &pl,
-                &first_info,
-                first_info.color.hdr.as_ref(),
-                prepared,
-                scene,
-                &mut dm_cache,
-                &target(scan.texture(0), out_color, view, &cfg),
-                &mut stages,
-            )?;
+            match prepared {
+                Some(prepared) => {
+                    // The first frame alone is its shot so far.
+                    let scene = found.l1.map(|f| {
+                        cinefit_render::dm::Scene::from_codes(
+                            l1::Shot::default().push(f, true),
+                            hdr10_source(first_info.color.hdr.as_ref()),
+                            vec![],
+                        )
+                    });
+                    draw(
+                        &pl,
+                        &first_info,
+                        first_info.color.hdr.as_ref(),
+                        prepared,
+                        scene,
+                        &mut dm_cache,
+                        &target(scan.texture(0), out_color, view, &cfg),
+                        &mut stages,
+                    )?;
+                }
+                // A tunnel with no conversion yet: pre-roll counts its held
+                // frames as steady. Black, as the loop draws the same frames,
+                // until its first good packet; stopping here would fail the
+                // same way at every restart (#271).
+                None => {
+                    info!(
+                        "first frame: {} with nothing to render it yet; starting with black",
+                        describe(key.kind)
+                    );
+                    pl.clear_black(scan.texture(0))?;
+                }
+            }
             let place = view
                 .dst
                 .unwrap_or_else(|| Rect::fit(first_info.width, first_info.height, size.0, size.1));
