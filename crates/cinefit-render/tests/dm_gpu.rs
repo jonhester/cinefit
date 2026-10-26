@@ -89,6 +89,11 @@ fn pixels(n: usize) -> Vec<u16> {
     v
 }
 
+/// One test on the device at a time: two Vulkan devices made at once by
+/// parallel tests have hung inside NVIDIA's driver (595.99, both threads
+/// waiting on it for good).
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn placebo() -> Option<Placebo> {
     match Placebo::new() {
         Ok(pl) => Some(pl),
@@ -104,6 +109,9 @@ fn placebo() -> Option<Placebo> {
 
 #[test]
 fn the_gpu_maps_as_the_reference_does() {
+    let _one = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(pl) = placebo() else { return };
     let (w, h) = (64, 32);
     let input = pixels(w * h);
@@ -179,6 +187,9 @@ fn v210_frame(w: usize, h: usize) -> Vec<u8> {
 #[test]
 fn hdr10_through_the_mapping_is_the_conversion_then_the_mapping() {
     use cinefit_render::{Mapping, Matrix, Primaries, RgbColor, Transfer, View, YcbcrColor};
+    let _one = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(pl) = placebo() else { return };
     let (w, h) = (192, 64);
     let mut planes = pl.planes(w, h).expect("planes");

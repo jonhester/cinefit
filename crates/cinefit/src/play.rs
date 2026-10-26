@@ -853,6 +853,11 @@ struct CropFinder {
     /// by its shots (#109). The epoch it last saw, to start again on a new one.
     tunnel_cuts: cinefit_detect::cuts::Cuts,
     tunnel_epoch: u32,
+    /// Cuts in HDR10 while measuring with cropping off, when the detector,
+    /// which finds them otherwise, sees no frames: a shot's L1 starts again at
+    /// a cut (#141). The epoch it last saw, to start again on a new one.
+    pq_cuts: cinefit_detect::cuts::Cuts,
+    pq_epoch: u32,
     /// Measure HDR10 frames' L1 for the display model (`output.mode`
     /// cinefithdr,
     /// #141), over the rows the crop keeps.
@@ -1460,6 +1465,17 @@ impl CropFinder {
             self.tunnel_cuts.observe(t, 0, 0).cut
         });
         if !self.on {
+            let l1 = measure(0, 0);
+            let pq_cut = match (&v210, l1) {
+                (Some(v), Some(_)) => {
+                    if epoch != self.pq_epoch {
+                        self.pq_cuts.reset();
+                        self.pq_epoch = epoch;
+                    }
+                    self.pq_cuts.observe(v, 0, 0).cut
+                }
+                _ => false,
+            };
             return Found {
                 source: geo::Source::Whole,
                 ms: None,
@@ -1468,8 +1484,8 @@ impl CropFinder {
                 reading: None,
                 thumb,
                 candidate: false,
-                cut: tunnel_cut,
-                l1: measure(0, 0),
+                cut: tunnel_cut || pq_cut,
+                l1,
             };
         }
         // A crop belongs to the picture it was found on: held over RGB, a
@@ -2174,6 +2190,8 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         thumbs: cfg.record,
         tunnel_cuts: Default::default(),
         tunnel_epoch: 0,
+        pq_cuts: Default::default(),
+        pq_epoch: 0,
         measure: cfg.mode == config::OutputMode::CinefitHdr,
     };
     // The detector's dataset (#91): a session directory, opened on the first
@@ -2543,7 +2561,12 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 match key {
                     "detect.crop" => finder.set_on(cfg.crop),
                     "detect.record" => finder.thumbs = cfg.record,
-                    "output.mode" => finder.measure = cfg.mode == config::OutputMode::CinefitHdr,
+                    "output.mode" => {
+                        finder.measure = cfg.mode == config::OutputMode::CinefitHdr;
+                        // What the shot held belongs to before: measuring
+                        // starts afresh, as at a cut.
+                        shot_l1.reset();
+                    }
                     "geometry.screen_ar" => {
                         win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
                         ui.set_band((win.y, win.h));
@@ -4013,6 +4036,8 @@ mod tests {
             thumbs: false,
             tunnel_cuts: Default::default(),
             tunnel_epoch: 0,
+            pq_cuts: Default::default(),
+            pq_epoch: 0,
             measure: false,
         };
         let sdr = Kind::Ycbcr(YcbcrColor {
@@ -4102,8 +4127,44 @@ mod tests {
             thumbs: false,
             tunnel_cuts: Default::default(),
             tunnel_epoch: 0,
+            pq_cuts: Default::default(),
+            pq_epoch: 0,
             measure: false,
         }
+    }
+
+    /// Measuring HDR10 with cropping off, the detector sees no frames: cuts
+    /// come from a detector of their own, so each shot's L1 starts again
+    /// (#141).
+    #[test]
+    fn hdr10_measured_with_cropping_off_still_sees_cuts() {
+        let (w, h) = (1920, 1080);
+        let (info, first) = v210(w, h, |x, y| {
+            180 + ((x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 7) % 620
+        });
+        let (_, second) = v210(w, h, |x, y| 90 + (x / 64 + y / 64) % 40);
+        let hdr10 = Kind::Ycbcr(YcbcrColor {
+            matrix: Matrix::Bt2020Nc,
+            primaries: Primaries::Bt2020,
+            transfer: Transfer::Pq,
+        });
+        let mut finder = finder();
+        finder.set_on(false);
+        finder.measure = true;
+        let mut cuts = Vec::new();
+        for i in 0..16u32 {
+            let bytes = if i < 10 { &first } else { &second };
+            let f = finder.find(&info, Some(bytes), hdr10, f64::from(i) / 24.0, 1);
+            assert!(f.l1.is_some(), "frame {i} measured");
+            if f.cut {
+                cuts.push(i);
+            }
+        }
+        assert_eq!(cuts, [10]);
+        // Not measuring: no cuts of its own are looked for.
+        finder.measure = false;
+        let f = finder.find(&info, Some(&first), hdr10, 1.0, 1);
+        assert!(f.l1.is_none() && !f.cut);
     }
 
     #[test]
