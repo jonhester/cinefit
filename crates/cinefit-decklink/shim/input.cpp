@@ -254,32 +254,45 @@ struct cf_dl_input {
     IDeckLinkInput *input;
     IDeckLinkStatus *status;    /* null if the device has none */
     Callback *cb;
-    bool started;
+    bool started;               /* the owner's thread only; the exit handler goes by the set */
     int64_t opened_connection;  /* the input selected before open, or 0 */
 };
 
 namespace {
 
-// Inputs started and not yet stopped. A process that ends without stopping
-// its input (std::process::exit on a second Ctrl-C, say) leaves the driver
-// with it enabled; this stops them at exit instead. Function-local statics,
-// constructed before the atexit registration, so they outlive the handler.
+// Inputs started whose stop has not begun. A process that ends without
+// stopping its input (std::process::exit on a second Ctrl-C, say) leaves the
+// driver with it enabled; this stops them at exit instead. Heap objects never
+// destroyed: statics are destroyed interleaved with atexit handlers in reverse
+// order of completion, and these complete after the registration, so as
+// ordinary statics they would be gone before the handler runs.
 std::mutex &started_mu() {
-    static std::mutex m;
-    return m;
+    static std::mutex *m = new std::mutex;
+    return *m;
 }
 std::set<cf_dl_input *> &started_inputs() {
-    static std::set<cf_dl_input *> s;
-    return s;
+    static std::set<cf_dl_input *> *s = new std::set<cf_dl_input *>;
+    return *s;
 }
 
+// The stop itself, done by whoever took the input out of the started set, so
+// it runs once even when the exit handler and cf_dl_input_stop race.
+void stop_untracked(cf_dl_input *in) {
+    // Disarm first: it waits out any callback in progress, including a
+    // format-change restart, and turns away any that arrive while streams stop.
+    in->cb->disarm();
+    in->input->StopStreams();
+    in->input->DisableVideoInput();
+    in->input->SetCallback(nullptr);
+}
+
+// Holds the lock while it stops, so a cf_dl_input_release on another thread
+// waits for the stop before it frees the input. An input whose stop is already
+// underway (the hang a second Ctrl-C is for) is out of the set and left alone.
 void stop_all_at_exit() {
-    std::set<cf_dl_input *> left;
-    {
-        std::lock_guard<std::mutex> g(started_mu());
-        left = started_inputs();
-    }
-    for (cf_dl_input *in : left) cf_dl_input_stop(in);
+    std::lock_guard<std::mutex> g(started_mu());
+    for (cf_dl_input *in : started_inputs()) stop_untracked(in);
+    started_inputs().clear();
 }
 
 void track_started(cf_dl_input *in) {
@@ -289,9 +302,10 @@ void track_started(cf_dl_input *in) {
     started_inputs().insert(in);
 }
 
-void untrack(cf_dl_input *in) {
+// Whether this call took the input out of the set, and so must stop it.
+bool untrack(cf_dl_input *in) {
     std::lock_guard<std::mutex> g(started_mu());
-    started_inputs().erase(in);
+    return started_inputs().erase(in) == 1;
 }
 
 // The mode and pixel format to open in: the detected mode and the format the
@@ -407,14 +421,8 @@ extern "C" int32_t cf_dl_input_start(cf_dl_input *in, cf_dl_format_cb on_format,
 
 extern "C" void cf_dl_input_stop(cf_dl_input *in) noexcept {
     if (!in->started) return;
-    // Disarm first: it waits out any callback in progress, including a
-    // format-change restart, and turns away any that arrive while streams stop.
-    in->cb->disarm();
-    in->input->StopStreams();
-    in->input->DisableVideoInput();
-    in->input->SetCallback(nullptr);
     in->started = false;
-    untrack(in);
+    if (untrack(in)) stop_untracked(in);
 }
 
 extern "C" int64_t cf_dl_input_opened_connection(cf_dl_input *in) noexcept {
