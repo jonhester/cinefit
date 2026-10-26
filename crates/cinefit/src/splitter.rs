@@ -76,7 +76,7 @@ pub fn parse(reply: &str) -> Option<u32> {
         .and_then(|n| n.trim().parse().ok())
 }
 
-/// What the index means on the rig's custom firmware (~/ezcoo-fw, the
+/// What the index means on the rig's custom firmware (the
 /// CF_7.1-TVLED_5.1-LLDV96 image): presets 30 and 28 are its slots 1 and 31.
 /// Another image means other EDIDs at the same indices: the note names the
 /// index first for that reason.
