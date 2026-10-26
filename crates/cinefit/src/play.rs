@@ -3246,21 +3246,25 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 // A source through a receiver in standby does not light it:
                 // the receiver coming on does, as its frames then ask.
                 let quiet = dark || standby_since.is_some();
-                let want = if quiet {
-                    latest_want = None;
-                    None
-                } else {
-                    latest_want.take()
-                };
                 let unshowable =
                     !quiet && matches!(last_key.map(|k| k.kind), Some(Kind::Unsupported(_)));
-                let want = want.or_else(|| {
-                    (menu.is_open() || cfg.idle_off == 0 || unshowable).then(|| follow::Want {
-                        rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
-                        signal: follow::Signal::Sdr,
-                    })
-                });
-                let Some(a) = want.and_then(|w| policy.wake(&w, now)) else {
+                let action = if quiet || unshowable {
+                    latest_want = None;
+                    let waiting =
+                        (menu.is_open() || cfg.idle_off == 0 || unshowable).then(|| follow::Want {
+                            rate_mhz: (cfg.wait_hz * 1000.0).round() as u32,
+                            signal: follow::Signal::Sdr,
+                        });
+                    policy.wake(None, waiting.as_ref(), now)
+                } else {
+                    // A source to follow: its frames light the output once
+                    // they have held, as a change does while it runs (#277).
+                    // A pass between two of them changes nothing.
+                    latest_want
+                        .take()
+                        .and_then(|w| policy.wake(Some(&w), None, now))
+                };
+                let Some(a) = action else {
                     ready = None;
                     continue;
                 };
