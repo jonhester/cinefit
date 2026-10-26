@@ -9,6 +9,7 @@
 
 use std::io::{self, Read, Write};
 
+const OP_CONTINUATION: u8 = 0x0;
 const OP_TEXT: u8 = 0x1;
 const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
@@ -79,28 +80,43 @@ impl<S: Read + Write> WebSocket<S> {
         self.stream.flush()
     }
 
-    /// Reads the next text message, answering pings along the way. Returns
-    /// `None` when the peer closes. Control frames other than ping/close are
-    /// skipped.
+    /// Reads the next text message, joining its fragments and answering
+    /// pings along the way. Returns `None` when the peer closes. Control
+    /// frames may come between a message's fragments (RFC 6455 5.4): each is
+    /// handled as it comes and the unfinished message kept (#261). Pongs,
+    /// binary messages and stray continuations are skipped.
     pub fn read_text(&mut self) -> io::Result<Option<String>> {
+        // The data message in progress: its opcode and its fragments so far.
+        let mut message: Option<(u8, Vec<u8>)> = None;
         loop {
-            let (opcode, payload) = match self.read_frame()? {
-                Some(f) => f,
-                None => return Ok(None),
+            let room = MAX_MESSAGE - message.as_ref().map_or(0, |(_, m)| m.len());
+            let Some((fin, opcode, mut payload)) = self.read_frame(room)? else {
+                return Ok(None);
             };
             match opcode {
-                OP_TEXT => {
-                    return String::from_utf8(payload).map(Some).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 text frame")
-                    });
-                }
                 OP_PING => self.send_control(OP_PONG, &payload)?,
                 OP_CLOSE => {
                     // Echo the close and stop.
                     let _ = self.send_control(OP_CLOSE, &payload);
                     return Ok(None);
                 }
-                _ => continue, // pong, or a stray continuation: ignore.
+                OP_CONTINUATION => match message.as_mut() {
+                    Some((_, m)) => m.append(&mut payload),
+                    None => continue, // a stray continuation: ignore.
+                },
+                // A new data message; one left unfinished is dropped.
+                op if op & 0x8 == 0 => message = Some((op, payload)),
+                _ => continue, // pong
+            }
+            if fin && opcode & 0x8 == 0 {
+                match message.take() {
+                    Some((OP_TEXT, m)) => {
+                        return String::from_utf8(m).map(Some).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 text frame")
+                        });
+                    }
+                    _ => continue, // binary: not ours to read.
+                }
             }
         }
     }
@@ -117,29 +133,15 @@ impl<S: Read + Write> WebSocket<S> {
         self.stream.flush()
     }
 
-    /// Reads one whole frame (reassembling a FIN-terminated run of
-    /// continuation frames). Returns the first frame's opcode and the joined
-    /// payload, or `None` at end of stream.
-    fn read_frame(&mut self) -> io::Result<Option<(u8, Vec<u8>)>> {
+    /// Reads one frame: its FIN bit, its opcode and its payload, or `None` at
+    /// end of stream. `room` is what its payload may take.
+    fn read_frame(&mut self, room: usize) -> io::Result<Option<(bool, u8, Vec<u8>)>> {
         let mut first = [0u8; 2];
         if !self.read_exact_or_eof(&mut first)? {
             return Ok(None);
         }
-        let opcode = first[0] & 0x0f;
-        let mut fin = first[0] & 0x80 != 0;
-        let mut payload = self.read_payload(first[1], MAX_MESSAGE)?;
-
-        // Reassemble continuation frames (opcode 0) until FIN.
-        while !fin {
-            let mut hdr = [0u8; 2];
-            if !self.read_exact_or_eof(&mut hdr)? {
-                return Ok(None);
-            }
-            fin = hdr[0] & 0x80 != 0;
-            let mut more = self.read_payload(hdr[1], MAX_MESSAGE - payload.len())?;
-            payload.append(&mut more);
-        }
-        Ok(Some((opcode, payload)))
+        let payload = self.read_payload(first[1], room)?;
+        Ok(Some((first[0] & 0x80 != 0, first[0] & 0x0f, payload)))
     }
 
     /// Reads a frame payload given its second header byte. Server frames are
@@ -345,6 +347,64 @@ mod tests {
             calls: 0,
         });
         assert_eq!(ws.read_text().unwrap().as_deref(), Some("abc"));
+    }
+
+    /// Reads from one buffer and writes to another, as a socket does.
+    struct Duplex {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A ping between a message's fragments is answered and left out of the
+    /// message, which still ends at its own last fragment (#261).
+    #[test]
+    fn a_ping_between_fragments_is_answered_not_joined() {
+        // text("a"), ping("p"), continuation("b", FIN), then text("c").
+        let raw = vec![
+            0x01, 0x01, b'a', 0x89, 0x01, b'p', 0x80, 0x01, b'b', 0x81, 0x01, b'c',
+        ];
+        let mut ws = WebSocket::new(Duplex {
+            input: Cursor::new(raw),
+            output: Vec::new(),
+        });
+        assert_eq!(ws.read_text().unwrap().as_deref(), Some("ab"));
+        assert_eq!(ws.read_text().unwrap().as_deref(), Some("c"));
+        // One pong, masked, carrying the ping's payload.
+        let out = &ws.stream.output;
+        assert_eq!(out.len(), 7);
+        assert_eq!(out[..2], [0x80 | OP_PONG, 0x80 | 1]);
+        assert_eq!(out[6] ^ out[2], b'p');
+    }
+
+    /// A close between fragments ends the read, as a close anywhere does.
+    #[test]
+    fn a_close_between_fragments_ends_the_read() {
+        let raw = vec![0x01, 0x01, b'a', 0x88, 0x00, 0x80, 0x01, b'b'];
+        let mut ws = WebSocket::new(Cursor::new(raw));
+        assert_eq!(ws.read_text().unwrap(), None);
+    }
+
+    /// A fragmented binary message is skipped whole, a text one after it read.
+    #[test]
+    fn a_binary_message_is_skipped_whole() {
+        let raw = vec![0x02, 0x01, 0xff, 0x80, 0x01, 0xfe, 0x81, 0x01, b'c'];
+        let mut ws = WebSocket::new(Cursor::new(raw));
+        assert_eq!(ws.read_text().unwrap().as_deref(), Some("c"));
     }
 
     #[test]
