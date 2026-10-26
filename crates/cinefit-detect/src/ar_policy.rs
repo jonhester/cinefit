@@ -562,7 +562,11 @@ impl ArPolicy {
                     // Interstellar's next return to scope a "new" height, 5
                     // frames late.
                     if nudge {
-                        if let Some(i) = self.find_known(self.crop) {
+                        // Looked up by the height adopted, not the crop: a
+                        // widened crop is a few rows past the known height,
+                        // beyond matching it, and the known height would be
+                        // left behind (#280). Not widened, the two are one.
+                        if let Some(i) = self.find_known(self.adopted) {
                             self.known[i].rows = rows;
                         }
                         self.adopted = rows;
@@ -1497,6 +1501,27 @@ mod tests {
         assert_eq!(r.p.crop(), crop(276, 265), "12 rows past it: still widens");
         r.feed(&weak(None, Some(261), 300), 1);
         assert_eq!(r.p.crop(), FULL, "16 rows past it: real picture, zooms out");
+    }
+
+    #[test]
+    fn a_matte_opening_while_widened_takes_the_known_height_with_it() {
+        let mut r = Run::new();
+        r.learn(SCOPE);
+        r.feed(&weak(None, Some(274), 300), 1);
+        assert_eq!(r.p.crop(), crop(276, 274), "widened 3 rows at the bottom");
+        r.feed(&letterbox(crop(272, 272)), 1);
+        assert_eq!(r.p.crop(), crop(272, 272), "a matte opening: nudged to it");
+        r.feed(&full(), 24);
+        assert_eq!(r.p.crop(), FULL);
+        let back = (0..24 * 5)
+            .map(|_| r.push(&letterbox(crop(272, 272))))
+            .find(|d| d.changed)
+            .expect("zooms back in");
+        assert_eq!(back.crop, crop(272, 272));
+        assert_eq!(
+            back.diag.reason, "zoom in (recent)",
+            "the height the nudge moved to is the known one"
+        );
     }
 
     #[test]
