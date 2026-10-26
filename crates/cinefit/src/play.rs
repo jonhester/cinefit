@@ -3177,7 +3177,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 vec![],
                             )
                         });
-                        dataset.set_hdr(frame_info.color.hdr, t);
+                        dataset.set_hdr(hdr_meta, t);
                         dataset.record(cfg.record, &found, t, epoch, content);
                         dataset.keep(&cfg, &found, t, &frame);
                         let source = found.source;
