@@ -110,7 +110,16 @@ fn run(shared: &Mutex<Shared>) {
             continue;
         };
         let stop = Arc::new(AtomicBool::new(false));
-        lock().stop = Some(Arc::clone(&stop));
+        {
+            // Stored only while the address is still the one read: a
+            // set_host since then found no flag to raise, and connecting to
+            // the old address would drop every update until it ended (#290).
+            let mut s = lock();
+            if s.host != host {
+                continue;
+            }
+            s.stop = Some(Arc::clone(&stop));
+        }
         info!("appletv: connecting to {host}");
         let result = cinefit_atv::watch(&host, &creds, &stop, |np| {
             let mut s = lock();
