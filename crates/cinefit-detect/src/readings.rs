@@ -146,6 +146,27 @@ fn why(s: &str) -> &'static str {
     .unwrap_or("")
 }
 
+/// A readings file's text: every line after the header that reads, and how
+/// many did not. A last line without its newline is a file still being
+/// written and is not counted; any other line that does not read is (#293),
+/// so a file in a format this version does not know is not taken for an
+/// empty one.
+pub fn parse_all(text: &str) -> (Vec<Reading>, usize) {
+    let lines: Vec<&str> = text.lines().skip(1).collect();
+    let partial = !text.ends_with('\n');
+    let mut out = Vec::with_capacity(lines.len());
+    let mut bad = 0;
+    for (i, line) in lines.iter().enumerate() {
+        match parse(line) {
+            Some(r) => out.push(r),
+            None if partial && i + 1 == lines.len() => {}
+            None if line.trim().is_empty() => {}
+            None => bad += 1,
+        }
+    }
+    (out, bad)
+}
+
 /// A CSV line back into a reading; `None` for the header or a line that is
 /// not one.
 pub fn parse(line: &str) -> Option<Reading> {
@@ -239,6 +260,29 @@ mod tests {
         let mut unknown = r;
         unknown.obs.top.level_confidence = None;
         assert_eq!(parse(&format(&unknown)), Some(unknown));
+    }
+
+    #[test]
+    fn lines_that_do_not_read_are_counted() {
+        let line = format(&sample());
+        let h = header();
+        assert_eq!(
+            parse_all(&format!("{h}\n{line}\n{line}\n")),
+            (vec![sample(); 2], 0)
+        );
+        assert_eq!(parse_all(&format!("{h}\n")), (vec![], 0), "a header alone");
+        // Half-written last line: a file still being written.
+        let half = &line[..line.len() / 2];
+        assert_eq!(
+            parse_all(&format!("{h}\n{line}\n{half}")),
+            (vec![sample()], 0)
+        );
+        // Corrupt in the middle, or a format this version does not know.
+        assert_eq!(
+            parse_all(&format!("{h}\n{half}\n{line}\n")),
+            (vec![sample()], 1)
+        );
+        assert_eq!(parse_all(&format!("{h}\n1,2,3\n4,5,6\n")), (vec![], 2));
     }
 
     #[test]
