@@ -169,6 +169,10 @@ impl fmt::Display for Ratio {
 pub enum OutputMode {
     Sdr2020,
     Passthrough,
+    /// cinefit HDR: HDR10 mapped scene by scene by the display model the
+    /// Dolby Vision tunnel uses, its levels measured from the picture (#141);
+    /// out as SDR BT.2020, as sdr2020.
+    CinefitHdr,
 }
 
 impl Default for Config {
@@ -350,25 +354,27 @@ static SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "output.mode",
-        kind: Kind::Choice(&["sdr2020", "passthrough"]),
+        kind: Kind::Choice(&["sdr2020", "passthrough", "cinefithdr"]),
         apply: Apply::Modeset,
         help: "sdr2020: SDR in a BT.2020 container, HDR tone-mapped into tonemap.target_nits; set the display \
-               to an SDR BT.2020 mode. passthrough: HDR10 goes out as HDR10, for the display to map. Dolby \
-               Vision always goes out as SDR BT.2020.",
+               to an SDR BT.2020 mode. passthrough: HDR10 goes out as HDR10, for the display to map. cinefithdr: \
+               as sdr2020, with HDR10 mapped scene by scene: each shot's levels, measured from the picture, drive \
+               the mapping cinefit uses for Dolby Vision. Dolby Vision always goes out as SDR BT.2020.",
         get: |c| {
             Value::Name(
                 match c.mode {
                     OutputMode::Sdr2020 => "sdr2020",
                     OutputMode::Passthrough => "passthrough",
+                    OutputMode::CinefitHdr => "cinefithdr",
                 }
                 .into(),
             )
         },
         set: Set::Name(|c, v| {
-            c.mode = if v == "passthrough" {
-                OutputMode::Passthrough
-            } else {
-                OutputMode::Sdr2020
+            c.mode = match v {
+                "passthrough" => OutputMode::Passthrough,
+                "cinefithdr" => OutputMode::CinefitHdr,
+                _ => OutputMode::Sdr2020,
             }
         }),
     },

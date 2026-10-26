@@ -235,6 +235,20 @@ unsafe extern "C" {
         map: *const Map,
         src_crop: *const f32,
     ) -> c_int;
+    pub fn cf_pl_render_ycbcr_dm(
+        pl: *mut Handle,
+        src: *mut Planes,
+        matrix: c_int,
+        primaries: c_int,
+        trc: c_int,
+        dm: *const Dm,
+        dst: *mut Tex,
+        dst_primaries: c_int,
+        dst_trc: c_int,
+        place: *const f32,
+        map: *const Map,
+        src_crop: *const f32,
+    ) -> c_int;
     pub fn cf_pl_dm_rgba16(
         pl: *mut Handle,
         w: c_int,

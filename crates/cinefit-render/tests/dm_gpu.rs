@@ -89,18 +89,30 @@ fn pixels(n: usize) -> Vec<u16> {
     v
 }
 
-#[test]
-fn the_gpu_maps_as_the_reference_does() {
-    let pl = match Placebo::new() {
-        Ok(pl) => pl,
+/// One test on the device at a time: two Vulkan devices made at once by
+/// parallel tests have hung inside NVIDIA's driver (595.99, both threads
+/// waiting on it for good).
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn placebo() -> Option<Placebo> {
+    match Placebo::new() {
+        Ok(pl) => Some(pl),
         Err(e) if std::env::var_os("CINEFIT_REQUIRE_GPU").is_some() => {
             panic!("no Vulkan device, and CINEFIT_REQUIRE_GPU is set: {e}")
         }
         Err(e) => {
             eprintln!("skipped: no Vulkan device ({e})");
-            return;
+            None
         }
-    };
+    }
+}
+
+#[test]
+fn the_gpu_maps_as_the_reference_does() {
+    let _one = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(pl) = placebo() else { return };
     let (w, h) = (64, 32);
     let input = pixels(w * h);
     for (name, scene, target) in scenes() {
@@ -144,4 +156,102 @@ fn the_gpu_maps_as_the_reference_does() {
         eprintln!("{name}: worst difference {:.4}", worst.0);
         assert!(worst.0 < TOLERANCE, "{name}: {:.4}, {}", worst.0, worst.1);
     }
+}
+
+/// A v210 frame of `w x h` (w a multiple of 6): luma ramping across, chroma
+/// varying down and across, all within limited range.
+fn v210_frame(w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w / 6 * 16 * h);
+    for y in 0..h {
+        let luma = |x: usize| (64 + x * 876 / w) as u32;
+        let cb = |p: usize| (512 + (p * 13 + y * 7) % 400 - 200) as u32;
+        let cr = |p: usize| (512 + (p * 29 + y * 11) % 300 - 150) as u32;
+        for g in 0..w / 6 {
+            let (x, p) = (g * 6, g * 3);
+            let word = |a: u32, b: u32, c: u32| a | b << 10 | c << 20;
+            for w in [
+                word(cb(p), luma(x), cr(p)),
+                word(luma(x + 1), cb(p + 1), luma(x + 2)),
+                word(cr(p + 1), luma(x + 3), cb(p + 2)),
+                word(luma(x + 4), cr(p + 2), luma(x + 5)),
+            ] {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// HDR10 through the mapping (#141) is the frame converted to BT.2020 PQ RGB,
+/// then the mapping pass, then placed: the same as those steps run apart.
+#[test]
+fn hdr10_through_the_mapping_is_the_conversion_then_the_mapping() {
+    use cinefit_render::{Mapping, Matrix, Primaries, RgbColor, Transfer, View, YcbcrColor};
+    let _one = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(pl) = placebo() else { return };
+    let (w, h) = (192, 64);
+    let mut planes = pl.planes(w, h).expect("planes");
+    pl.unpack_v210(&mut planes, &v210_frame(w, h), w / 6 * 16)
+        .expect("unpack");
+    let hdr10 = YcbcrColor {
+        matrix: Matrix::Bt2020Nc,
+        primaries: Primaries::Bt2020,
+        transfer: Transfer::Pq,
+    };
+    let pq = RgbColor {
+        primaries: Primaries::Bt2020,
+        transfer: Transfer::Pq,
+    };
+    let frame = Frame::new(
+        &Scene::from_codes([62, 1200, 2950], [62, 3079], vec![]),
+        96.0,
+    );
+    let flat = Mapping {
+        src_peak: 1000.0,
+        dst_peak: 1000.0,
+        curve: cinefit_render::Curve::Bt2390,
+        peak_detect: false,
+        contrast_recovery: 0.0,
+        peak_percentile: 0.0,
+        knee_offset: 0.0,
+    };
+
+    let whole = pl.target_rgba16(w, h).expect("target");
+    pl.render_ycbcr_dm(
+        &planes,
+        hdr10,
+        &frame,
+        whole.texture(),
+        pq,
+        View::default(),
+        &flat,
+    )
+    .expect("render");
+    let got = whole.download().expect("download");
+
+    let apart = pl.target_rgba16(w, h).expect("target");
+    pl.render_ycbcr_mapped(&planes, hdr10, apart.texture(), pq, View::default(), None)
+        .expect("render");
+    let rgb = apart.download().expect("download");
+    let want = pl.dm_rgba16(w, h, &rgb, &frame).expect("mapping");
+
+    let worst = got
+        .chunks(4)
+        .zip(want.chunks(4))
+        .flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c])))
+        .max()
+        .unwrap();
+    // The mapping moves the picture a long way, so a match is no accident.
+    let moved = rgb
+        .chunks(4)
+        .zip(want.chunks(4))
+        .filter(|(a, b)| a[1].abs_diff(b[1]) > 1000)
+        .count();
+    assert!(
+        moved > w * h / 4,
+        "the mapping barely moved the frame: {moved}"
+    );
+    assert!(worst <= 4, "16-bit codes apart: {worst}");
 }

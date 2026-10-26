@@ -17,6 +17,7 @@ mod device;
 mod dovi_meta;
 mod follow;
 mod hindsight;
+mod l1;
 #[cfg(target_os = "linux")]
 mod menu;
 #[cfg(target_os = "linux")]

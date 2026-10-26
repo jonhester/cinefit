@@ -222,6 +222,12 @@ typedef struct {
 int cf_pl_render_dovi_dm(cf_pl *pl, cf_pl_planes *src, const cf_pl_dovi *dovi,
                          const cf_pl_dm *dm, cf_pl_tex *dst, int dst_primaries, int dst_trc,
                          const float *place, const cf_pl_map *map, const float *src_crop);
+/* HDR10 (PQ YCbCr planes) through Dolby's display mapping (#141): converted to
+ * BT.2020 PQ RGB, mapped by `dm` in place, then cropped and placed as
+ * cf_pl_render_dovi_dm does. */
+int cf_pl_render_ycbcr_dm(cf_pl *pl, cf_pl_planes *src, int matrix, int primaries, int trc,
+                          const cf_pl_dm *dm, cf_pl_tex *dst, int dst_primaries, int dst_trc,
+                          const float *place, const cf_pl_map *map, const float *src_crop);
 
 /* The mapping alone, on w x h BT.2020 PQ RGBA16 pixels (rows packed, alpha
  * ignored) into out, the same size. For checking the GPU against src/dm.rs.
