@@ -374,13 +374,30 @@ fn rgb10_kind(t: TunnelFrame, color: RgbColor, last_tunnel: &mut Option<Tunnel>)
     }
 }
 
+/// The kind of an 8-bit ARGB frame. Only 10-bit tunnels are unpacked: one in
+/// 8-bit RGB would render as coloured noise, so it is a format nothing
+/// renders, black with the slate (#198).
+fn argb8_kind(t: TunnelFrame, color: RgbColor) -> Kind {
+    match t {
+        TunnelFrame::Absent => Kind::Rgb(rgb::Format::Argb8, color),
+        TunnelFrame::Held | TunnelFrame::Update(_) => Kind::Unsupported(PixelFormat::Argb8),
+    }
+}
+
 /// Classifies a frame, updating the last good tunnel conversion.
 fn classify(frame: &Frame, last_tunnel: &mut Option<Tunnel>) -> Key {
     let info = frame.info();
     let mut tunnel_shaped = false;
     let kind = match info.pixel_format {
         PixelFormat::V210 => Kind::Ycbcr(ycbcr_color(info)),
-        PixelFormat::Argb8 => Kind::Rgb(rgb::Format::Argb8, rgb_color(info)),
+        PixelFormat::Argb8 => argb8_kind(
+            frame.pixels().map_or(TunnelFrame::Absent, |p| {
+                let parity =
+                    cinefit_dovi::argb8_parity(p.bytes(), info.width as usize, info.row_bytes);
+                tunnel_frame(cinefit_dovi::decode(parity))
+            }),
+            rgb_color(info),
+        ),
         PixelFormat::Rgb10 => {
             let t = frame
                 .pixels()
@@ -2064,7 +2081,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                         ..
                     }),
                     _,
-                ) => format!("{f}, which nothing renders"),
+                ) => format!("{}, which nothing renders", unsupported(f)),
                 (Some(k), Some(f)) => format!("{f}, as {}, not yet steady", describe(k.kind)),
                 _ => format!(
                     "no signal ({} frames with one, {} without)",
@@ -3776,6 +3793,24 @@ mod tests {
         }
         let update = tunnel_frame(Ok(dovi_tunnel(UB820, Some(3079))));
         assert!(matches!(update, TunnelFrame::Update(ref t) if t.scene_max_pq == Some(3079)));
+    }
+
+    #[test]
+    fn a_tunnel_in_8_bit_rgb_is_not_shown_as_rgb() {
+        use super::{argb8_kind, tunnel_frame};
+        use cinefit_dovi::Error;
+        let plain = argb8_kind(tunnel_frame(Err(Error::NoPacket { packet: 0 })), SDR_BT2020);
+        assert_eq!(plain, Kind::Rgb(rgb::Format::Argb8, SDR_BT2020));
+        for t in [
+            Err(Error::NoPacket { packet: 1 }),
+            Ok(dovi_tunnel(UB820, Some(3079))),
+        ] {
+            assert_eq!(
+                argb8_kind(tunnel_frame(t), SDR_BT2020),
+                Kind::Unsupported(PixelFormat::Argb8)
+            );
+        }
+        assert!(cant_show(PixelFormat::Argb8).starts_with("Dolby Vision tunnel in 8-bit RGB"));
     }
 
     // Metadata, a frame without, metadata: a tunnel throughout, the first

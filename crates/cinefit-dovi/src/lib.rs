@@ -121,6 +121,29 @@ mod tests {
     }
 
     #[test]
+    fn a_tunnel_decodes_from_8_bit_argb() {
+        use packet::tests::{bits, packetize};
+        // Each pixel's parity carries one bit, in red alone; alpha's one set
+        // bit would flip every bit if it counted. Rows padded past the width.
+        let (width, row_bytes) = (1000, 4032);
+        let structure = metadata::tests::structure(&metadata::tests::UB820_BLOCKS);
+        let data = bits(&packetize(&structure, 0));
+        let mut frame = vec![0u8; row_bytes * data.len().div_ceil(width)];
+        for (i, &bit) in data.iter().enumerate() {
+            let o = i / width * row_bytes + i % width * 4;
+            frame[o..o + 4].copy_from_slice(&[0x01, u8::from(bit), 0x40, 0x40]);
+        }
+        let t = decode(argb8_parity(&frame, width, row_bytes)).expect("decodes");
+        assert_eq!(t.metadata.expect("metadata").level2.len(), 3);
+        // Grey with odd parity everywhere: no packet.
+        let grey = vec![0x80u8; frame.len()];
+        assert_eq!(
+            decode(argb8_parity(&grey, width, row_bytes)).err(),
+            Some(Error::NoPacket { packet: 0 })
+        );
+    }
+
+    #[test]
     fn pq_codes_convert_to_nits() {
         let near = |code, nits: f64| (pq_to_nits(code) - nits).abs() < nits * 0.002 + 0.001;
         assert!(near(0, 0.0));

@@ -18,7 +18,8 @@ pub(crate) enum Kind {
     /// for it: its range is the `input.rgb_range` setting's.
     Rgb(rgb::Format, RgbColor),
     Tunnel,
-    /// A capture format nothing renders.
+    /// A capture format nothing renders. `Argb8` here is 8-bit RGB carrying
+    /// a Dolby Vision tunnel (#198): plain 8-bit RGB is [`Kind::Rgb`].
     Unsupported(PixelFormat),
 }
 
@@ -353,7 +354,19 @@ pub(crate) fn encoding_for(signal: follow::Signal) -> Encoding {
 /// The slate's detail for a format nothing renders: what it is, and what
 /// to change.
 pub(crate) fn cant_show(f: PixelFormat) -> String {
-    format!("{f} \u{b7} set the player to YCbCr")
+    match f {
+        PixelFormat::Argb8 => format!("{} \u{b7} only 10-bit is unpacked", unsupported(f)),
+        f => format!("{f} \u{b7} set the player to YCbCr"),
+    }
+}
+
+/// What an unsupported input is called: a tunnel in 8-bit RGB is the one
+/// [`Kind::Unsupported`] whose format the card can capture.
+pub(crate) fn unsupported(f: PixelFormat) -> String {
+    match f {
+        PixelFormat::Argb8 => "Dolby Vision tunnel in 8-bit RGB".into(),
+        f => f.to_string(),
+    }
 }
 
 /// What the info panel says about the input: its picture type, then size,
@@ -381,7 +394,7 @@ pub(crate) fn input_section(
         Content::Hlg(_) => "HLG".into(),
         Content::Sdr(p) if p.primaries() == Primaries::Bt2020 => "SDR BT.2020".into(),
         Content::Sdr(_) => "SDR".into(),
-        Content::Unsupported(f) => format!("{f}: nothing renders it"),
+        Content::Unsupported(f) => format!("{}: nothing renders it", unsupported(f)),
     };
     let mut detail = format!("{width} \u{d7} {height}");
     if let Some(f) = format {
@@ -592,7 +605,7 @@ pub(crate) fn describe(kind: Kind) -> String {
             c.primaries, c.transfer
         ),
         Kind::Tunnel => "Dolby Vision tunnel".into(),
-        Kind::Unsupported(f) => format!("{f}, unsupported"),
+        Kind::Unsupported(f) => format!("{}, unsupported", unsupported(f)),
     }
 }
 
