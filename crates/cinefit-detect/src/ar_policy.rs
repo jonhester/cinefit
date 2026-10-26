@@ -355,6 +355,17 @@ impl ArPolicy {
         k.tight.bottom = k.tight.bottom.max(rows.bottom).min(k.rows.bottom + cap);
     }
 
+    /// A matte opening: the height's wide rows move to `rows`, and its deep
+    /// rows stay within `widen_max` of them, so three openings do not leave
+    /// the first clip's deep reading matching a height it is 9 rows inside.
+    fn widen_known(&mut self, i: usize, rows: Crop) {
+        let cap = self.tol(self.p.widen_max);
+        let k = &mut self.known[i];
+        k.rows = rows;
+        k.tight.top = k.tight.top.max(rows.top).min(rows.top + cap);
+        k.tight.bottom = k.tight.bottom.max(rows.bottom).min(rows.bottom + cap);
+    }
+
     fn near_standard(&self, rows: Crop, within: u32) -> bool {
         let a = rows.active(self.height);
         STANDARD.iter().any(|&r| {
@@ -595,7 +606,7 @@ impl ArPolicy {
                         // beyond matching it, and the known height would be
                         // left behind (#280). Not widened, the two are one.
                         if let Some(i) = self.find_known(self.adopted) {
-                            self.known[i].rows = rows;
+                            self.widen_known(i, rows);
                         }
                         self.adopted = rows;
                     }
@@ -745,6 +756,11 @@ impl ArPolicy {
                     // while dark content's apparent edges wander with the
                     // picture.
                     let exact = k.is_some() || self.near_standard(rows, self.tol(self.p.tol_match));
+                    // A frame just outside the band keeps a candidate counting
+                    // (the jitter above) but cannot zoom in: a dark-edged menu
+                    // holding 2 rows past the band would otherwise adopt on
+                    // evidence alone, around the non-standard rule.
+                    let in_band = k.is_some() || self.near_standard(rows, self.tol(self.p.tol_ar));
                     let prior = self.prior_of(k, t);
                     let threshold = self.threshold(prior);
                     let c = self.candidate.as_mut().expect("set above");
@@ -755,7 +771,7 @@ impl ArPolicy {
                     c.evidence +=
                         o.strength * if exact { 1.0 } else { self.p.inexact } * persistence;
 
-                    if c.evidence >= threshold {
+                    if c.evidence >= threshold && in_band {
                         // Rows, not ratios: the measured rows, or a known
                         // height's own rows so a return lands exactly where it
                         // was, but never tighter than this frame's picture. A
@@ -1043,6 +1059,41 @@ mod tests {
             r.p.crop(),
             crop(265, 265),
             "adopted as new, on evidence alone"
+        );
+    }
+
+    // A candidate begun in the band keeps counting through readings just
+    // outside it, but cannot zoom in on one: a dark-edged menu holding at
+    // 267/267 (8 rows from 2.35) never adopts without the non-standard rule.
+    #[test]
+    fn a_candidate_cannot_adopt_on_a_frame_outside_the_band() {
+        let mut r = Run::new();
+        r.feed(&letterbox(crop(265, 265)), 4);
+        r.feed(&letterbox(crop(267, 267)), 24 * 20);
+        assert_eq!(r.p.crop(), FULL);
+        assert!(
+            r.last.diag.candidate.is_some(),
+            "still counting, not adopted"
+        );
+    }
+
+    // Three matte openings move a height's wide rows 9 inside its first
+    // reading; its deep rows follow, no more than widen_max inside.
+    #[test]
+    fn widening_keeps_the_deep_rows_within_the_cap() {
+        let mut r = Run::new();
+        r.learn(crop(275, 275));
+        for rows in [272, 269, 266] {
+            r.feed(&letterbox(crop(rows, rows)), 12);
+        }
+        assert_eq!(r.p.crop(), crop(266, 266));
+        r.feed(&full(), 48);
+        let d = r.push(&letterbox(crop(275, 275)));
+        assert!(!d.changed, "9 rows inside: no longer this height");
+        let d = r.push(&letterbox(crop(271, 271)));
+        assert!(
+            d.changed && r.p.crop() == crop(266, 266),
+            "5 rows inside: is"
         );
     }
 
