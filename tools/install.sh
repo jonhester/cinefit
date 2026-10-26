@@ -97,32 +97,40 @@ restart() {
 }
 
 # Puts binary $1 in place as $app/$2/cinefit, with $3 in its VERSION file,
-# checks the copy, and makes it current.
+# and makes it current. The copy is checked before it replaces anything: $2
+# can be the directory current already points at (a reinstall, or every
+# ALLOW_DIRTY=1 build of one commit), where a failed check after the rename
+# would leave current on the binary that failed.
 place() {
     dest="$app/$2"
+    new="$dest/.cinefit.new"
     mkdir -p "$dest"
-    # Copy beside it and rename over it: reinstalling the build that is
-    # running must not leave it a half-written file.
-    cp "$1" "$dest/.cinefit.new"
-    chmod +x "$dest/.cinefit.new"
-    mv -f "$dest/.cinefit.new" "$dest/cinefit"
-    echo "$3 $(date -Iseconds)" > "$dest/VERSION"
+    cp "$1" "$new"
+    chmod +x "$new"
 
     # Everything it links resolves, and libplacebo is inside it: a copy that
     # loaded one from a build tree would break the day that tree changed.
-    links=$(ldd "$dest/cinefit") || die "ldd $dest/cinefit failed"
+    links=$(ldd "$new") || { rm -f "$new"; die "ldd $1 failed"; }
     if echo "$links" | grep -q "not found"; then
-        die "$dest/cinefit is missing libraries:
+        rm -f "$new"
+        die "$1 is missing libraries; current left as it was:
 $(echo "$links" | grep "not found")"
     fi
     if echo "$links" | grep -q libplacebo; then
-        die "$dest/cinefit loads libplacebo as a shared library; it should carry it"
+        rm -f "$new"
+        die "$1 loads libplacebo as a shared library; it should carry it"
     fi
     # It starts, and reads the settings file the service will: a bad file
     # found now, not as a service failing every 5 s.
-    "$dest/cinefit" settings > /dev/null ||
-        die "$dest/cinefit settings failed; current left as it was"
+    "$new" settings > /dev/null || {
+        rm -f "$new"
+        die "$1 settings failed; current left as it was"
+    }
 
+    # Renamed over the old one: reinstalling the build that is running must
+    # not leave it a half-written file.
+    mv -f "$new" "$dest/cinefit"
+    echo "$3 $(date -Iseconds)" > "$dest/VERSION"
     echo "installed $("$dest/cinefit" --version) into $dest"
     switch_to "$2/cinefit"
 }
