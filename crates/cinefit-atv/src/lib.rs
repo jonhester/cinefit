@@ -173,10 +173,14 @@ impl NowPlaying {
     }
 }
 
-/// Apple's time: seconds since 2001-01-01 UTC.
-pub fn cocoa(secs: f64) -> SystemTime {
+/// Apple's time: seconds since 2001-01-01 UTC. `None` for a value no
+/// `SystemTime` holds (infinite, or past about 9e18 s): it comes straight from
+/// the Apple TV, and panicking on it ended the reader for good (#289).
+/// Negative and NaN are taken as 0.
+pub fn cocoa(secs: f64) -> Option<SystemTime> {
     const EPOCH_2001: u64 = 978_307_200;
-    UNIX_EPOCH + Duration::from_secs(EPOCH_2001) + Duration::from_secs_f64(secs.max(0.0))
+    let since = Duration::try_from_secs_f64(secs.max(0.0)).ok()?;
+    (UNIX_EPOCH + Duration::from_secs(EPOCH_2001)).checked_add(since)
 }
 
 /// The player an app reports for when it has not said which: pyatv's
@@ -274,7 +278,7 @@ impl Tracker {
             episode: m.episode_number,
             duration: m.duration,
             elapsed: m.elapsed_time,
-            elapsed_at: m.elapsed_time_timestamp.map(cocoa),
+            elapsed_at: m.elapsed_time_timestamp.and_then(cocoa),
             rate: m.playback_rate,
             content_id: m.content_identifier,
             store_id: m.itunes_store_identifier,
@@ -797,6 +801,18 @@ fn answer_events(mut events: Conn) {
 mod tests {
     use super::*;
     use proto::*;
+
+    #[test]
+    fn apple_time_out_of_range_is_none_not_a_panic() {
+        let at = |s: f64| cocoa(s).map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs());
+        assert_eq!(at(0.0), Some(978_307_200));
+        assert_eq!(at(1.0e9), Some(1_978_307_200));
+        assert_eq!(at(-5.0), Some(978_307_200), "negative: the epoch");
+        assert_eq!(at(f64::NAN), Some(978_307_200), "NaN: the epoch");
+        assert_eq!(cocoa(f64::INFINITY), None);
+        assert_eq!(cocoa(1.0e19), None);
+        assert_eq!(cocoa(f64::MAX), None);
+    }
 
     // An event channel whose Apple TV never closes the socket still ends
     // with its session: its thread has exited once the channel is dropped
