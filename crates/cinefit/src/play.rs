@@ -48,12 +48,16 @@ use log::{info, warn};
 /// one frame is not enough.
 const STABLE_FRAMES: usize = 12;
 /// Frames of 10-bit RGB that does not decode as a Dolby Vision tunnel before
-/// it is taken for plain RGB: two seconds at 24p. The player starts a Dolby
-/// Vision title with RGB frames that carry no tunnel yet, and believing them
-/// on [`STABLE_FRAMES`] cost a modeset to SDR and another back a second later
-/// (2026-10-13, S&M montage). Plain 10-bit RGB is rare from this chain, so
-/// waiting for it costs little.
-const TUNNEL_GRACE: usize = 48;
+/// it is taken for plain RGB, while it could still be one (its low bits clear,
+/// [`Key::tunnel_shaped`]): twenty seconds at 24p. The player starts a Dolby
+/// Vision title with RGB frames whose tunnel cannot be read yet, and believing
+/// them on [`STABLE_FRAMES`] cost a modeset to SDR and another back a second
+/// later (2026-10-13, S&M montage). Two seconds was too short: shown as plain
+/// RGB, tunnel bytes are a red screen, and in the rig's logs 16 of 26 starts
+/// took 3.7 to 12.9 s to decode (the other 10 within 0.6 s; all 4K 23.976,
+/// 2026-10-15 to 10-25). RGB that sets the low bits cannot be a tunnel and is
+/// trusted on [`STABLE_FRAMES`]: a real 10-bit RGB source does not wait.
+const TUNNEL_GRACE: usize = 480;
 /// How long to wait for stable input before starting without it. A source
 /// that is on settles in well under a second (a tunnel, in two); past this
 /// the display is opened at `output.wait_hz` with black, so it shows neither
@@ -365,6 +369,7 @@ fn rgb10_kind(t: TunnelFrame, last_tunnel: &mut Option<Tunnel>) -> Kind {
 /// Classifies a frame, updating the last good tunnel conversion.
 fn classify(frame: &Frame, last_tunnel: &mut Option<Tunnel>) -> Key {
     let info = frame.info();
+    let mut tunnel_shaped = false;
     let kind = match info.pixel_format {
         PixelFormat::V210 => Kind::Ycbcr(ycbcr_color(info)),
         PixelFormat::Argb8 => Kind::Rgb(rgb::Format::Argb8),
@@ -372,7 +377,12 @@ fn classify(frame: &Frame, last_tunnel: &mut Option<Tunnel>) -> Key {
             let t = frame
                 .pixels()
                 .map_or(TunnelFrame::Absent, |p| decode_tunnel(info, p.bytes()));
-            rgb10_kind(t, last_tunnel)
+            let kind = rgb10_kind(t, last_tunnel);
+            tunnel_shaped = kind == Kind::Rgb(rgb::Format::R210)
+                && frame
+                    .pixels()
+                    .is_some_and(|p| could_be_tunnel(p.bytes(), info));
+            kind
         }
         other => Kind::Unsupported(other),
     };
@@ -380,13 +390,25 @@ fn classify(frame: &Frame, last_tunnel: &mut Option<Tunnel>) -> Key {
         width: info.width,
         height: info.height,
         kind,
+        tunnel_shaped,
     }
+}
+
+/// Whether an `r210` frame could carry a tunnel: the low two bits of every
+/// component clear on its first and middle rows, as a tunnel's are. Padded
+/// 8-bit RGB is clear too, so it waits as a tunnel might.
+fn could_be_tunnel(bytes: &[u8], info: &FrameInfo) -> bool {
+    let (w, rb) = (info.width as usize, info.row_bytes);
+    let row = |y: usize| bytes.get(y * rb..y * rb + w * 4);
+    [0, info.height as usize / 2]
+        .into_iter()
+        .all(|y| row(y).is_some_and(|r| !crate::capture::r210_low_bits_set(r, w)))
 }
 
 /// How many frames in a row an input must hold before it is believed.
 fn frames_to_trust(key: Key) -> usize {
     match key.kind {
-        Kind::Rgb(rgb::Format::R210) => TUNNEL_GRACE,
+        Kind::Rgb(rgb::Format::R210) if key.tunnel_shaped => TUNNEL_GRACE,
         _ => STABLE_FRAMES,
     }
 }
@@ -4085,6 +4107,48 @@ mod tests {
         });
         let found = finder.find(&info, Some(&full), sdr, 2.0, 3);
         assert_eq!(found.source, geo::Source::Rows { top: 0, bottom: 0 });
+    }
+
+    /// RGB that could be a tunnel waits the long grace for one to decode;
+    /// RGB that uses its low bits cannot be one, and is trusted as quickly as
+    /// any input (#189).
+    #[test]
+    fn only_rgb_that_could_be_a_tunnel_waits_for_one() {
+        let (w, h) = (8u32, 4u32);
+        let info = FrameInfo {
+            width: w,
+            height: h,
+            row_bytes: w as usize * 4,
+            pixel_format: PixelFormat::Rgb10,
+            ..v210(2, 2, |_, _| 64).0
+        };
+        // Each pixel a big-endian word: 2 unused bits, then R, G, B at 10.
+        let frame = |px: &dyn Fn(u32) -> u32| -> Vec<u8> {
+            (0..w * h)
+                .flat_map(|i| {
+                    let v = px(i);
+                    (v << 20 | v << 10 | v).to_be_bytes()
+                })
+                .collect()
+        };
+        // 8-bit values padded to 10 bits, as a tunnel carries its bytes.
+        assert!(could_be_tunnel(&frame(&|i| (i % 256) << 2), &info));
+        // A 10-bit picture: some low bits set.
+        assert!(!could_be_tunnel(&frame(&|i| 300 + i), &info));
+        // Set on the middle row alone is enough.
+        let middle = h / 2 * w;
+        assert!(!could_be_tunnel(
+            &frame(&|i| if i == middle { 513 } else { 512 }),
+            &info
+        ));
+        let key = |tunnel_shaped| Key {
+            width: w,
+            height: h,
+            kind: Kind::Rgb(rgb::Format::R210),
+            tunnel_shaped,
+        };
+        assert_eq!(frames_to_trust(key(true)), TUNNEL_GRACE);
+        assert_eq!(frames_to_trust(key(false)), STABLE_FRAMES);
     }
 
     /// A 1080p tunnel frame with `bar` black rows top and bottom and a

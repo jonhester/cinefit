@@ -27,6 +27,11 @@ pub(crate) struct Key {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) kind: Kind,
+    /// 10-bit RGB that did not decode as a tunnel, but could be one: the low
+    /// two bits of its components clear on the rows checked, as a tunnel's
+    /// always are (0 of 35,961 frames set them, 2026-10-25). RGB that uses
+    /// them is plain RGB and need not wait for one (#189).
+    pub(crate) tunnel_shaped: bool,
 }
 
 /// What the input *is*: the capture's [`Kind`] read with the settings that
