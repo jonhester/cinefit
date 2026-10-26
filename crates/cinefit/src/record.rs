@@ -632,8 +632,16 @@ fn too_big(line: usize) -> std::io::Error {
 }
 
 /// An index frame's width, height and row bytes, within what the card
-/// makes: its rows together no larger than its largest frame.
+/// makes: its rows together no larger than its largest frame, and not empty.
+/// Only frames with a picture are recorded, so a 0 is a damaged index, and
+/// the readers downstream divide by the width (#294).
 fn frame_dims(w: u64, h: u64, row: u64, line: usize) -> std::io::Result<(usize, usize, usize)> {
+    if w == 0 || h == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frames.csv line {line}: a frame with no picture (width or height 0)"),
+        ));
+    }
     let rows = row.checked_mul(h).ok_or_else(|| too_big(line))?;
     if w > MAX_WIDTH || h > MAX_HEIGHT || rows > MAX_FRAME_BYTES {
         return Err(too_big(line));
@@ -1282,6 +1290,8 @@ pub(crate) mod tests {
             "0,0,1000000000000,0.0,1001,1001,3840,2160,10240,v210,,,,,,",
             "0,0,22118400,0.0,1001,1001,99999,2160,10240,v210,,,,,,",
             "0,0,22118400,0.0,1001,1001,3840,2160,99999999,v210,,,,,,",
+            "0,0,22118400,0.0,1001,1001,0,2160,10240,v210,,,,,,",
+            "0,0,22118400,0.0,1001,1001,3840,0,10240,v210,,,,,,",
         ] {
             let e = ours(bad).expect_err(bad);
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{bad}: {e}");
@@ -1302,6 +1312,8 @@ pub(crate) mod tests {
         );
         let e = cpp("0,0,0,0,24000,1001,3840,4000000000,4000000000")
             .expect_err("overflowing dimensions");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+        let e = cpp("0,0,0,0,24000,1001,0,2160,10240").expect_err("width 0");
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
