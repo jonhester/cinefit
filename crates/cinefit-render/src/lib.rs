@@ -1101,7 +1101,8 @@ impl Placebo {
     ///
     /// # Errors
     ///
-    /// [`Error::Render`] if libplacebo fails.
+    /// [`Error::Render`] if libplacebo fails, or if `dst` cannot be cleared
+    /// (its format is not blittable).
     pub fn clear_black(&self, dst: &Texture<'_>) -> Result<(), Error> {
         self.owns(dst.pl)?;
         // SAFETY: the texture belongs to this live device (checked above).
