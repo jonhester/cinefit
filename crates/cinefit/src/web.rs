@@ -16,6 +16,9 @@
 //! the Apple TV is paired, and `POST /api/atv/pair/start` and
 //! `/api/atv/pair/finish` with `{"pin": …}` to pair it (#115); `POST
 //! /api/save` saves the frame on screen (#92).
+//!
+//! Open, but only to the home network itself (#268): a request whose Host
+//! is a public name is refused, and so is a POST from another site's page.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -112,8 +115,96 @@ fn json_response(code: u16, body: &Json) -> Response<std::io::Cursor<Vec<u8>>> {
         .with_header(header("Cache-Control", "no-store"))
 }
 
+/// The value of a request header, if it was sent.
+fn header_value<'a>(request: &'a tiny_http::Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str())
+}
+
+/// Whether a request's Host is one the home network itself gives: an IP
+/// address, `localhost`, a bare hostname, or a name under a suffix no one
+/// can register in public DNS (`.local` from mDNS, `.lan`, `.home.arpa`,
+/// `.internal`). DNS rebinding needs a name its attacker serves, which is
+/// a public dotted one, so those are what is refused; the owner's ways in
+/// (the IP, the hostname, `name.local`) all pass. No Host at all is a
+/// client that is not a browser (HTTP/1.0, curl by hand): let through.
+fn host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host else { return true };
+    let host = host.trim();
+    // A bracketed IPv6 address, with or without a port.
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split_once(']').is_some_and(|(ip, port)| {
+            ip.parse::<std::net::Ipv6Addr>().is_ok()
+                && (port.is_empty() || port.strip_prefix(':').is_some_and(is_port))
+        });
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if is_port(port) => name,
+        Some(_) => return false,
+        None => host,
+    };
+    // `name.` is the same name as an absolute one.
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    let hostname = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+    };
+    if !hostname(&name) {
+        return false;
+    }
+    if name.parse::<std::net::Ipv4Addr>().is_ok() || !name.contains('.') {
+        return true;
+    }
+    [".local", ".lan", ".home.arpa", ".internal", ".localhost"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn is_port(p: &str) -> bool {
+    !p.is_empty() && p.parse::<u16>().is_ok()
+}
+
+/// Whether a POST may change anything: a browser names the page that sent
+/// it in Origin, and only the page served here (same host and port as the
+/// request was sent to) may. Without an Origin it is not a browser page
+/// (curl, a script on the network), which is allowed as before. A text/plain
+/// POST from another site needs no preflight, so this is the check that
+/// stops it; Origin `null` (a sandboxed or local file page) is refused.
+fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let Some(host) = host else { return false };
+    origin
+        .trim()
+        .strip_prefix("http://")
+        .is_some_and(|o| o.eq_ignore_ascii_case(host.trim()))
+}
+
 fn serve(s: &Shared, mut request: tiny_http::Request) {
     let url = request.url().split('?').next().unwrap_or("").to_string();
+    let host = header_value(&request, "Host");
+    let refused = if !host_allowed(host) {
+        Some("this page is served only by its address on the home network")
+    } else if *request.method() == Method::Post
+        && !origin_allowed(header_value(&request, "Origin"), host)
+    {
+        Some("changes are taken only from cinefit's own page")
+    } else {
+        None
+    };
+    if let Some(why) = refused {
+        warn!(
+            "web: refused {} {url} (Host {:?}, Origin {:?})",
+            request.method(),
+            host.unwrap_or(""),
+            header_value(&request, "Origin").unwrap_or("")
+        );
+        let _ = request.respond(json_response(403, &json!({"error": why})));
+        return;
+    }
     let reply = match (request.method(), url.as_str()) {
         (Method::Get, "/") => Response::from_string(PAGE)
             .with_header(header("Content-Type", "text/html; charset=utf-8"))
@@ -500,6 +591,79 @@ mod tests {
             [("detect.crop".to_string(), "off".to_string())]
         );
         assert!(http(port, "GET /nothing HTTP/1.0\r\n\r\n").contains(" 404 "));
+        // Another site's page, and a rebound name: refused, nothing queued.
+        let cross = http(
+            port,
+            &format!(
+                "POST /api/set HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://evil.example.com\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(cross.contains(" 403 "), "{cross:.80}");
+        let rebound = http(
+            port,
+            "GET /api/state HTTP/1.1\r\nHost: evil.example.com:8080\r\nConnection: close\r\n\r\n",
+        );
+        assert!(rebound.contains(" 403 "), "{rebound:.80}");
+        assert!(web.take_changes().is_empty());
+    }
+
+    #[test]
+    fn only_home_network_hosts_are_served() {
+        for ok in [
+            None,
+            Some("192.168.1.20:8080"),
+            Some("192.168.1.20"),
+            Some("[::1]:8080"),
+            Some("[fe80::1]"),
+            Some("localhost:8080"),
+            Some("cinefit"),
+            Some("Cinefit:8080"),
+            Some("cinefit.local:8080"),
+            Some("cinefit.lan"),
+            Some("cinefit.home.arpa:8080"),
+            Some("cinefit.local."),
+        ] {
+            assert!(host_allowed(ok), "{ok:?}");
+        }
+        for bad in [
+            "evil.example.com:8080",
+            "evil.com",
+            "evil.com.",
+            "192.168.1.20.nip.io",
+            "local.evil.com",
+            "cinefit:port",
+            "cinefit:99999",
+            "[::1",
+            "[not-v6]:8080",
+            "::1",
+            ":8080",
+            "",
+        ] {
+            assert!(!host_allowed(Some(bad)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_the_page_itself_may_post() {
+        let host = Some("192.168.1.20:8080");
+        assert!(origin_allowed(None, host), "not a browser");
+        assert!(origin_allowed(Some("http://192.168.1.20:8080"), host));
+        assert!(origin_allowed(
+            Some("http://Cinefit.local:8080"),
+            Some("cinefit.local:8080")
+        ));
+        for bad in [
+            "https://evil.example.com",
+            "http://evil.example.com",
+            "http://192.168.1.20",
+            "http://192.168.1.20:8081",
+            "null",
+            "",
+        ] {
+            assert!(!origin_allowed(Some(bad), host), "{bad}");
+        }
+        assert!(!origin_allowed(Some("http://192.168.1.20:8080"), None));
     }
 
     #[test]
