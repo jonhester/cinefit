@@ -144,8 +144,8 @@ pub fn source_rows(frame_w: u32, frame_h: u32, top: u32, bottom: u32) -> Rect {
 /// instead and loses a sliver at each side: a 2.40 film gives up 1% of its
 /// width a side and shows no bars. Wider content (2.55, 2.76) keeps its full
 /// width and its thin bars. Narrows `src` symmetrically in whole pixels and
-/// returns whether it applied; place the result at its own aspect, which then
-/// fills the window. 0 is off.
+/// returns whether it applied; place the result at the window itself, which
+/// it then fills. 0 is off.
 ///
 /// A measured crop's ratio wobbles by a row around the nominal one (2.40
 /// measures 2.3985 or 2.4015), so "no wider than" allows 0.5%.
@@ -158,11 +158,10 @@ pub fn trim_sides(win: Rect, fill_max_ar: f64, src: &mut Rect) -> bool {
         return false;
     }
     // Rounded up: a hair wider than the window, so it fills it exactly
-    // rather than landing a pixel short.
-    let w = (f64::from(src.h) * win_ar).ceil() as u32;
-    if w >= src.w {
-        return false;
-    }
+    // rather than landing a pixel short. Content less than a column wider
+    // than the window (544 rows of 1280) has nothing to trim but still fills
+    // it, rather than being letterboxed by a single row.
+    let w = ((f64::from(src.h) * win_ar).ceil() as u32).min(src.w);
     src.x += (src.w - w) / 2;
     src.w = w;
     true
@@ -199,9 +198,10 @@ pub struct Placement {
 }
 
 /// Places one frame: the source from measured rows or a stated aspect,
-/// trimmed at the sides when [`trim_sides`] applies, placed in the window by
-/// [`dest_rect`]. Rows, not ratios: measured rows are placed at width over
-/// rows, never rounded to a named ratio.
+/// trimmed at the sides when [`trim_sides`] applies and then filling the
+/// window, otherwise placed in it by [`dest_rect`]. Rows, not ratios:
+/// measured rows are placed at width over rows, never rounded to a named
+/// ratio.
 pub fn place_frame(
     frame: (u32, u32),
     out: (u32, u32),
@@ -229,15 +229,15 @@ pub fn place_frame(
         Source::Rows { top, bottom } => (source_rows(frame.0, frame.1, top, bottom), true, 0.0),
         Source::Aspect(ar) => (source_crop(frame.0, frame.1, ar), false, ar),
     };
-    let trimmed = trim_sides(win, fill_max_ar, &mut src);
-    let dst = dest_rect(
-        win,
-        if by_rows || trimmed {
-            src.aspect()
-        } else {
-            content_ar
-        },
-    );
+    // A trimmed source is placed at the window itself, not at its own aspect:
+    // the trim was chosen to fill it, and its rounded-up column is enough at
+    // 1080 or 720 rows to put the aspect past the window's and land a row
+    // short. Filling it stretches by at most that one column.
+    let dst = if trim_sides(win, fill_max_ar, &mut src) {
+        win
+    } else {
+        dest_rect(win, if by_rows { src.aspect() } else { content_ar })
+    };
     Placement { src, dst }
 }
 
@@ -357,6 +357,43 @@ mod tests {
         assert!(!trim_sides(w, 2.40, &mut s178));
         let mut off = source_rows(3840, 2160, 280, 279);
         assert!(!trim_sides(w, 0.0, &mut off), "fill 0: off");
+    }
+
+    #[test]
+    fn trimmed_content_fills_the_window_at_every_source_size() {
+        // At 1080 and 720 rows the trim's extra column is a bigger share of
+        // the width than at 2160, enough to tip dest_rect into its width-bound
+        // branch and land a row short (1741 of 1742); and a crop less than a
+        // column wider than the window was not trimmed at all, so landed
+        // there too.
+        let w = win();
+        for (fw, fh) in [(1920, 1080), (1280, 720), (3840, 2160)] {
+            let mut filled = 0;
+            for h in 1..=fh {
+                let ar = f64::from(fw) / f64::from(h);
+                if ar <= w.aspect() || ar > 2.40 * 1.005 {
+                    continue;
+                }
+                let (top, bottom) = ((fh - h) / 2, fh - h - (fh - h) / 2);
+                let p = place_frame(
+                    (fw, fh),
+                    (4096, 2160),
+                    w,
+                    Source::Rows { top, bottom },
+                    2.40,
+                );
+                assert_eq!(p.dst, w, "{fw}x{fh}, {h} rows");
+                assert_eq!((p.src.y, p.src.h), (top, h), "{fw}x{fh}, {h} rows");
+                assert!(p.src.x + p.src.w <= fw);
+                let off_centre = 2 * i64::from(p.src.x) + i64::from(p.src.w) - i64::from(fw);
+                assert!(off_centre.abs() <= 1, "{fw}x{fh}, {h} rows");
+                // Stretched to the window by at most the one column rounded up.
+                assert!(p.src.aspect() >= w.aspect());
+                assert!(f64::from(p.src.w) - f64::from(h) * w.aspect() < 1.0);
+                filled += 1;
+            }
+            assert!(filled > 0, "{fw}x{fh}: the fill range holds crops");
+        }
     }
 
     #[test]
