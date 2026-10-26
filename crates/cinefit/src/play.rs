@@ -853,7 +853,8 @@ struct CropFinder {
     /// by its shots (#109). The epoch it last saw, to start again on a new one.
     tunnel_cuts: cinefit_detect::cuts::Cuts,
     tunnel_epoch: u32,
-    /// Measure HDR10 frames' L1 for Dolby's mapping (`output.mode` dolby,
+    /// Measure HDR10 frames' L1 for the display model (`output.mode`
+    /// cinefithdr,
     /// #141), over the rows the crop keeps.
     measure: bool,
 }
@@ -1708,7 +1709,8 @@ fn one_to_one(dst: &Target<'_, '_>) -> Mapping {
 /// The second half: the uploaded frame drawn into the target, with the crop
 /// the detector found for this same frame. `hdr` is the HDR10 metadata in
 /// force for it, carried over frames without a block; `hdr10_scene` the
-/// shot's measured L1 for Dolby's mapping, with `output.mode` dolby; `dm` the
+/// shot's measured L1 for the display model, with `output.mode` cinefithdr;
+/// `dm` the
 /// last mapping table, kept between frames.
 #[allow(clippy::too_many_arguments)]
 fn draw(
@@ -2172,7 +2174,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
         thumbs: cfg.record,
         tunnel_cuts: Default::default(),
         tunnel_epoch: 0,
-        measure: cfg.mode == config::OutputMode::Dolby,
+        measure: cfg.mode == config::OutputMode::CinefitHdr,
     };
     // The detector's dataset (#91): a session directory, opened on the first
     // frame recorded, so a run with nothing coming in leaves none.
@@ -2541,7 +2543,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                 match key {
                     "detect.crop" => finder.set_on(cfg.crop),
                     "detect.record" => finder.thumbs = cfg.record,
-                    "output.mode" => finder.measure = cfg.mode == config::OutputMode::Dolby,
+                    "output.mode" => finder.measure = cfg.mode == config::OutputMode::CinefitHdr,
                     "geometry.screen_ar" => {
                         win = geo::screen_window(size.0, size.1, cfg.screen_ar.value());
                         ui.set_band((win.y, win.h));

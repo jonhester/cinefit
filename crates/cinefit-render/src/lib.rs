@@ -405,7 +405,7 @@ impl Placebo {
 
 /// The passes [`Placebo::take_gpu_results`] times, in its order: the frame's upload,
 /// its unpack on the GPU, the decode into the Dolby mapping's RGB (the
-/// tunnel's, or HDR10's under `output.mode` dolby), the Dolby mapping, and the
+/// tunnel's, or HDR10's under `output.mode` cinefithdr), the Dolby mapping, and the
 /// render that scales, converts and writes the output.
 pub const PASSES: [&str; 5] = ["upload", "unpack", "decode", "Dolby mapping", "output"];
 

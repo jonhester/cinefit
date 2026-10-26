@@ -1,4 +1,4 @@
-//! L1 measured from an HDR10 picture, for Dolby's display mapping (#141):
+//! L1 measured from an HDR10 picture, for cinefit's model of Dolby's display mapping (#141):
 //! the minimum, mean and maximum of max(R,G,B) in PQ, as Dolby's analysis
 //! gives them, over the picture without its bars.
 //!
