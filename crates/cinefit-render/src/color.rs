@@ -47,7 +47,8 @@ pub struct RgbSourceColor {
     pub transfer: Transfer,
 }
 
-/// An RGB target: always full range.
+/// An RGB target, always full range; also captured RGB's primaries and
+/// transfer apart from its range, which the card does not report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbColor {
     pub primaries: Primaries,

@@ -1053,25 +1053,28 @@ impl Placebo {
         dst_color: RgbColor,
         place: Option<Rect>,
     ) -> Result<(), Error> {
-        self.render_rgb_view(src, color, dst, dst_color, View::placed(place))
+        self.render_rgb_mapped(src, color, dst, dst_color, View::placed(place), None)
     }
 
     /// [`render_rgb`](Self::render_rgb) with a source crop as well as a
-    /// placement.
+    /// placement, and a tone mapping into a target that cannot show the
+    /// source's range, as [`render_ycbcr_mapped`](Self::render_ycbcr_mapped).
     ///
     /// # Errors
     ///
     /// As [`render_rgb`](Self::render_rgb).
-    pub fn render_rgb_view(
+    pub fn render_rgb_mapped(
         &self,
         src: &GpuRgb<'_>,
         color: RgbSourceColor,
         dst: &Texture<'_>,
         dst_color: RgbColor,
         view: View,
+        map: Option<&Mapping>,
     ) -> Result<(), Error> {
         let place = Rect::raw(view.dst.as_ref());
         let src_crop = Rect::raw(view.src.as_ref());
+        let map = map.map(Mapping::raw);
         let levels = match color.levels {
             Levels::Full => ffi::LEVELS_FULL,
             Levels::Limited => ffi::LEVELS_LIMITED,
@@ -1079,7 +1082,9 @@ impl Placebo {
         self.owns(src.pl)?;
         self.owns(dst.pl)?;
         // SAFETY: the source and the texture belong to this live device
-        // (checked above); `place` is null or four floats, read during the call.
+        // (checked above); `place` and `src_crop` are null or four floats and
+        // `map` null or a struct whose layout the shim shares, all read
+        // during the call.
         let rc = unsafe {
             ffi::cf_pl_render_rgb(
                 self.handle.as_ptr(),
@@ -1091,6 +1096,7 @@ impl Placebo {
                 primaries_raw(dst_color.primaries),
                 transfer_raw(dst_color.transfer),
                 place.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                map.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
                 src_crop.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             )
         };

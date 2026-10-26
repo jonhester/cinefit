@@ -967,7 +967,7 @@ int cf_pl_rgb_download(cf_pl *pl, cf_pl_rgb *r, uint16_t *out) {
 
 int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
                      cf_pl_tex *dst, int dst_prim, int dst_trc, const float *place,
-                     const float *src_crop) {
+                     const cf_pl_map *map, const float *src_crop) {
     if (!src->filled) {
         log_err(pl, "RGB read before any frame was unpacked into it");
         return -1;
@@ -998,6 +998,9 @@ int cf_pl_render_rgb(cf_pl *pl, cf_pl_rgb *src, int levels, int prim, int trc,
     params.dither_params = NULL;
     // As in cf_pl_render_ycbcr: no tone mapping between identical spaces.
     params.peak_detect_params = NULL;
+    struct pl_color_map_params cmp;
+    struct pl_peak_detect_params pdp;
+    apply_map(&image, &target, &params, &cmp, &pdp, map);
     if (!render_timed(pl, CF_PL_PASS_OUTPUT, &image, &target, &params)) return -1;
     pl_gpu_finish(pl->vk->gpu);
     return 0;
