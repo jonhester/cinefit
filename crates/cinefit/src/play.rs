@@ -2417,11 +2417,11 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
     match (&start_key, &start_input) {
         (Some(key), Some(input)) => {
             if let Some(b) = banner_for(
-                Content::of(key.kind, opts.config.lldv),
+                Content::of(key.kind, cfg.lldv),
                 (key.width, key.height),
                 rate_mhz(input),
                 size.0,
-                &opts.config,
+                &cfg,
             ) {
                 ui.picture(b, true, now);
             }
@@ -3128,7 +3128,7 @@ fn play(opts: Options) -> Result<(), Box<dyn Error>> {
                                 (k.width, k.height),
                                 want.rate_mhz,
                                 size.0,
-                                &opts.config,
+                                &cfg,
                             )
                         {
                             let resync = want.mode_key() != policy.committed().mode_key();
