@@ -939,14 +939,25 @@ impl Output {
         let mut hdr_blob = None;
         match &self.hdr {
             Some(hdr) => {
-                let prop = p
+                let made = p
                     .hdr_metadata
-                    .ok_or(Error::MissingProperty("HDR_OUTPUT_METADATA"))?;
-                let id = blob_id(
-                    self.card
-                        .create_property_blob(&hdr.blob())
-                        .map_err(io("creating the HDR metadata blob"))?,
-                );
+                    .ok_or(Error::MissingProperty("HDR_OUTPUT_METADATA"))
+                    .and_then(|prop| {
+                        self.card
+                            .create_property_blob(&hdr.blob())
+                            .map(|b| (prop, blob_id(b)))
+                            .map_err(io("creating the HDR metadata blob"))
+                    });
+                let (prop, id) = match made {
+                    Ok(made) => made,
+                    Err(e) => {
+                        // The mode blob is already made, and nothing else
+                        // frees it before the fd closes: a refused switch is
+                        // retried, one blob a try (#281).
+                        let _ = self.card.destroy_property_blob(blob);
+                        return Err(e);
+                    }
+                };
                 hdr_blob = Some(id);
                 set.push((conn, prop, id));
                 if let Some(cs) = &p.colorspace
