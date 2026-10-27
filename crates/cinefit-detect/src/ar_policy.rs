@@ -355,15 +355,17 @@ impl ArPolicy {
         k.tight.bottom = k.tight.bottom.max(rows.bottom).min(k.rows.bottom + cap);
     }
 
-    /// A matte opening: the height's wide rows move to `rows`, and its deep
-    /// rows stay within `widen_max` of them, so three openings do not leave
-    /// the first clip's deep reading matching a height it is 9 rows inside.
+    /// The height's wide rows widen to contain `rows` (a matte opening, or a
+    /// return a row or two wider), never narrowing, and its deep rows stay
+    /// within `widen_max` of them: three openings must not leave the first
+    /// clip's deep reading matching a height it is 9 rows inside.
     fn widen_known(&mut self, i: usize, rows: Crop) {
         let cap = self.tol(self.p.widen_max);
         let k = &mut self.known[i];
-        k.rows = rows;
-        k.tight.top = k.tight.top.max(rows.top).min(rows.top + cap);
-        k.tight.bottom = k.tight.bottom.max(rows.bottom).min(rows.bottom + cap);
+        k.rows.top = k.rows.top.min(rows.top);
+        k.rows.bottom = k.rows.bottom.min(rows.bottom);
+        k.tight.top = k.tight.top.max(rows.top).min(k.rows.top + cap);
+        k.tight.bottom = k.tight.bottom.max(rows.bottom).min(k.rows.bottom + cap);
     }
 
     fn near_standard(&self, rows: Crop, within: u32) -> bool {
@@ -786,10 +788,8 @@ impl ArPolicy {
                         // than the wide rows lands on them, not on itself.
                         self.crop = match k {
                             Some(i) => {
-                                let kr = &mut self.known[i].rows;
-                                kr.top = kr.top.min(rows.top);
-                                kr.bottom = kr.bottom.min(rows.bottom);
-                                *kr
+                                self.widen_known(i, rows);
+                                self.known[i].rows
                             }
                             None => {
                                 self.known.push(Known {
@@ -1095,6 +1095,17 @@ mod tests {
             d.changed && r.p.crop() == crop(266, 266),
             "5 rows inside: is"
         );
+        r.feed(&letterbox(crop(271, 271)), 12); // confirms the zoom-in
+        // A return two rows wider moves the wide rows and re-caps the deep
+        // ones to 270: 273 matched before (272 + tol_match), not now; 272 does.
+        r.feed(&full(), 48);
+        assert!(r.push(&letterbox(crop(264, 264))).changed);
+        assert_eq!(r.p.crop(), crop(264, 264));
+        r.feed(&letterbox(crop(264, 264)), 12);
+        r.feed(&full(), 48);
+        assert!(!r.push(&letterbox(crop(273, 273))).changed, "9 inside: not");
+        assert!(r.push(&letterbox(crop(272, 272))).changed, "8 inside: is");
+        assert_eq!(r.p.crop(), crop(264, 264));
     }
 
     #[test]
