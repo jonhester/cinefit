@@ -209,6 +209,15 @@ pub struct Share {
 /// full height and needs no state of its own.
 const STANDARD: [f64; 9] = [1.85, 1.90, 2.00, 2.20, 2.35, 2.39, 2.40, 2.55, 2.76];
 
+/// [measured] Two standard heights this close (active rows at 2160) make a
+/// cluster, and a height between them is near a standard too: 2.35, 2.39
+/// and 2.40 (1634, 1607 and 1600 rows at 3840 wide), where a film clip
+/// scaled into a 16:9 programme lands (the Top Gun featurettes' scope at
+/// 2.37 to 2.385, 5 to 11 rows from 2.39). Over the 37-clip set, no menu or
+/// trailer frame fell between them (#337); the 1.86 trailers sit 55 rows below
+/// 1.90, outside any cluster, and stay non-standard.
+const CLUSTER_GAP: u32 = 30;
+
 struct Known {
     /// The widest rows the height has shown: what a return lands on.
     rows: Crop,
@@ -374,6 +383,22 @@ impl ArPolicy {
             let s = (f64::from(self.width) / r).round() as u32;
             s < self.height && a.abs_diff(s) <= within
         })
+    }
+
+    /// Between two standard heights less than `CLUSTER_GAP` apart: scaled
+    /// scope. Near a standard for the non-standard rule, not for `exact`.
+    fn in_cluster(&self, rows: Crop) -> bool {
+        let a = rows.active(self.height);
+        let gap = self.tol(CLUSTER_GAP);
+        let mut heights: Vec<u32> = STANDARD
+            .iter()
+            .map(|&r| (f64::from(self.width) / r).round() as u32)
+            .filter(|&s| s < self.height)
+            .collect();
+        heights.sort_unstable();
+        heights
+            .windows(2)
+            .any(|w| w[1] - w[0] <= gap && w[0] <= a && a <= w[1])
     }
 
     fn prior_of(&self, k: Option<usize>, t: f64) -> Prior {
@@ -704,7 +729,10 @@ impl ArPolicy {
                 // candidate already counting is not dropped at the band's
                 // edge: a reading that jitters a row across it (265/265 to
                 // 265/266 on a 2.356:1 clip, twice in 1.8 s) started over.
-                if k.is_none() && !continuing && !self.near_standard(rows, self.tol(self.p.tol_ar))
+                if k.is_none()
+                    && !continuing
+                    && !self.near_standard(rows, self.tol(self.p.tol_ar))
+                    && !self.in_cluster(rows)
                 {
                     self.candidate = None;
                     let held = self
@@ -762,7 +790,9 @@ impl ArPolicy {
                     // (the jitter above) but cannot zoom in: a dark-edged menu
                     // holding 2 rows past the band would otherwise adopt on
                     // evidence alone, around the non-standard rule.
-                    let in_band = k.is_some() || self.near_standard(rows, self.tol(self.p.tol_ar));
+                    let in_band = k.is_some()
+                        || self.near_standard(rows, self.tol(self.p.tol_ar))
+                        || self.in_cluster(rows);
                     let prior = self.prior_of(k, t);
                     let threshold = self.threshold(prior);
                     let c = self.candidate.as_mut().expect("set above");
@@ -1064,12 +1094,12 @@ mod tests {
 
     // A candidate begun in the band keeps counting through readings just
     // outside it, but cannot zoom in on one: a dark-edged menu holding at
-    // 267/267 (8 rows from 2.35) never adopts without the non-standard rule.
+    // 73/73 (7 rows from 1.90) never adopts without the non-standard rule.
     #[test]
     fn a_candidate_cannot_adopt_on_a_frame_outside_the_band() {
         let mut r = Run::new();
-        r.feed(&letterbox(crop(265, 265)), 4);
-        r.feed(&letterbox(crop(267, 267)), 24 * 20);
+        r.feed(&letterbox(crop(71, 71)), 4);
+        r.feed(&letterbox(crop(73, 73)), 24 * 20);
         assert_eq!(r.p.crop(), FULL);
         assert!(
             r.last.diag.candidate.is_some(),
@@ -1106,6 +1136,29 @@ mod tests {
         assert!(!r.push(&letterbox(crop(273, 273))).changed, "9 inside: not");
         assert!(r.push(&letterbox(crop(272, 272))).changed, "8 inside: is");
         assert_eq!(r.p.crop(), crop(264, 264));
+    }
+
+    // A featurette's scope clip is the film scaled a little up: 271/271 is
+    // 2.373:1, between 2.35 and 2.39. A new height, not a non-standard one,
+    // so one shot without a cut adopts it; 1.86 (48/48, 55 rows below
+    // 1.90) and 2.08 (158/158) still wait for the non-standard rule.
+    #[test]
+    fn a_height_between_the_scope_standards_is_new_not_non_standard() {
+        let mut r = Run::new();
+        let mut reason = "";
+        for _ in 0..48 {
+            let d = r.push(&letterbox(crop(271, 271)));
+            if d.changed {
+                reason = d.diag.reason;
+                break;
+            }
+        }
+        assert_eq!((r.p.crop(), reason), (crop(271, 271), "zoom in (new)"));
+        for rows in [crop(48, 48), crop(158, 158)] {
+            let mut r = Run::new();
+            r.feed(&letterbox(rows), 48);
+            assert_eq!(r.p.crop(), FULL, "{rows:?}: still non-standard");
+        }
     }
 
     #[test]
