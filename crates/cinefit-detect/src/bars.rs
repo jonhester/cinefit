@@ -61,8 +61,10 @@ pub struct Params {
     /// row at 95 on each side, over bar at 64.
     pub edge_lines: u32,
     /// [measured] Rows at 2160 of black line that sharpness looks past, inside
-    /// the edge. Top Gun: Maverick's featurette puts two rows at 64 between
-    /// its grey bars (76, ending on a row of ringing) and each film clip.
+    /// the edge; also the most rows of ringing the line may sit behind. Top
+    /// Gun: Maverick's featurette puts two rows at 64 between its grey bars
+    /// (76, ending on one row of ringing on most clips, two on a clip at
+    /// 2.356:1) and each film clip.
     pub black_line: u32,
 }
 
@@ -601,10 +603,37 @@ impl Bars {
         obs.bar = edge;
         let last = band - 1;
 
-        // Coverage and strength just inside the edge.
+        // Where the picture starts: at the edge, or past a black line between
+        // bar and picture (rows inside the edge no brighter than the bar,
+        // which a ramp never has), which may itself sit a row or two in,
+        // behind ringing (#258). The featurette's clips ring on one row
+        // (most) or two (a 2.356:1 clip: 265-266 at 87-89 over bars at 76),
+        // then two rows at 64, then the picture. Read from the edge, the
+        // two-row clip had no line: its hard edge measured 0.03, and its
+        // strength was the ringing's, 0.01, so as a never-seen height it
+        // never gathered its evidence.
+        let (ring, line) = if p.black_line == 0 {
+            (0, 0)
+        } else {
+            let most = scaled(p.black_line, h);
+            let ring = (1..=most)
+                .take_while(|&k| s.excess(edge + k) >= 1.0)
+                .count() as u32;
+            let line = (1..=most)
+                .take_while(|&k| s.excess(edge + ring + k) < 1.0)
+                .count() as u32;
+            (ring, line)
+        };
+        let start = if line > 0 {
+            edge + ring + line + 1
+        } else {
+            edge
+        };
+
+        // Coverage and strength just inside the picture's start.
         let (mut cov, mut ex) = (0.0, 0.0);
         for k in 0..p.edge_rows {
-            let i = (edge + k).min(last);
+            let i = (start + k).min(last);
             cov += f64::from(s.lit_count(i).0) / w as f64;
             ex += s.excess(i);
         }
@@ -612,19 +641,9 @@ impl Bars {
         obs.strength = (ex / f64::from(p.edge_rows) / p.strength_span).min(1.0);
 
         // Sharpness: a matte edge reaches full level within a row or two, a
-        // dark scene ramps up over many. Row edge+1 skips the ringing row; the
-        // reference is 12 rows in, deep enough that a ramp is still climbing
-        // where a real edge has long been flat. A black line between bar and
-        // picture (rows inside the edge no brighter than the bar, which a ramp
-        // never has) moves both past it, where the picture starts (#258).
-        let line = if p.black_line == 0 {
-            0
-        } else {
-            (1..=scaled(p.black_line, h))
-                .take_while(|&k| s.excess(edge + k) < 1.0)
-                .count() as u32
-        };
-        let start = edge + line + u32::from(line > 0);
+        // dark scene ramps up over many. Row start+1 skips the ringing row;
+        // the reference is 12 rows in, deep enough that a ramp is still
+        // climbing where a real edge has long been flat.
         let deep = s.excess(start + scaled(12, h));
         obs.sharpness = if deep > 1.0 {
             (s.excess(start + 1) / deep).min(1.0)
@@ -1036,6 +1055,37 @@ mod tests {
         assert!(o.top.sharpness > 0.5, "{}", o.top.sharpness);
         assert_eq!(o.class, FrameClass::Letterbox, "{o:?}");
         assert!(o.strength > 0.1, "{}", o.strength);
+    }
+
+    #[test]
+    fn a_black_line_behind_two_rows_of_ringing_keeps_it_sharp() {
+        // The featurette's clip at 2.356:1 (recording, 420 s): grey bars at
+        // 76 to row 264, ringing on 265 and 266, black on 267 and 268, the
+        // picture from 269. Read from the edge there is no black line and
+        // the hard edge measured 0.03; the line a row further in is found.
+        let pal = Palette::new(W);
+        let grey = Row::luma(W, |_| 76);
+        let ring = Row::luma(W, |x| if x % 16 == 0 { 100 } else { 84 });
+        let mut f = Frame::new(&pal, H);
+        f.content(269, 269, &pal.picture, 0);
+        for (y0, step) in [(0u32, 1i64), (H - 1, -1)] {
+            let at = |k: i64| (i64::from(y0) + step * k) as u32;
+            f.fill(at(0).min(at(264)), at(0).max(at(264)) + 1, &grey);
+            f.set(at(265), &ring);
+            f.set(at(266), &ring);
+            f.set(at(267), &pal.bar);
+            f.set(at(268), &pal.bar);
+        }
+        let o = observe(&mut f);
+        assert_eq!((o.top.bar, o.bottom.bar), (265, 265), "{o:?}");
+        assert!(o.top.sharpness > 0.5, "{}", o.top.sharpness);
+        assert!(o.bottom.sharpness > 0.5, "{}", o.bottom.sharpness);
+        assert_eq!(o.class, FrameClass::Letterbox, "{o:?}");
+        assert!(
+            o.strength > 0.3,
+            "the picture's, not the ringing's: {}",
+            o.strength
+        );
     }
 
     #[test]
