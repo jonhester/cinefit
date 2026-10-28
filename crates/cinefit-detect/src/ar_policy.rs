@@ -209,8 +209,9 @@ pub struct Share {
 /// full height and needs no state of its own.
 const STANDARD: [f64; 9] = [1.85, 1.90, 2.00, 2.20, 2.35, 2.39, 2.40, 2.55, 2.76];
 
-/// [measured] Two standard heights this close (active rows at 2160) make a
-/// cluster, and a height between them is near a standard too: 2.35, 2.39
+/// [measured] Two standard heights this close (active rows at 3840 wide;
+/// the distance between standards scales with the width) make a cluster,
+/// and a height between them is near a standard too: 2.35, 2.39
 /// and 2.40 (1634, 1607 and 1600 rows at 3840 wide), where a film clip
 /// scaled into a 16:9 programme lands (the Top Gun featurettes' scope at
 /// 2.37 to 2.385, 5 to 11 rows from 2.39). Over the 37-clip set, no menu or
@@ -389,7 +390,7 @@ impl ArPolicy {
     /// scope. Near a standard for the non-standard rule, not for `exact`.
     fn in_cluster(&self, rows: Crop) -> bool {
         let a = rows.active(self.height);
-        let gap = self.tol(CLUSTER_GAP);
+        let gap = (u64::from(CLUSTER_GAP) * u64::from(self.width) / 3840) as u32;
         let mut heights: Vec<u32> = STANDARD
             .iter()
             .map(|&r| (f64::from(self.width) / r).round() as u32)
@@ -1158,6 +1159,28 @@ mod tests {
             let mut r = Run::new();
             r.feed(&letterbox(rows), 48);
             assert_eq!(r.p.crop(), FULL, "{rows:?}: still non-standard");
+        }
+    }
+
+    // The cluster is a property of the widths, not the frame height: at
+    // 4096 x 2160 and 3840 x 1920 the scope standards are still clustered.
+    #[test]
+    fn the_scope_cluster_holds_at_other_frame_sizes() {
+        for (w, h, rows) in [
+            (4096u32, 2160u32, 220u32),
+            (3840, 1920, 151),
+            (1920, 1080, 136),
+        ] {
+            let mut r = Run::new();
+            let mut reason = "";
+            for _ in 0..48 {
+                let d = r.push(&letterbox_at(crop(rows, rows), 1.0, w, h));
+                if d.changed {
+                    reason = d.diag.reason;
+                    break;
+                }
+            }
+            assert_eq!(reason, "zoom in (new)", "{w}x{h} at {rows}/{rows}");
         }
     }
 
